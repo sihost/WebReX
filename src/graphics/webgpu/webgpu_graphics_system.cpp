@@ -10,7 +10,9 @@
 
 #include <emscripten/emscripten.h>
 
+#include <rex/cvar.h>
 #include <rex/graphics/null/command_processor.h>
+#include <rex/graphics/null/graphics_system.h>
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
 #include <rex/graphics/webgpu/webgpu_device.h>
 #include <rex/logging.h>
@@ -24,6 +26,12 @@
 #else
 #define REX_WEBGPU_HAS_PROVIDER 0
 #endif
+
+REXCVAR_DEFINE_STRING(gpu, "webgpu", "GPU",
+                      "Web GPU backend: webgpu (falls back to null without a device) or null "
+                      "(PM4 executes, nothing is drawn)")
+    .allowed({"webgpu", "null"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
 
@@ -96,6 +104,19 @@ std::unique_ptr<CommandProcessor> WebGPUGraphicsSystem::CreateCommandProcessor()
     return std::make_unique<null::NullCommandProcessor>(this, kernel_state_);
   }
   return std::make_unique<WebGPUCommandProcessor>(this, kernel_state_);
+}
+
+std::unique_ptr<GraphicsSystem> CreateWebGraphicsSystem() {
+  if (REXCVAR_GET(gpu) == "null") {
+    REXGPU_INFO("GPU backend: null (gpu=null)");
+    return std::make_unique<null::NullGraphicsSystem>();
+  }
+  if (!WebGPUGraphicsSystem::IsAvailable()) {
+    REXGPU_WARN("GPU backend: null (no navigator.gpu in this worker)");
+    return std::make_unique<null::NullGraphicsSystem>();
+  }
+  REXGPU_INFO("GPU backend: WebGPU");
+  return std::make_unique<WebGPUGraphicsSystem>();
 }
 
 }  // namespace rex::graphics::webgpu

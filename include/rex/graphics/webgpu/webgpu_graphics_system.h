@@ -54,4 +54,8 @@ class WebGPUGraphicsSystem : public GraphicsSystem {
   std::unique_ptr<WebGPUDevice> device_;
 };
 
+// The web default backend (ReXApp): WebGPUGraphicsSystem unless the `gpu` cvar
+// is "null" or the worker has no navigator.gpu, else null::NullGraphicsSystem.
+std::unique_ptr<GraphicsSystem> CreateWebGraphicsSystem();
+
 }  // namespace rex::graphics::webgpu
