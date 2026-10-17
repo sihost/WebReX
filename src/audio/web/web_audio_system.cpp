@@ -6,11 +6,14 @@
 
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/audio_stats.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/web/web_audio_output.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
+
+#include <chrono>
 
 // Defined by the SDL driver natively, which is not built for the web.
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
@@ -45,12 +48,29 @@ class WebAudioDriver final : public AudioDriver {
       REXAPU_DEBUG("WebAudioDriver::SubmitFrame: frame_ptr={:08X} state={} ring_frames={}",
                    frame_ptr, s.state, s.ring_frames);
     }
+    // --audio_stats_interval_ms: the AudioWorklet side of the ring (rex/audio/audio_stats.h).
+    const int32_t interval = REXCVAR_GET(audio_stats_interval_ms);
+    if (interval > 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_stats_ >= std::chrono::milliseconds(interval)) {
+        last_stats_ = now;
+        const auto s = output_.stats();
+        REXAPU_INFO(
+            "web audio stats: state {} (0 none, 1 suspended, 2 running, 3 failed) rate {} "
+            "submitted {} played {} free_run {} quanta {} underrun_quanta {} overflows {} "
+            "ring {} last_peak {:.4f} max_batch {} latency {} us",
+            s.state, s.context_sample_rate, s.submitted, s.played, s.free_run, s.quanta,
+            s.underrun_quanta, s.overflows, s.ring_frames, s.peak, s.max_batch,
+            s.output_latency_us);
+      }
+    }
   }
 
  private:
   rex::thread::Semaphore* semaphore_;
   WebAudioOutput output_;
   uint32_t submit_count_ = 0;
+  std::chrono::steady_clock::time_point last_stats_{};
 };
 
 }  // namespace

@@ -11,6 +11,7 @@
 
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/audio_stats.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
@@ -24,9 +25,93 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
+#include <rex/types.h>
+
+#include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cmath>
+
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+REXCVAR_DEFINE_INT32(audio_stats_interval_ms, 0, "Audio",
+                     "Diagnostics: every N ms log per-client submitted frames, their RMS/peak "
+                     "and the XMA decoder counters (0 = off). See rex/audio/audio_stats.h");
+
+namespace rex::audio::stats {
+XmaCounters& xma() {
+  static XmaCounters counters;
+  return counters;
+}
+}  // namespace rex::audio::stats
+
+namespace {
+// --audio_stats_interval_ms accumulators (SubmitFrame runs under the global lock).
+struct SubmitStats {
+  std::chrono::steady_clock::time_point start;
+  uint64_t frames = 0;
+  uint64_t nonsilent = 0;
+  double sum_squares = 0.0;
+  float peak = 0.0f;
+  uint64_t total_frames = 0;
+  uint64_t total_nonsilent = 0;
+};
+SubmitStats g_submit_stats[16];
+
+// 6 channels x 256 big-endian floats (the XAudio render frame).
+void AccumulateSubmitStats(size_t index, const uint32_t* frame_be) {
+  const int32_t interval = REXCVAR_GET(audio_stats_interval_ms);
+  if (interval <= 0 || index >= 16) {
+    return;
+  }
+  auto& s = g_submit_stats[index];
+  const auto now = std::chrono::steady_clock::now();
+  if (s.frames == 0 && s.start.time_since_epoch().count() == 0) {
+    s.start = now;
+  }
+  double sum = 0.0;
+  float peak = 0.0f;
+  for (uint32_t i = 0; i < 6 * 256; ++i) {
+    const float v = std::bit_cast<float>(rex::byte_swap(frame_be[i]));
+    if (std::isfinite(v)) {
+      sum += double(v) * double(v);
+      peak = std::max(peak, std::fabs(v));
+    }
+  }
+  s.frames++;
+  s.total_frames++;
+  s.sum_squares += sum;
+  s.peak = std::max(s.peak, peak);
+  if (peak > 1.0e-5f) {
+    s.nonsilent++;
+    s.total_nonsilent++;
+  }
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(now - s.start).count();
+  if (elapsed_ms < interval) {
+    return;
+  }
+  const double rms = std::sqrt(s.sum_squares / double(s.frames * 6 * 256));
+  auto& x = rex::audio::stats::xma();
+  uint32_t contexts = 0;
+  for (auto& m : x.context_mask) {
+    contexts += uint32_t(std::popcount(m.exchange(0, std::memory_order_relaxed)));
+  }
+  REXAPU_INFO(
+      "audio stats: client {} {:.0f} ms: {} frames ({:.0f}/s), non-silent {} ({} of {} total), "
+      "rms {:.5f} ({:.1f} dBFS) peak {:.4f}; XMA total work {} frames {}, {} contexts wrote "
+      "output in this interval",
+      index, elapsed_ms, s.frames, s.frames * 1000.0 / elapsed_ms, s.nonsilent, s.total_nonsilent,
+      s.total_frames, rms, rms > 0.0 ? 20.0 * std::log10(rms) : -999.0, s.peak,
+      x.work.load(std::memory_order_relaxed), x.frames_decoded.load(std::memory_order_relaxed),
+      contexts);
+  s.start = now;
+  s.frames = 0;
+  s.nonsilent = 0;
+  s.sum_squares = 0.0;
+  s.peak = 0.0f;
+}
+}  // namespace
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -258,6 +343,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
   assert_true(clients_[index].driver != NULL);
+  AccumulateSubmitStats(index, memory()->TranslateVirtual<const uint32_t*>(samples_ptr));
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 

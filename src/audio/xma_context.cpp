@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/audio/audio_stats.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
@@ -100,6 +101,7 @@ bool XmaContext::Work() {
   }
 
   set_is_enabled(false);
+  stats::xma().work.fetch_add(1, std::memory_order_relaxed);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -627,6 +629,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       assert_true(output_remaining_bytes >= byte_count);
       const uint32_t output_write_before = static_cast<uint32_t>(output_rb.write_offset());
       output_rb.Write(raw_frame_.data(), byte_count);
+      stats::NoteXmaFrame(id_);
       MarkOutputDirty(data->output_buffer_ptr, output_capacity, output_write_before,
                       static_cast<uint32_t>(byte_count));
       output_remaining_bytes -= byte_count;
