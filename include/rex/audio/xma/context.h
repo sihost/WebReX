@@ -180,6 +180,9 @@ class XmaContext {
   }
 
  private:
+  void MarkContextDirty();
+  void MarkOutputDirty(uint32_t output_buffer_ptr, uint32_t capacity, uint32_t write_offset,
+                       uint32_t byte_count);
   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
   static bool TrySetupNextLoop(XMA_CONTEXT_DATA* data, bool ignore_input_buffer_offset);
   static void NextPacket(XMA_CONTEXT_DATA* data);

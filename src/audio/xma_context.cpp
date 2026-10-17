@@ -105,6 +105,7 @@ bool XmaContext::Work() {
   XMA_CONTEXT_DATA data(context_ptr);
   Decode(&data);
   data.Store(context_ptr);
+  MarkContextDirty();
   return true;
 }
 
@@ -122,6 +123,7 @@ void XmaContext::Enable() {
                    kBitsPerPacket);
 
   data.Store(context_ptr);
+  MarkContextDirty();
 
   set_is_enabled(true);
 }
@@ -152,6 +154,7 @@ void XmaContext::Clear() {
   data.output_buffer_write_offset = 0;
 
   data.Store(context_ptr);
+  MarkContextDirty();
 }
 
 void XmaContext::Disable() {
@@ -168,6 +171,30 @@ void XmaContext::Release() {
   set_is_allocated(false);
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
+  MarkContextDirty();
+}
+
+// Host writes of guest memory (context block, output ring) bypass the PPC store macros, so
+// on the web they must feed the dirty map themselves (docs/port/memory.md section 7). Neither
+// is GPU-watched today, but marking keeps any future reader coherent. No-ops natively.
+void XmaContext::MarkContextDirty() {
+  memory()->MarkPhysicalDirty(guest_ptr(), static_cast<uint32_t>(sizeof(XMA_CONTEXT_DATA)));
+}
+
+void XmaContext::MarkOutputDirty(uint32_t output_buffer_ptr, uint32_t capacity,
+                                 uint32_t write_offset, uint32_t byte_count) {
+  if (!capacity || !byte_count) {
+    return;
+  }
+  // Same masking as Memory::TranslatePhysical, which produced the host pointer written.
+  const uint32_t physical = output_buffer_ptr & 0x1FFFFFFF;
+  write_offset %= capacity;
+  const uint32_t first = std::min(byte_count, capacity - write_offset);
+  memory()->MarkPhysicalDirtyPhysical(physical + write_offset, first);
+  if (first < byte_count) {
+    // The ring wrapped.
+    memory()->MarkPhysicalDirtyPhysical(physical, byte_count - first);
+  }
 }
 
 void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
@@ -598,7 +625,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
       auto byte_count = kBytesPerFrameChannel << data->is_stereo;
       assert_true(output_remaining_bytes >= byte_count);
+      const uint32_t output_write_before = static_cast<uint32_t>(output_rb.write_offset());
       output_rb.Write(raw_frame_.data(), byte_count);
+      MarkOutputDirty(data->output_buffer_ptr, output_capacity, output_write_before,
+                      static_cast<uint32_t>(byte_count));
       output_remaining_bytes -= byte_count;
       data->output_buffer_write_offset = output_rb.write_offset() / 256;
 
