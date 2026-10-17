@@ -170,8 +170,13 @@ WGPUPrimitiveTopology WebGPUPrimitiveProcessor::GetTopology(
 }
 
 WGPUIndexFormat WebGPUPrimitiveProcessor::GetStripIndexFormat(const ProcessingResult& result) {
-  if (result.index_buffer_type == ProcessedIndexBufferType::kNone ||
-      !result.host_primitive_reset_enabled) {
+  // WebGPU rejects indexed draws with a strip pipeline whose stripIndexFormat
+  // is undefined, and restarts strips at the format's maximum value whenever it
+  // is set: there is no "restart disabled" state for indexed strips. So every
+  // indexed strip gets the format, whether or not the guest enabled the reset.
+  // (A reset-disabled guest strip that uses vertex 0xFFFF / 0xFFFFFFFF as a real
+  // index would restart there; not handled.)
+  if (result.index_buffer_type == ProcessedIndexBufferType::kNone) {
     return WGPUIndexFormat_Undefined;
   }
   WGPUPrimitiveTopology topology = GetTopology(result.host_primitive_type);

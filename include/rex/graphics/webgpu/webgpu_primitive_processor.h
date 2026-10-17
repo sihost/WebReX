@@ -95,8 +95,9 @@ class WebGPUPrimitiveProcessor final : public PrimitiveProcessor {
 
   // Host topology of a processed draw (only the types Process can return).
   static WGPUPrimitiveTopology GetTopology(xenos::PrimitiveType host_primitive_type);
-  // GPUPrimitiveState.stripIndexFormat: the host index format for strip
-  // topologies that restart primitives (0xFFFF / 0xFFFFFFFF), else Undefined.
+  // GPUPrimitiveState.stripIndexFormat: the host index format for every indexed
+  // strip draw (WebGPU requires it there and then always restarts at 0xFFFF /
+  // 0xFFFFFFFF), Undefined for lists and non-indexed draws.
   static WGPUIndexFormat GetStripIndexFormat(const ProcessingResult& result);
   // Workgroup counts for a HostVertexShaderType::kMemExportCompute dispatch of
   // `vertex_count` guest vertices (local size 1; the translator derives the
