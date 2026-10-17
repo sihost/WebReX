@@ -61,6 +61,12 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
     )
+elseif(EMSCRIPTEN)
+    # STUB window (no canvas surface yet) + real pending-function UI loop.
+    set(REXUI_PLATFORM_SOURCES
+        window_web.cpp
+        windowed_app_context_web.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -136,6 +142,8 @@ if(WIN32)
         dwmapi
         Shcore
     )
+elseif(EMSCRIPTEN)
+    # No GTK/X11 on the web.
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)

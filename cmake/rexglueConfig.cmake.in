@@ -16,7 +16,10 @@ find_dependency(fmt CONFIG)
 find_dependency(spdlog CONFIG)
 find_dependency(Snappy CONFIG)
 find_dependency(utf8cpp CONFIG)
-find_dependency(SDL3 CONFIG)
+if(NOT EMSCRIPTEN)
+    # SDL3 is not built for the web (audio/input SDL drivers are excluded).
+    find_dependency(SDL3 CONFIG)
+endif()
 
 # Vulkan dependencies
 set(REXGLUE_USE_VULKAN @REXGLUE_USE_VULKAN@)

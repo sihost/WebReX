@@ -9,20 +9,25 @@ set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
 set_target_properties(rexgraphics PROPERTIES EXPORT_NAME graphics)
 set_target_properties(rexsystem PROPERTIES EXPORT_NAME system)
 set_target_properties(rexkernel PROPERTIES EXPORT_NAME kernel)
-set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
+if(TARGET rexcodegen)
+    set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
+endif()
 
 # Build install target list dynamically based on backend options
 set(REXGLUE_INSTALL_TARGETS
     # ReX SDK libraries
     rexcore rexfilesystem rexui rexinput
-    rexaudio rexgraphics rexsystem rexkernel rexcodegen
+    rexaudio rexgraphics rexsystem rexkernel
     # Vendored thirdparty libraries (required by SDK)
     disruptorplus renderdoc simde tomlplusplus  # INTERFACE (header-only)
     aes128 mspack o1heap disasm xxhash imgui  # STATIC libraries
     libavcodec libavutil           # FFmpeg (vendored build)
-    # CLI tool
-    rexglue
 )
+
+# Recompiler library + CLI tool (host builds only; not built for Emscripten)
+if(TARGET rexcodegen)
+    list(APPEND REXGLUE_INSTALL_TARGETS rexcodegen rexglue)
+endif()
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
@@ -118,6 +123,7 @@ endif()
 install(FILES
     src/ui/windowed_app_main_win.cpp
     src/ui/windowed_app_main_posix.cpp
+    src/ui/windowed_app_main_web.cpp
     src/ui/rex_app.cpp
     DESTINATION ${CMAKE_INSTALL_DATADIR}/rexglue
 )
@@ -168,6 +174,11 @@ install(EXPORT rexglueTargets
 #
 # Windows: HKCU\Software\Kitware\CMake\Packages\rexglue  (REG_SZ, value name = MD5 hash)
 # Unix:    ~/.cmake/packages/rexglue/<hash>               (file containing prefix path)
+#
+# Not for Emscripten: a registered wasm64 prefix has the same package name and
+# version as the native one and could be picked up by native find_package().
+# Web consumers pass -Drexglue_DIR=<prefix>/lib/cmake/rexglue explicitly.
+if(NOT EMSCRIPTEN)
 install(CODE [[
     # Normalize path casing on Windows before hashing to avoid duplicate entries
     if(CMAKE_HOST_WIN32)
@@ -192,3 +203,4 @@ install(CODE [[
     message(STATUS "Registered rexglue in CMake user package registry")
     message(STATUS "  -> ${CMAKE_INSTALL_PREFIX}")
 ]])
+endif()

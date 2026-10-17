@@ -15,6 +15,9 @@ function(rexglue_configure_target target_name)
     if(WIN32)
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
+    elseif(EMSCRIPTEN)
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_web.cpp)
     else()
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
@@ -24,8 +27,35 @@ function(rexglue_configure_target target_name)
     target_sources(${target_name} PRIVATE
         ${REXGLUE_SHARE_DIR}/rex_app.cpp)
 
+    # Web (Emscripten, wasm64) platform settings. No GTK, no code model.
+    if(EMSCRIPTEN)
+        target_compile_options(${target_name} PRIVATE
+            -pthread -msimd128 -fwasm-exceptions "SHELL:-s SUPPORT_LONGJMP=wasm")
+        # Kernel exports self-register through static PPCFuncRegistrar objects
+        # (XBOXKRNL_EXPORT/XAM_EXPORT); wasm-ld would drop the unreferenced
+        # objects of librexkernel.a exactly like ld does, so force them in.
+        target_link_options(${target_name} PRIVATE
+            -Wl,--whole-archive
+            $<TARGET_FILE:rex::kernel>
+            -Wl,--no-whole-archive
+        )
+        target_link_options(${target_name} PRIVATE
+            -pthread
+            -fwasm-exceptions
+            "SHELL:-s SUPPORT_LONGJMP=wasm"
+            # main() runs on a pthread so it may block (Atomics.wait).
+            "SHELL:-s PROXY_TO_PTHREAD=1"
+            "SHELL:-s OFFSCREENCANVAS_SUPPORT=1"
+            "SHELL:-s ENVIRONMENT=web,worker"
+            # main()/runtime setup runs on this stack (default is only 64 KiB).
+            "SHELL:-s STACK_SIZE=8MB"
+            "SHELL:-s DEFAULT_PTHREAD_STACK_SIZE=2MB"
+            --use-port=emdawnwebgpu
+        )
+    endif()
+
     # Linux platform settings
-    if(UNIX AND NOT APPLE)
+    if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
@@ -42,7 +72,7 @@ function(rexglue_configure_target target_name)
         target_compile_options(${target_name} PRIVATE -mcmodel=large)
     endif()
 
-    if(NOT MSVC)
+    if(NOT MSVC AND NOT EMSCRIPTEN)
         target_compile_options(${target_name} PRIVATE -msse4.1)
     endif()
 

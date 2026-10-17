@@ -25,7 +25,13 @@ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (ex
 # Graphics backend selection
 # D3D12: Windows only, ON by default.
 # Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
-if(WIN32)
+if(EMSCRIPTEN)
+    # Web (wasm64): no Vulkan/D3D12/FidelityFX/SDL/GTK. The WebGPU backend is
+    # Phase 2 (WS-D); until then the graphics core builds without a host backend.
+    set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
+    set(REXGLUE_USE_VULKAN OFF CACHE BOOL "" FORCE)
+    set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "" FORCE)
+elseif(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
 else()
@@ -33,7 +39,7 @@ else()
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 endif()
 
-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+if(NOT EMSCRIPTEN AND NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
 endif()
 
@@ -70,9 +76,9 @@ if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
     message(FATAL_ERROR "ReXGlue requires Clang 18 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
 endif()
 
-# Enforce x64 architecture
+# Enforce a 64-bit host (x64, arm64 or wasm64 via -m64)
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "ReXGlue only supports x64 architecture")
+    message(FATAL_ERROR "ReXGlue only supports 64-bit hosts (for Emscripten pass -m64)")
 endif()
 
 # Set C++23 standard
@@ -82,7 +88,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_DEBUG_POSTFIX d)
 set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
 
-if(NOT WIN32)
+if(EMSCRIPTEN)
+    # wasm64: no code models / PIC (PIC means dynamic linking in wasm).
+    # Threads + wasm EH + wasm SjLj must be uniform across every object, so
+    # they are forced here too in case the cache flags omit them.
+    add_compile_options(-pthread -msimd128 -fwasm-exceptions "SHELL:-s SUPPORT_LONGJMP=wasm")
+    add_link_options(-pthread -fwasm-exceptions "SHELL:-s SUPPORT_LONGJMP=wasm")
+elseif(NOT WIN32)
     # TODO: do we actually need this?
     # Use large code model on Linux for linking with very large recompiled executables (35MB+)
     # Position-independent code for all targets
@@ -105,6 +117,9 @@ add_compile_options(
 if(WIN32)
     set(REX_PLATFORM "win-amd64")
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+elseif(EMSCRIPTEN)
+    # REX_PLATFORM_WEB comes from include/rex/platform.h (__EMSCRIPTEN__).
+    set(REX_PLATFORM "wasm64")
 elseif(UNIX AND NOT APPLE)
     set(REX_PLATFORM "linux-amd64")
     add_compile_definitions(REX_PLATFORM_LINUX=1)
@@ -148,8 +163,12 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-add_subdirectory(src/codegen)    
-add_subdirectory(src/rexglue)
+if(NOT EMSCRIPTEN)
+    # The recompiler and its CLI are host tools; the web build only needs the
+    # runtime libraries.
+    add_subdirectory(src/codegen)
+    add_subdirectory(src/rexglue)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)

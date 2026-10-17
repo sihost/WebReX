@@ -282,6 +282,9 @@ target_compile_options(imgui PRIVATE -w)
 #=============================================================================
 # SDL3 - Cross-platform media layer
 #=============================================================================
+# Not built for the web: the SDL audio/input drivers are excluded there and
+# browser audio/input are Phase 2 workstreams (E/F).
+if(NOT EMSCRIPTEN)
 set(SDL_INSTALL ON CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -311,6 +314,7 @@ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(sdl3)
+endif()
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
@@ -377,6 +381,14 @@ set(FFMPEG_COMMON_DEFINES
     HAVE_AV_CONFIG_H
     _USE_MATH_DEFINES  # For M_PI/etc
 )
+
+# wasm64 has no generated FFmpeg config upstream; ours lives in the SDK tree
+# (cmake/ffmpeg_wasm/config.h, x86/asm disabled, wmapro/xmaframes only) and must
+# be searched before ${FFMPEG_DIR} so it shadows FFmpeg's own config.h.
+set(FFMPEG_CONFIG_OVERRIDE_INCLUDE "")
+if(EMSCRIPTEN)
+    set(FFMPEG_CONFIG_OVERRIDE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ffmpeg_wasm")
+endif()
 
 # Platform-specific include paths for atomics
 if(WIN32)
@@ -466,7 +478,7 @@ add_library(libavutil STATIC
 )
 
 # Add x86 optimizations on Windows/Linux
-if(WIN32 OR (UNIX AND NOT APPLE))
+if(WIN32 OR (UNIX AND NOT APPLE AND NOT EMSCRIPTEN))
     target_sources(libavutil PRIVATE
         ${FFMPEG_DIR}/libavutil/x86/cpu.c
         ${FFMPEG_DIR}/libavutil/x86/fixed_dsp_init.c
@@ -476,6 +488,9 @@ if(WIN32 OR (UNIX AND NOT APPLE))
     )
 endif()
 
+if(FFMPEG_CONFIG_OVERRIDE_INCLUDE)
+    target_include_directories(libavutil BEFORE PRIVATE ${FFMPEG_CONFIG_OVERRIDE_INCLUDE})
+endif()
 target_include_directories(libavutil
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
@@ -555,7 +570,7 @@ if(WIN32)
 endif()
 
 # Add x86 optimizations on Windows/Linux
-if(WIN32 OR (UNIX AND NOT APPLE))
+if(WIN32 OR (UNIX AND NOT APPLE AND NOT EMSCRIPTEN))
     target_sources(libavcodec PRIVATE
         ${FFMPEG_DIR}/libavcodec/x86/constants.c
         ${FFMPEG_DIR}/libavcodec/x86/fdctdsp_init.c
@@ -565,6 +580,9 @@ if(WIN32 OR (UNIX AND NOT APPLE))
     )
 endif()
 
+if(FFMPEG_CONFIG_OVERRIDE_INCLUDE)
+    target_include_directories(libavcodec BEFORE PRIVATE ${FFMPEG_CONFIG_OVERRIDE_INCLUDE})
+endif()
 target_include_directories(libavcodec
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>

@@ -14,8 +14,13 @@ target_include_directories(rexinput PUBLIC
 )
 if(WIN32)
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
+elseif(EMSCRIPTEN)
+    # No SDL on the web (browser input is WS-F); MnK + NOP drivers only.
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
 
-target_link_libraries(rexinput PUBLIC rexcore SDL3::SDL3)
+target_link_libraries(rexinput PUBLIC rexcore)
+if(NOT EMSCRIPTEN)
+    target_link_libraries(rexinput PUBLIC SDL3::SDL3)
+endif()

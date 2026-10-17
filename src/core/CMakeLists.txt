@@ -43,6 +43,31 @@ if(WIN32)
         string_win.cpp
         threading_win.cpp
     )
+elseif(EMSCRIPTEN)
+    # Web (wasm64). Start from the POSIX set; any <name>_web.cpp that exists
+    # replaces <name>_posix.cpp (WS-C adds memory/threading/clock/filesystem
+    # web backends incrementally). fiber has no POSIX fallback on web (D6).
+    set(_rex_core_posix_units
+        atomic clock dbg dynlib exception_handler filesystem mapped_memory
+        memory seh socket string threading)
+    foreach(_unit IN LISTS _rex_core_posix_units)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_unit}_web.cpp")
+            target_sources(rexcore PRIVATE ${_unit}_web.cpp)
+        else()
+            target_sources(rexcore PRIVATE ${_unit}_posix.cpp)
+        endif()
+    endforeach()
+    target_sources(rexcore PRIVATE fiber_web.cpp math_gcc.cpp)
+    # Pick up web-only helpers that have no POSIX counterpart.
+    file(GLOB _rex_core_web_extra CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/*_web.cpp")
+    foreach(_f IN LISTS _rex_core_web_extra)
+        get_filename_component(_n "${_f}" NAME_WE)
+        string(REGEX REPLACE "_web$" "" _n "${_n}")
+        if(NOT _n IN_LIST _rex_core_posix_units AND NOT _n STREQUAL "fiber")
+            target_sources(rexcore PRIVATE "${_f}")
+        endif()
+    endforeach()
 elseif(UNIX)
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
@@ -73,7 +98,7 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(UNIX AND NOT EMSCRIPTEN)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 

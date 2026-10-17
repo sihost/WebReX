@@ -63,6 +63,34 @@
             "displayName": "Linux AMD64",
             "description": "Multi-config build for Linux AMD64 using Clang 20",
             "inherits": "linux-base"
+        },
+        {
+            "name": "wasm64-base",
+            "hidden": true,
+            "description": "Emscripten wasm64 (run emsdk_env first so $env{EMSDK} is set). Short binary dirs: Windows 250-char object paths.",
+            "generator": "Ninja",
+            "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+            "cacheVariables": {
+                "CMAKE_C_FLAGS": "-m64 -pthread -msimd128 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm",
+                "CMAKE_CXX_FLAGS": "-m64 -pthread -msimd128 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm",
+                "CMAKE_EXE_LINKER_FLAGS": "-m64 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm",
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/wasm64"
+            }
+        },
+        {
+            "name": "wasm64-release",
+            "displayName": "wasm64 Release (Emscripten)",
+            "inherits": "wasm64-base",
+            "binaryDir": "C:/rex/b/w64r",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "wasm64-debug",
+            "displayName": "wasm64 Debug (Emscripten)",
+            "inherits": "wasm64-base",
+            "binaryDir": "C:/rex/b/w64d",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
         }
     ],
     "buildPresets": [
@@ -95,6 +123,14 @@
             "name": "linux-amd64-relwithdebinfo",
             "configurePreset": "linux-amd64",
             "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "wasm64-release",
+            "configurePreset": "wasm64-release"
+        },
+        {
+            "name": "wasm64-debug",
+            "configurePreset": "wasm64-debug"
         }
     ],
     "testPresets": [
