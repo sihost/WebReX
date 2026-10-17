@@ -17,13 +17,54 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/string/utf8.h>
 
 namespace rex::filesystem {
 
+namespace {
+// Lower-case, '\\'-separated, without leading/trailing separators.
+std::string NormalizeDevicePath(std::string_view path) {
+  std::string out = rex::string::utf8_lower_ascii(path);
+  for (char& c : out) {
+    if (c == '/') c = '\\';
+  }
+  const size_t first = out.find_first_not_of('\\');
+  if (first == std::string::npos) return {};
+  const size_t last = out.find_last_not_of('\\');
+  return out.substr(first, last - first + 1);
+}
+}  // namespace
+
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path, bool read_only)
-    : Device(mount_path), name_("STFS"), host_path_(host_path), read_only_(read_only) {}
+    : Device(mount_path),
+      name_("STFS"),
+      host_path_(host_path),
+      read_only_(read_only),
+      delete_on_close_(REX_PLATFORM_WEB != 0) {}
+
+void HostPathDevice::SetDeleteOnClose(bool enabled, std::vector<std::string> keep_prefixes) {
+  delete_on_close_ = enabled;
+  delete_on_close_keep_.clear();
+  for (const auto& prefix : keep_prefixes) {
+    std::string p = NormalizeDevicePath(prefix);
+    if (!p.empty()) delete_on_close_keep_.push_back(std::move(p));
+  }
+}
+
+bool HostPathDevice::DeletesOnClose(std::string_view entry_path) const {
+  if (!delete_on_close_ || read_only_) return false;
+  if (delete_on_close_keep_.empty()) return true;
+  const std::string path = NormalizeDevicePath(entry_path);
+  for (const auto& prefix : delete_on_close_keep_) {
+    if (path.size() >= prefix.size() && path.compare(0, prefix.size(), prefix) == 0 &&
+        (path.size() == prefix.size() || path[prefix.size()] == '\\')) {
+      return false;
+    }
+  }
+  return true;
+}
 
 HostPathDevice::~HostPathDevice() = default;
 

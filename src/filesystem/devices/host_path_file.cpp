@@ -12,7 +12,8 @@
 #include "host_path_entry.h"
 #include "host_path_file.h"
 
-#include <rex/platform.h>
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/logging.h>
 
 namespace rex::filesystem {
 
@@ -29,18 +30,21 @@ void HostPathFile::Destroy() {
   file_handle_.reset();  // close the host descriptor before a possible unlink
   const bool last = host_entry->ReleaseOpenFile();
   delete this;
-#if REX_PLATFORM_WEB
   // NT deletes a file marked with FileDispositionInformation when its last handle closes. Halo 3
   // wipes cache:\maps\cached_fonts by "find first file, mark delete, close" until the folder is
-  // empty, which looped forever while the flag was ignored (second boot with a persisted
-  // OPFS cache:). Native builds keep ignoring the flag for now: there cache: is the user's game
-  // folder and Halo marks its shipped saved_films for deletion at every boot (STUBS.md).
+  // empty (looped forever on web while the flag was ignored), and its autosave queue deletes the
+  // oldest cache:\autosave item while 25 or more exist (looped forever natively once 25 had
+  // accumulated). The device decides (HostPathDevice::SetDeleteOnClose): on by default on web,
+  // off by default natively, where the device folder may be the user's game folder.
   if (last && host_entry->delete_on_close()) {
-    host_entry->DeleteOnLastClose();
+    auto* device = static_cast<HostPathDevice*>(host_entry->device());
+    if (device->DeletesOnClose(host_entry->path())) {
+      host_entry->DeleteOnLastClose();
+    } else {
+      REXFS_DEBUG("HostPathFile: delete-on-close of {} not carried out (device policy)",
+                  host_entry->path());
+    }
   }
-#else
-  (void)last;
-#endif
 }
 
 X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,

@@ -49,8 +49,9 @@ class HostPathEntry : public Entry {
   // last one closed.
   void AddOpenFile() { open_files_.fetch_add(1, std::memory_order_relaxed); }
   bool ReleaseOpenFile() { return open_files_.fetch_sub(1, std::memory_order_acq_rel) == 1; }
-  // Web: carries out a delete-on-close (NtSetInformationFile FileDispositionInformation) once the
-  // last handle closed. May destroy this entry; do not touch it afterwards.
+  // Carries out a delete-on-close (NtSetInformationFile FileDispositionInformation) once the last
+  // handle closed, when the device allows it (HostPathDevice::DeletesOnClose). May destroy this
+  // entry; do not touch it afterwards.
   void DeleteOnLastClose();
 
  private:

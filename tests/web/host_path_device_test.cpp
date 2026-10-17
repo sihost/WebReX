@@ -16,10 +16,10 @@
  *              See LICENSE file in the project root for full license text.
  */
 
-#include <sys/stat.h>
-
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,16 +52,27 @@ int g_checks = 0;
   } while (0)
 
 constexpr uint32_t kReadWrite = FileAccess::kGenericRead | FileAccess::kGenericWrite;
-const char* kHost = "/tmp/rex_host_path_test/cache";
+#ifdef __EMSCRIPTEN__
+const std::string kHost = "/tmp/rex_host_path_test/cache";
+#else
+// Native: also covers the Windows HostPathDevice (the flag was never acted on there before).
+const std::string kHost =
+    (std::filesystem::temp_directory_path() / "rex_host_path_test" / "cache").generic_string();
+#endif
 
 bool HostExists(const std::string& p) {
-  struct stat st;
-  return stat(p.c_str(), &st) == 0;
+  std::error_code ec;
+  return std::filesystem::exists(std::filesystem::path(p), ec);
 }
+
+// Delete-on-close policy for Mount(): the platform default (on web, off natively) unless set.
+int g_policy = -1;  // -1 default, 0 off, 1 on
+std::vector<std::string> g_keep;
 
 std::unique_ptr<VirtualFileSystem> Mount() {
   auto vfs = std::make_unique<VirtualFileSystem>();
   auto dev = std::make_unique<HostPathDevice>("\\CACHE", kHost, false);
+  if (g_policy >= 0) dev->SetDeleteOnClose(g_policy == 1, g_keep);
   if (!dev->Initialize()) return nullptr;
   if (!vfs->RegisterDevice(std::move(dev))) return nullptr;
   vfs->RegisterSymbolicLink("cache:", "\\CACHE");
@@ -93,9 +104,115 @@ bool Has(const std::vector<std::string>& v, const char* n) {
 
 }  // namespace
 
+// Halo 3 autosave_queue_save_item_remove_stale_items (0x822C5C78): count the items in
+// cache:\autosave; while 25 or more exist, delete the oldest and run again. Returns how many
+// rounds ran before fewer than 25 were left (max_rounds = it never got there).
+int AutosavePrune(VirtualFileSystem* vfs, int max_rounds) {
+  int rounds = 0;
+  for (; rounds < max_rounds; ++rounds) {
+    auto names = Children(vfs, "cache:\\autosave");
+    if (names.size() < 25) break;
+    std::sort(names.begin(), names.end());  // names sort like their write times here
+    std::string p = "cache:\\autosave\\" + names[0];
+    File* f = Open(vfs, p.c_str(), FileDisposition::kOpen,
+                   FileAccess::kGenericRead | 0x00010000 /* DELETE */);
+    if (!f) break;
+    f->entry()->SetForDeletion(true);
+    f->Destroy();
+  }
+  return rounds;
+}
+
+void MakeFile(VirtualFileSystem* vfs, const std::string& guest_path) {
+  File* f = Open(vfs, guest_path.c_str(), FileDisposition::kCreate, kReadWrite);
+  CHECK(f != nullptr);
+  if (f) {
+    size_t n = 0;
+    f->WriteSync({reinterpret_cast<const uint8_t*>("x"), 1}, 0, &n);
+    f->Destroy();
+  }
+}
+
+void MarkAndClose(VirtualFileSystem* vfs, const std::string& guest_path) {
+  File* f = Open(vfs, guest_path.c_str(), FileDisposition::kOpen,
+                 FileAccess::kGenericRead | 0x00010000 /* DELETE */);
+  CHECK(f != nullptr);
+  if (f) {
+    f->entry()->SetForDeletion(true);
+    f->Destroy();
+  }
+}
+
+// 9-11: the device policy (HostPathDevice::SetDeleteOnClose), incl. the native default.
+void PolicyTests() {
+  std::error_code ec;
+  std::filesystem::remove_all(std::filesystem::path(kHost), ec);
+  const std::string host_autosave = kHost + "/autosave";
+  const std::string host_films = kHost + "/saved_films";
+
+  // 9. Policy off (the native default before this change, kept for devices that do not opt in):
+  //    the marked file stays, and the autosave prune never gets below 25.
+  g_policy = 0;
+  g_keep.clear();
+  auto vfs = Mount();
+  CHECK(vfs != nullptr);
+  if (!vfs) return;
+  CHECK(vfs->CreatePath("cache:\\autosave", rex::filesystem::kFileAttributeDirectory));
+  CHECK(vfs->CreatePath("cache:\\saved_films", rex::filesystem::kFileAttributeDirectory));
+  for (int i = 0; i < 25; ++i) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "cache:\\autosave\\asq%016X.slayer", 0x6AD2B585 + i);
+    MakeFile(vfs.get(), name);
+  }
+  MakeFile(vfs.get(), "cache:\\saved_films\\riverwo_F9EB78A3.film");
+  CHECK(Children(vfs.get(), "cache:\\autosave").size() == 25);
+  CHECK(AutosavePrune(vfs.get(), 50) == 50);  // the native hang
+  CHECK(HostExists(host_autosave + "/asq000000006AD2B585.slayer"));
+
+  // 10. Policy on with saved_films kept (what Halo 3 mounts natively): the prune deletes exactly
+  //     the oldest item; a marked film stays on the host and in the VFS.
+  g_policy = 1;
+  g_keep = {"Saved_Films"};
+  vfs.reset();
+  vfs = Mount();
+  CHECK(vfs != nullptr);
+  if (!vfs) return;
+  CHECK(AutosavePrune(vfs.get(), 50) == 1);
+  CHECK(!HostExists(host_autosave + "/asq000000006AD2B585.slayer"));
+  CHECK(HostExists(host_autosave + "/asq000000006AD2B586.slayer"));
+  CHECK(Children(vfs.get(), "cache:\\autosave").size() == 24);
+  MarkAndClose(vfs.get(), "cache:\\saved_films\\riverwo_F9EB78A3.film");
+  CHECK(HostExists(host_films + "/riverwo_F9EB78A3.film"));
+  CHECK(Has(Children(vfs.get(), "cache:\\saved_films"), "riverwo_F9EB78A3.film"));
+  // A prefix only matches whole path components (saved_films_x is not kept).
+  MakeFile(vfs.get(), "cache:\\saved_films_x");
+  MarkAndClose(vfs.get(), "cache:\\saved_films_x");
+  CHECK(!HostExists(kHost + "/saved_films_x"));
+
+  // 11. Policy on, nothing kept: the film goes too.
+  g_keep.clear();
+  vfs.reset();
+  vfs = Mount();
+  CHECK(vfs != nullptr);
+  if (!vfs) return;
+  MarkAndClose(vfs.get(), "cache:\\saved_films\\riverwo_F9EB78A3.film");
+  CHECK(!HostExists(host_films + "/riverwo_F9EB78A3.film"));
+  vfs.reset();
+  g_policy = -1;
+  std::filesystem::remove_all(std::filesystem::path(kHost), ec);
+}
+
 int main() {
-  std::printf("host_path_device_test (WasmFS, %s)\n", kHost);
-  std::string host_fonts = std::string(kHost) + "/maps/cached_fonts";
+  std::printf("host_path_device_test (%s)\n", kHost.c_str());
+#ifndef __EMSCRIPTEN__
+  // Natively the default leaves marked entries alone; sections 1-8 test NT semantics.
+  g_policy = 1;
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::path(kHost), ec);
+  }
+#endif
+  std::string host_fonts = kHost + "/maps/cached_fonts";
   auto vfs = Mount();
   CHECK(vfs != nullptr);
   if (!vfs) return 1;
@@ -229,6 +346,9 @@ int main() {
     CHECK(vfs->ResolvePath("cache:\\maps\\cached_fonts") == nullptr);
     CHECK(Has(Children(vfs.get(), "cache:\\"), "preferences.dat"));
   }
+  vfs.reset();
+
+  PolicyTests();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures ? 1 : 0;
