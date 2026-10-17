@@ -55,6 +55,13 @@ static_assert(REX_PLATFORM_WEB, "This file is web-only (Emscripten)");
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(thread_exit_unwind, true, "Kernel",
+                    "Web: Thread::Exit/Terminate unwind the thread's C++ frames back to its start "
+                    "routine while the pthread is alive. false = the old pthread_exit, whose "
+                    "destructors ran on a torn-down pthread (tid 0) and could leave the global "
+                    "critical region locked for good (diagnostics/A-B only)");
 
 namespace rex::thread {
 
@@ -110,6 +117,7 @@ struct ThreadControl {
   std::string name;
   int32_t priority = 0;
   uint64_t affinity_mask = 0;
+  bool exit_unwinds = false;  // runs under ThreadMain (own thread only): Exit unwinds to it
 };
 
 thread_local std::shared_ptr<ThreadControl> tls_control_ref;
@@ -908,11 +916,35 @@ void MarkFinishedLocked(ThreadControl* c, int exit_code) {
   }
 }
 
+// Thrown by ExitCurrentThreadLocked on a thread started by ThreadMain and caught there.
+struct ThreadExitUnwind {
+  int exit_code;
+};
+
 void ExitCurrentThreadLocked(ThreadControl* c, std::unique_lock<std::mutex>& lock, int exit_code) {
+  if (c->exit_unwinds && REXCVAR_GET(thread_exit_unwind)) {
+    // Unwind the C++ frames (running their destructors) back to ThreadMain while this is still
+    // a live pthread; ThreadMain marks the thread finished and returns.
+    //
+    // Not pthread_exit: Emscripten's pthread_exit first tears the pthread down (TLS dtors,
+    // pthread_self() = NULL, so tid reads 0, and a detached thread's stack and TLS block are
+    // queued to be freed on the main thread) and only then throws its JS 'unwind' exception.
+    // With -fwasm-exceptions every C++ cleanup pad on the way catches that exception and runs
+    // its destructors on the dead thread. XThread::Exit's object_ref then runs ~XThread
+    // (UnregisterThread, SystemHeapFree, FreeStack), which take the global critical region
+    // (a recursive mutex) with tid 0: musl sees a free mutex as "owned by me", only bumps
+    // _m_count, and the next real owner inherits the count, so its last unlock never releases
+    // the mutex. Every other thread then blocks on the global lock for good (gate 5: the
+    // intermittent freeze after main_game_change; a guest thread exits during the map change,
+    // and in the captured case the BINK thread inherited the lock and kept it while sleeping).
+    lock.unlock();
+    SetDiagState(c, "exiting");
+    throw ThreadExitUnwind{exit_code};
+  }
   MarkFinishedLocked(c, exit_code);
   lock.unlock();
-  // Emscripten unwinds the Worker back to its event loop (a JS exception); C++ destructors
-  // are not guaranteed to run, as with Thread::Exit on native.
+  // Threads not started by ThreadMain (the main thread, std::thread): Emscripten unwinds the
+  // Worker back to its event loop (a JS exception), see above.
   pthread_exit(reinterpret_cast<void*>(static_cast<intptr_t>(exit_code)));
 }
 
@@ -932,31 +964,38 @@ void* ThreadMain(void* parameter) {
   tls_control = c;
   c->diag.tid.store(gettid(), std::memory_order_relaxed);
   SetDiagState(c, "starting");
+  c->exit_unwinds = true;
 
-  std::string name;
-  {
-    std::unique_lock<std::mutex> lock(g_dispatcher);
-    c->pthread = pthread_self();
-    c->started = true;
-    UpdateSafePointFlagLocked(c);
-    name = c->name;
-    // create_suspended threads park here until the first Resume().
-    if (SafePointLocked(c, lock) == SafePointAction::kTerminate) {
-      ExitCurrentThreadLocked(c, lock, c->terminate_exit_code);
+  int exit_code = 0;
+  try {
+    std::string name;
+    {
+      std::unique_lock<std::mutex> lock(g_dispatcher);
+      c->pthread = pthread_self();
+      c->started = true;
+      UpdateSafePointFlagLocked(c);
+      name = c->name;
+      // create_suspended threads park here until the first Resume().
+      if (SafePointLocked(c, lock) == SafePointAction::kTerminate) {
+        ExitCurrentThreadLocked(c, lock, c->terminate_exit_code);
+      }
+      name = c->name;
     }
-    name = c->name;
-  }
-  ApplyNativeThreadName(name);
+    ApplyNativeThreadName(name);
 
-  SetDiagState(c, "running");
-  start_routine();
+    SetDiagState(c, "running");
+    start_routine();
+  } catch (const ThreadExitUnwind& exit) {
+    // Thread::Exit / Terminate: every frame above has been unwound on this live pthread.
+    exit_code = exit.exit_code;
+  }
   start_routine = nullptr;
 
   {
     std::lock_guard<std::mutex> lock(g_dispatcher);
-    MarkFinishedLocked(c, 0);
+    MarkFinishedLocked(c, exit_code);
   }
-  return nullptr;
+  return reinterpret_cast<void*>(static_cast<intptr_t>(exit_code));
 }
 
 }  // namespace
