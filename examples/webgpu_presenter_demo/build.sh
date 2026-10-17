@@ -2,7 +2,7 @@
 # Builds the WebGPU presenter demo into out/web next to this file.
 #   ./build.sh [wasm64 SDK install prefix, default <repo>/out/install/wasm64]
 # Needs emsdk on PATH (source emsdk_env.sh first) and the SDK built + installed with the
-# wasm64-release preset (see WEB_PORT.md).
+# wasm64-release preset (see the main README).
 set -e
 SRC="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${1:-$SRC/../../out/install/wasm64}"

@@ -1,72 +1,102 @@
-# WebReX
+<h1 align="center">WebReX</h1>
 
-**The ReXGlue Xbox 360 runtime in the browser, with the Xenos GPU on WebGPU.**
+<p align="center">
+  <b>The ReXGlue Xbox 360 runtime in the browser, with Xenos on WebGPU</b>
+</p>
 
-WebReX runs ReXGlue-recompiled Xbox 360 titles in the browser. The runtime (kernel, threads,
-memory, filesystem, audio, input, system-link networking) is built for **wasm64** with
-Emscripten, and the Xenos GPU is emulated on **WebGPU**. It was originally built for a browser
-port of Halo 3. No game code or game data is included.
-
-- What the web port adds, its status, and how to build it: [WEB_PORT.md](WEB_PORT.md)
-- A runnable example: [WebGPU presenter demo](examples/webgpu_presenter_demo)
-
-WebReX is a fork of [ReXGlue](https://github.com/rexglue/rexglue-sdk). Native builds
-(Windows/Linux, D3D12/Vulkan) still work. The upstream ReXGlue README follows.
-
----
+<p align="center">
+  <img src="docs/media/presenter_demo.png" width="560" alt="WebReX presenter demo running in Chrome">
+</p>
 
 > [!CAUTION]
-> This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
+> WebReX is experimental. It needs a recent Chromium browser with WebGPU and wasm64 support, a
+> lot of memory, and a game recompiled with ReXGlue. APIs will change.
 
-<h1 align="center">
-  <br>
-  <a href="https://github.com/rexglue/rexglue-sdk">
-    <img src="https://github.com/rexglue/rexglue-media/blob/main/ReX_Banner.png" alt="ReXGlue banner">
-  </a>
-  <br>
-  <br>
-  <a href="https://discord.gg/CNTxwSNZfT">
-    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
-  </a>
-  <a href="https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml">
-    <img src="https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml/badge.svg" alt="win-amd64 build status">
-  </a>
-  <a href="https://github.com/rexglue/rexglue-sdk/stargazers">
-    <img src="https://img.shields.io/github/stars/rexglue/rexglue-sdk" alt="rexglue-sdk stargazers">
-  </a>
-</h1>
+WebReX runs Xbox 360 games that were recompiled with [ReXGlue](https://github.com/rexglue/rexglue-sdk)
+in a web browser, without plugins. The runtime (kernel, threads, memory, filesystem, audio,
+input and system-link networking) is compiled to **WebAssembly (wasm64)** with Emscripten.
+The Xbox 360 GPU, **Xenos**, is emulated on **WebGPU**.
 
-ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
+WebReX was originally built for a browser port of Halo 3. It contains no game code or game
+data: a recompiled game is a separate project that links WebReX and loads its own files.
 
-ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia-project), the Xbox 360 emulator. Rather than interpreting or JIT-compiling PPC instructions at runtime, ReXGlue takes a different path: it generates C++ source code ahead of time, an approach inspired by [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and [rexdex's recompiler](https://github.com/rexdex/recompiler).
+## How it works
 
-Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.
+ReXGlue translates a game's PowerPC code into C++ ahead of time, so no CPU is emulated at
+runtime. WebReX takes the runtime that recompiled code runs on and makes it work in a browser:
 
-## Example Projects
+| Area | What WebReX does in the browser |
+|---|---|
+| **GPU (Xenos)** | Xenos command processor on WebGPU (`src/graphics/webgpu/`): command streams recorded on the game's GPU thread and replayed on a WebGPU device thread, guest memory mirrored with a dirty map, EDRAM emulation with resolves, render-target and texture caches, Xenos texture formats decoded on the GPU, tessellation and vertex memexport as compute passes |
+| **Shaders** | Xenos shader microcode → SPIR-V → WGSL through [Tint](https://dawn.googlesource.com/dawn). Translation runs on worker threads and is cached in browser storage (OPFS). The 93 built-in shaders ship pre-translated |
+| **Display** | `WebGPUPresenter` draws the game's frames to a canvas once per animation frame, letterboxed, and handles resizes and device loss. Includes the ImGui settings/debug overlay |
+| **Threads and memory** | Emscripten pthreads with suspend, APCs and timers like the 360 kernel expects; the 4 GB guest address space inside wasm64 memory |
+| **Files** | Game files stream over HTTP Range requests with an OPFS block cache; saves and profiles persist in OPFS across reloads |
+| **Audio** | AudioWorklet output fed from a SharedArrayBuffer ring |
+| **Input** | Gamepad API, keyboard and mouse with pointer lock |
+| **Network** | System link as a virtual UDP LAN over a WebSocket relay (relay server not included) |
 
-- [demo-iruka](https://github.com/rexglue/demo-iruka)
-- [reblue](https://github.com/rexglue/reblue)
+Native builds (Windows/Linux with D3D12/Vulkan) still work from the same tree.
 
-## Quickstart
+## Status
 
-For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
+Tested with a full recompiled retail game in Chrome on Windows:
 
-# **Disclaimer**
-ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 
+- boots to the main menu, loads maps and plays with audio, controller and mouse/keyboard
+- settings and profiles survive a page reload
+- two browser tabs find each other and join one system-link lobby
+- frames match the native D3D12 build at fixed game ticks (about 36–40 dB PSNR)
+- saved films play back and closely match native (some draws still skipped, see below)
 
-This project is not intended to promote piracy nor unauthorized use of copyrighted material. Any misuse of this software to endorse or enable this type of activity is strictly prohibited.
+Known gaps: occlusion queries are not emulated yet, and a large game needs about 8 GB of wasm
+memory per tab.
 
+## Example
 
-# Credits
+[`examples/webgpu_presenter_demo`](examples/webgpu_presenter_demo) is a small program built
+against WebReX. It sends frames through the same display path a game uses, checks the result
+by reading pixels back from the GPU, and then shows an animated frame (the image above).
+Its README has build and run steps.
 
-## ReXGlue
-- [Tom (crack)](https://github.com/tomcl7) - Lead developer and project founder
-- [Loreaxe](https://github.com/Loreaxe) - Core contributor of the Linux/POSIX, ARM, and Vulkan feature sets.
-- [Soren/Roxxsen](https://github.com/Roxxsen) - Lead project manager and git maintainer.
-- [Toby](https://github.com/TbyDtch) - Graphic designer.
+## Building
 
-## Very Special Thank You:
-- [Project Xenia](https://github.com/xenia-project/xenia/tree/master/src/xenia) - Their invaluable work on Xbox 360 emulation laid the groundwork for ReXGlue's development. This project (and numerous others) would not exist without their hard work and dedication.
-- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - For pioneering the modern static recompilation approach for Xbox 360. A lot of the codegen analysis logic and instruction translations are based on their work. Thank you!
-- [rexdex's recompiler](https://github.com/rexdex/recompiler) - The OG static recompiler for Xbox 360. 
-- Many others in the Xbox 360 homebrew and modding communities whose work and research have contributed to the collective knowledge that makes projects like this possible.
+Requirements: [emsdk](https://emscripten.org/docs/getting_started/downloads.html) (activated),
+CMake 3.25+, Ninja, Git, Python 3, and Chrome or Edge with WebGPU.
+
+```sh
+git submodule update --init --recursive
+scripts/fetch_dawn.sh            # Windows: scripts\fetch_dawn.bat (Tint sources, ~150 MB)
+cmake --preset wasm64-release    # build dir: out/w64r
+cmake --build out/w64r           # the first build also compiles Tint (~10 min)
+cmake --install out/w64r         # installs to out/install/wasm64
+```
+
+Pages that use WebReX must be served with `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`, because wasm threads need SharedArrayBuffer.
+The example's `serve.mjs` does this.
+
+For the recompiler itself (turning a game into C++), see the
+[ReXGlue wiki](https://github.com/rexglue/rexglue-sdk/wiki).
+
+## Credits
+
+- [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom (crack), Loreaxe, Soren/Roxxsen and
+  Toby: the recompiler and runtime WebReX is built on.
+- [Xenia](https://github.com/xenia-project/xenia): the Xbox 360 emulator whose GPU, kernel and
+  system work ReXGlue (and so WebReX) is derived from.
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and
+  [rexdex's recompiler](https://github.com/rexdex/recompiler): the static recompilation
+  approach ReXGlue follows.
+- [Dawn/Tint](https://dawn.googlesource.com/dawn) and [Emscripten](https://emscripten.org).
+- Built with help from Claude.
+
+## Disclaimer
+
+WebReX is not affiliated with or endorsed by Microsoft or Xbox. All trademarks belong to their
+owners. It does not include any game code or data, and is not meant to enable piracy: use it
+only with games you own.
+
+## License
+
+BSD 3-Clause, the same as ReXGlue: see [LICENSE](LICENSE). Portions are derived from
+[Xenia](https://xenia.jp).

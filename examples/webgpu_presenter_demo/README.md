@@ -20,7 +20,7 @@ The header badge shows **PASS** or **FAIL**, and the page logs a `RESULT {json}`
 
 ## Build and run
 
-1. Build and install the SDK for the web (see [`WEB_PORT.md`](../../WEB_PORT.md)):
+1. Build and install the SDK for the web (see the main [README](../../README.md#building)):
    `cmake --preset wasm64-release`, `cmake --build out/w64r`, `cmake --install out/w64r`.
 2. Build the demo: `build.bat` on Windows or `./build.sh` elsewhere, with emsdk activated.
    Pass a different SDK install prefix as the first argument if needed.

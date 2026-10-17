@@ -2,7 +2,7 @@
 rem Builds the WebGPU presenter demo into out\web next to this file.
 rem   build.bat [wasm64 SDK install prefix, default <repo>\out\install\wasm64]
 rem Needs emsdk on PATH (run emsdk_env.bat first) and the SDK built + installed with the
-rem wasm64-release preset (see WEB_PORT.md).
+rem wasm64-release preset (see the main README).
 setlocal
 set SRC=%~dp0
 set PREFIX=%~1
