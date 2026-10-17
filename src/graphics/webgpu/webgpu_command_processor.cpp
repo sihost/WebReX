@@ -120,7 +120,8 @@ bool WebGPUCommandProcessor::SetupContext() {
     return false;
   }
 
-  render_target_cache_ = std::make_unique<WebGPURenderTargetCache>(*this, *register_file_);
+  render_target_cache_ =
+      std::make_unique<WebGPURenderTargetCache>(*this, *register_file_, *memory_, trace_writer_);
   if (!render_target_cache_->Initialize(shared_memory_->binding_count())) {
     REXGPU_ERROR("WebGPU: render target cache initialization failed");
     return false;
@@ -433,6 +434,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint64_t swap_index = ++statistics_.swaps;
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  // WP4: render targets bound in the previous frame are not kept accumulated.
+  render_target_cache_->BeginFrame();
 
   uint32_t texture_width = 0, texture_height = 0;
   xenos::TextureFormat texture_format = xenos::TextureFormat(0);
