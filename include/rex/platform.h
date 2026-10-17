@@ -35,6 +35,12 @@
 #elif defined(__ANDROID__)
 #define REX_PLATFORM_ANDROID 1
 #define REX_PLATFORM_LINUX 1
+#elif defined(__EMSCRIPTEN__)
+// Browser / wasm64 build (Emscripten). Deliberately NOT REX_PLATFORM_LINUX:
+// there is no ucontext, /proc, shm_open, RT signals or SIGSEGV. Code that is
+// plain POSIX (pthreads, clock_gettime, BSD strings) should test
+// REX_PLATFORM_POSIX instead of REX_PLATFORM_LINUX.
+#define REX_PLATFORM_WEB 1
 #elif defined(__gnu_linux__)
 #define REX_PLATFORM_GNU_LINUX 1
 #define REX_PLATFORM_LINUX 1
@@ -59,6 +65,16 @@
 #ifndef REX_PLATFORM_LINUX
 #define REX_PLATFORM_LINUX 0
 #endif
+#ifndef REX_PLATFORM_WEB
+#define REX_PLATFORM_WEB 0
+#endif
+
+// Generic POSIX userland (pthreads, clock_gettime, mmap-less fallbacks ok).
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_WEB
+#define REX_PLATFORM_POSIX 1
+#else
+#define REX_PLATFORM_POSIX 0
+#endif
 
 #if defined(__clang__)
 #define REX_COMPILER_CLANG 1
@@ -82,6 +98,11 @@
 #error Rex is not supported on 32-bit platforms.
 #elif defined(_M_PPC) || defined(__powerpc__)
 #define REX_ARCH_PPC 1
+#elif defined(__wasm64__)
+#define REX_ARCH_WASM 1
+#define REX_ARCH_WASM64 1
+#elif defined(__wasm32__)
+#error Rex is not supported on wasm32 (pointer-sized guest function table).
 #endif
 
 #if REX_PLATFORM_WIN32
