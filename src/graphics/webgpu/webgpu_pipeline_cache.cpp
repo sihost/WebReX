@@ -625,6 +625,8 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
   if (Shader::IsHostVertexShaderTypeDomain(host_vs_type) ||
       host_vs_type == HVST::kMemExportCompute) {
     // No tessellation on WebGPU; memexport compute is not a render pipeline.
+    ++statistics_.draws_unsupported;
+    ++statistics_.draws_refused_tessellation;
     return false;
   }
 
@@ -658,6 +660,7 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
   bindings_out.vertex = GetShaderBindings(vs, vs_mod.value);
   if (!bindings_out.vertex) {
     ++statistics_.draws_unsupported;
+    ++statistics_.draws_refused_bindings;
     return false;
   }
 
@@ -694,11 +697,13 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
       // share group 0 with the read-only VS binding (and the shared memory is
       // also the index buffer of the pass). TODO: a separate layout + pass.
       ++statistics_.draws_unsupported;
+      ++statistics_.draws_refused_ps_memexport;
       return false;
     }
     bindings_out.pixel = GetShaderBindings(ps, ps_mod.value);
     if (!bindings_out.pixel) {
       ++statistics_.draws_unsupported;
+      ++statistics_.draws_refused_bindings;
       return false;
     }
   }
@@ -748,6 +753,7 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
     desc.front_face_cw = uint8_t(mode.face);
     if (mode.cull_front && mode.cull_back) {
       // Everything culled; WebGPU has no front-and-back culling.
+      ++statistics_.draws_refused_cull_both;
       return false;
     }
     desc.cull_mode = uint8_t(mode.cull_front  ? WGPUCullMode_Front
@@ -765,9 +771,14 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
   if (!REXCVAR_GET(webgpu_draw_with_pipelines)) {
     // Diagnostics: pipelines are created, draws are dropped.
     pipeline_out = kInvalidPipelineId;
+    ++statistics_.draws_refused_no_pipeline;
     return false;
   }
-  return pipeline_out != kInvalidPipelineId;
+  if (pipeline_out == kInvalidPipelineId) {
+    ++statistics_.draws_refused_no_pipeline;
+    return false;
+  }
+  return true;
 }
 
 PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& description) {

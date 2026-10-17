@@ -50,12 +50,74 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 }
 )";
 
+// The same blit through the guest display gamma ramp (Frame::gamma_ramp): the
+// source is read without filtering (VulkanCommandProcessor's apply-gamma
+// shaders, which use texelFetch at the pixel position).
+constexpr char kGammaBlitWgsl[] = R"(
+struct GammaParams {
+  uv_offset : vec2<f32>,
+  uv_scale : vec2<f32>,
+  // 1 = 256-entry table, 2 = PWL.
+  mode : u32,
+  rb_swap : u32,
+};
+@group(0) @binding(0) var<uniform> params : GammaParams;
+@group(0) @binding(1) var source_texture : texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> ramp : array<u32>;
+
+struct VertexOutput {
+  @builtin(position) position : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index : u32) -> VertexOutput {
+  let corner = vec2<f32>(f32((vertex_index << 1u) & 2u), f32(vertex_index & 2u));
+  var output : VertexOutput;
+  output.position = vec4<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0.0, 1.0);
+  output.uv = params.uv_offset + corner * params.uv_scale;
+  return output;
+}
+
+fn apply_pwl(value_10b : u32, channel : u32) -> f32 {
+  let entry = ramp[(value_10b >> 3u) * 3u + channel];
+  let value = f32(entry & 0xFFFFu) + f32((value_10b & 7u) * (entry >> 16u)) * 0.125;
+  return clamp(value * 1.52737048e-05, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+  let size = textureDimensions(source_texture, 0);
+  let texel = min(vec2<u32>(max(input.uv, vec2<f32>(0.0)) * vec2<f32>(size)), size - 1u);
+  var color = textureLoad(source_texture, texel, 0).rgb;
+  if (params.rb_swap != 0u) {
+    color = color.bgr;
+  }
+  if (params.mode == 2u) {
+    let source = vec3<u32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * 1023.0 + 0.5);
+    return vec4<f32>(apply_pwl(source.r, 0u), apply_pwl(source.g, 1u), apply_pwl(source.b, 2u),
+                     1.0);
+  }
+  let source = vec3<u32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0 + 0.5);
+  // DC_LUT_30_COLOR: blue in bits 0:9, green 10:19, red 20:29.
+  return vec4<f32>(vec3<f32>(f32((ramp[source.r] >> 20u) & 0x3FFu),
+                             f32((ramp[source.g] >> 10u) & 0x3FFu),
+                             f32(ramp[source.b] & 0x3FFu)) / 1023.0, 1.0);
+}
+)";
+
+constexpr uint32_t kGammaRampDwords = 128 * 3;
+
 constexpr uint32_t kUniformSlotSize = 256;  // minUniformBufferOffsetAlignment upper bound.
 constexpr uint32_t kUniformSlotCount = 16;  // Blits encodable per submission.
 
 struct BlitParams {
   float uv_offset[2];
   float uv_scale[2];
+  // Gamma blit only.
+  uint32_t gamma_mode;
+  uint32_t gamma_rb_swap;
+  uint32_t padding[2];
 };
 
 }  // namespace
@@ -68,6 +130,12 @@ WebGPUPresentPass::~WebGPUPresentPass() {
   pipelines_.clear();
   if (uniform_buffer_) {
     wgpuBufferRelease(uniform_buffer_);
+  }
+  if (gamma_ramp_buffer_) {
+    wgpuBufferRelease(gamma_ramp_buffer_);
+  }
+  if (gamma_shader_module_) {
+    wgpuShaderModuleRelease(gamma_shader_module_);
   }
   if (sampler_) {
     wgpuSamplerRelease(sampler_);
@@ -93,6 +161,17 @@ bool WebGPUPresentPass::Initialize() {
     REXWGPU_ERROR("WebGPU present: shader module creation failed");
     return false;
   }
+  WGPUShaderSourceWGSL gamma_wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+  gamma_wgsl.code = MakeStringView(kGammaBlitWgsl);
+  WGPUShaderModuleDescriptor gamma_module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+  gamma_module_desc.nextInChain = &gamma_wgsl.chain;
+  gamma_module_desc.label = MakeStringView("rex present gamma blit");
+  gamma_shader_module_ = wgpuDeviceCreateShaderModule(device, &gamma_module_desc);
+  WGPUBufferDescriptor ramp_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+  ramp_desc.label = MakeStringView("rex present gamma ramp");
+  ramp_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+  ramp_desc.size = kGammaRampDwords * sizeof(uint32_t);
+  gamma_ramp_buffer_ = wgpuDeviceCreateBuffer(device, &ramp_desc);
 
   WGPUSamplerDescriptor sampler_desc = WGPU_SAMPLER_DESCRIPTOR_INIT;
   sampler_desc.label = MakeStringView("rex present bilinear");
@@ -113,24 +192,29 @@ bool WebGPUPresentPass::Initialize() {
   return sampler_ && uniform_buffer_;
 }
 
-const WebGPUPresentPass::Pipeline* WebGPUPresentPass::GetPipeline(WGPUTextureFormat format) {
+const WebGPUPresentPass::Pipeline* WebGPUPresentPass::GetPipeline(WGPUTextureFormat format,
+                                                                  bool gamma) {
   for (const Pipeline& pipeline : pipelines_) {
-    if (pipeline.format == format) {
+    if (pipeline.format == format && pipeline.gamma == gamma) {
       return &pipeline;
     }
+  }
+  WGPUShaderModule module = gamma ? gamma_shader_module_ : shader_module_;
+  if (!module) {
+    return nullptr;
   }
   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
   target.format = format;
   target.writeMask = WGPUColorWriteMask_All;
   WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
-  fragment.module = shader_module_;
+  fragment.module = module;
   fragment.entryPoint = MakeStringView("fs_main");
   fragment.targetCount = 1;
   fragment.targets = &target;
   WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
   desc.label = MakeStringView("rex present blit");
   desc.layout = nullptr;  // "auto"
-  desc.vertex.module = shader_module_;
+  desc.vertex.module = module;
   desc.vertex.entryPoint = MakeStringView("vs_main");
   desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
   desc.primitive.cullMode = WGPUCullMode_None;
@@ -143,6 +227,7 @@ const WebGPUPresentPass::Pipeline* WebGPUPresentPass::GetPipeline(WGPUTextureFor
   }
   Pipeline pipeline;
   pipeline.format = format;
+  pipeline.gamma = gamma;
   pipeline.pipeline = render_pipeline;
   pipeline.bind_group_layout = wgpuRenderPipelineGetBindGroupLayout(render_pipeline, 0);
   pipelines_.push_back(pipeline);
@@ -162,14 +247,18 @@ bool WebGPUPresentPass::EncodeClearAndBlit(WGPUCommandEncoder encoder, WGPUTextu
 
   const Pipeline* pipeline = nullptr;
   WGPUBindGroup bind_group = nullptr;
+  bool gamma = frame.gamma_ramp != Frame::GammaRamp::kNone && frame.gamma_ramp_data &&
+               gamma_ramp_buffer_;
   if (draw_source) {
-    pipeline = GetPipeline(target_format);
+    pipeline = GetPipeline(target_format, gamma);
     if (!pipeline) {
       draw_source = false;
     }
   }
   if (draw_source) {
-    BlitParams params;
+    BlitParams params = {};
+    params.gamma_mode = uint32_t(frame.gamma_ramp);
+    params.gamma_rb_swap = frame.gamma_rb_swap ? 1 : 0;
     params.uv_offset[0] = float(double(x0 - frame.dest_x) / double(frame.dest_width));
     params.uv_offset[1] = float(double(y0 - frame.dest_y) / double(frame.dest_height));
     params.uv_scale[0] = float(double(x1 - x0) / double(frame.dest_width));
@@ -187,7 +276,16 @@ bool WebGPUPresentPass::EncodeClearAndBlit(WGPUCommandEncoder encoder, WGPUTextu
     entries[1].binding = 1;
     entries[1].textureView = frame.source;
     entries[2].binding = 2;
-    entries[2].sampler = sampler_;
+    if (gamma) {
+      uint32_t ramp_dwords = frame.gamma_ramp == Frame::GammaRamp::kPwl ? kGammaRampDwords : 256;
+      wgpuQueueWriteBuffer(device_.queue(), gamma_ramp_buffer_, 0, frame.gamma_ramp_data,
+                           ramp_dwords * sizeof(uint32_t));
+      entries[2].buffer = gamma_ramp_buffer_;
+      entries[2].offset = 0;
+      entries[2].size = kGammaRampDwords * sizeof(uint32_t);
+    } else {
+      entries[2].sampler = sampler_;
+    }
     WGPUBindGroupDescriptor bind_group_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bind_group_desc.layout = pipeline->bind_group_layout;
     bind_group_desc.entryCount = 3;

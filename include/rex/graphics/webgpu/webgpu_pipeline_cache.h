@@ -203,8 +203,19 @@ class WebGPUPipelineCache {
     uint64_t pipelines_requested = 0;
     // Draws refused because of a resource limit or an unsupported shader
     // (pixel shader memexport: a writable shared memory binding in a pass that
-    // also reads it).
+    // also reads it). Sum of the draws_refused_* counters below.
     uint64_t draws_unsupported = 0;
+    // ConfigurePipeline refusals by reason.
+    uint64_t draws_refused_ps_memexport = 0;
+    // Shader texture/sampler bindings over the device limits (or failed layout).
+    uint64_t draws_refused_bindings = 0;
+    // Tessellated (domain) host vertex shaders.
+    uint64_t draws_refused_tessellation = 0;
+    // Front and back faces culled (WebGPU has no cull-both mode); nothing drawn.
+    uint64_t draws_refused_cull_both = 0;
+    // Shader translation failed (cached kInvalidPipelineId) or the
+    // webgpu_draw_with_pipelines diagnostic is off.
+    uint64_t draws_refused_no_pipeline = 0;
   };
   const Statistics& statistics() const { return statistics_; }
   // Written by createRenderPipelineAsync callbacks (device thread); shared so a

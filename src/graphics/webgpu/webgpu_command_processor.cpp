@@ -36,6 +36,10 @@
 
 REXCVAR_DEFINE_BOOL(webgpu_log_frames, false, "GPU",
                     "WebGPU: log submission/upload statistics on every swap (else every 600)");
+REXCVAR_DEFINE_BOOL(webgpu_swap_gamma_ramp, true, "GPU",
+                    "WebGPU: apply the guest display gamma ramp (PWL for 2_10_10_10 front "
+                    "buffers, else the 256-entry table) when copying the front buffer to the "
+                    "guest output, as the Vulkan and D3D12 backends do");
 
 namespace rex::graphics::webgpu {
 
@@ -461,12 +465,10 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
 
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     int32_t color_exp_bias = color_infos[i].color_exp_bias;
-    // 16_16 and 16_16_16_16 are float16 targets with the full -32...32 range
-    // (WebGPURenderTargetCache::IsFixedRG*16TruncatedToMinus1To1() == false).
-    if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
-        color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
-      color_exp_bias -= 5;
-    }
+    // 16_16 and 16_16_16_16 are float16 targets holding the guest value with the
+    // full -32...32 range (the EDRAM dump/load shaders convert 0x7FFF <-> 32.0).
+    // Unlike Vulkan's snorm16 host targets, nothing is remapped to -1...1, so no
+    // extra -5 exponent bias here (that made those targets 32x too dark).
     uint32_t scale_bits = UINT32_C(0x3F800000) + uint32_t(color_exp_bias << 23);
     std::memcpy(&c.color_exp_bias[i], &scale_bits, sizeof(float));
   }
@@ -656,6 +658,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     ++statistics_.draws_dropped;
+    ++statistics_.drops_render_targets;
     return true;
   }
   WebGPUDrawPipelineState pipeline_state;
@@ -684,6 +687,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   WebGPUDrawBindings draw_bindings;
   if (!pipeline_cache_->ConfigurePipeline(pipeline_state, pipeline, draw_bindings)) {
     ++statistics_.draws_dropped;
+    ++statistics_.drops_pipeline;
     return true;
   }
 
@@ -694,7 +698,10 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw_util::ViewportInfo viewport_info;
   // Host D24FS8 depth is guest * 0.5 (full_float24_in_0_to_1, as Vulkan; the
   // render target cache stores it that way); no float24 rounding in the PS.
-  draw_util::GetHostViewportInfo(regs, 1, 1, false, rt_width, rt_height, false,
+  // origin_bottom_left = true as on D3D12: WebGPU NDC +Y points up (towards
+  // framebuffer row 0), unlike Vulkan's. With false every draw was flipped
+  // vertically within its viewport and the face winding (culling) reversed.
+  draw_util::GetHostViewportInfo(regs, 1, 1, true, rt_width, rt_height, false,
                                  normalized_depth_control, false, true,
                                  pixel_shader && pixel_shader->writes_depth(), viewport_info);
   draw_util::Scissor scissor;
@@ -728,6 +735,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t constant_offsets[SpirvTr::kConstantBufferCount];
   if (!UpdateConstantBuffers(*vertex_shader, pixel_shader, constant_offsets)) {
     ++statistics_.draws_dropped;
+    ++statistics_.drops_constants;
     return true;
   }
 
@@ -771,6 +779,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             texture_cache_->UseSampler(texture_cache_->GetSamplerParameters(sampler));
         if (!entry.sampler) {
           ++statistics_.draws_dropped;
+          ++statistics_.drops_sampler;
           return true;
         }
       }
@@ -920,6 +929,9 @@ void WebGPUCommandProcessor::EncodeSwap(void* user, WebGPUReplayState& /*state*/
   WebGPUPresentPass::Frame frame;
   frame.clear_color = blit.clear_color;
   frame.source = blit.source;
+  frame.gamma_ramp = WebGPUPresentPass::Frame::GammaRamp(blit.gamma_mode);
+  frame.gamma_ramp_data = blit.gamma_ramp;
+  frame.gamma_rb_swap = blit.gamma_rb_swap;
   frame.dest_x = 0;
   frame.dest_y = 0;
   frame.dest_width = blit.width;
@@ -938,8 +950,49 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   uint32_t texture_width = 0, texture_height = 0;
   xenos::TextureFormat texture_format = xenos::TextureFormat(0);
-  WGPUTextureView swap_view =
-      texture_cache_->RequestSwapTexture(texture_width, texture_height, texture_format);
+  bool swap_needs_rb_swap = false;
+  WGPUTextureView swap_view = texture_cache_->RequestSwapTexture(
+      texture_width, texture_height, texture_format, &swap_needs_rb_swap);
+
+  // Display gamma ramp (VulkanCommandProcessor::IssueSwap: D3D initializes the
+  // 256-entry table for 8_8_8_8 output and the PWL ramp for 2_10_10_10).
+  using GammaRamp = WebGPUPresentPass::Frame::GammaRamp;
+  GammaRamp gamma_mode = GammaRamp::kNone;
+  if (swap_view && REXCVAR_GET(webgpu_swap_gamma_ramp)) {
+    bool pwl = texture_format == xenos::TextureFormat::k_2_10_10_10 ||
+               texture_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+    gamma_mode = pwl ? GammaRamp::kPwl : GammaRamp::kTable256;
+    if (pwl) {
+      static_assert(sizeof(swap_blit_.gamma_ramp) == 128 * 3 * sizeof(reg::DC_LUT_PWL_DATA));
+      std::memcpy(swap_blit_.gamma_ramp, gamma_ramp_pwl_rgb(), sizeof(swap_blit_.gamma_ramp));
+    } else {
+      std::memcpy(swap_blit_.gamma_ramp, gamma_ramp_256_entry_table(),
+                  256 * sizeof(reg::DC_LUT_30_COLOR));
+    }
+    uint64_t ramp_hash = XXH3_64bits(swap_blit_.gamma_ramp, sizeof(swap_blit_.gamma_ramp)) ^
+                         uint64_t(gamma_mode);
+    if (ramp_hash != logged_gamma_ramp_hash_) {
+      logged_gamma_ramp_hash_ = ramp_hash;
+      // A few points of the curve (10-bit output for inputs 0, 1/4, 1/2, 3/4, 1).
+      auto sample = [&](uint32_t channel, float x) -> uint32_t {
+        if (pwl) {
+          uint32_t v = std::min(uint32_t(x * 1023.0f + 0.5f), 1023u);
+          reg::DC_LUT_PWL_DATA e;
+          e.value = swap_blit_.gamma_ramp[(v >> 3) * 3 + channel];
+          return std::min(uint32_t((e.base + ((v & 7) * e.delta) / 8) >> 6), 1023u);
+        }
+        uint32_t v = std::min(uint32_t(x * 255.0f + 0.5f), 255u);
+        return (swap_blit_.gamma_ramp[v] >> (20 - 10 * channel)) & 0x3FF;
+      };
+      REXGPU_INFO(
+          "WebGPU: swap gamma ramp {} (front buffer format {}): R {} {} {} {} {}, G {} {} {} {} "
+          "{}, B {} {} {} {} {} (of 1023)",
+          pwl ? "PWL" : "256-entry table", uint32_t(texture_format), sample(0, 0.0f),
+          sample(0, 0.25f), sample(0, 0.5f), sample(0, 0.75f), sample(0, 1.0f), sample(1, 0.0f),
+          sample(1, 0.25f), sample(1, 0.5f), sample(1, 0.75f), sample(1, 1.0f), sample(2, 0.0f),
+          sample(2, 0.25f), sample(2, 0.5f), sample(2, 0.75f), sample(2, 1.0f));
+    }
+  }
   uint32_t output_width = std::clamp<uint32_t>(
       frontbuffer_width ? frontbuffer_width : texture_width, 1, 8192);
   uint32_t output_height = std::clamp<uint32_t>(
@@ -970,6 +1023,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           swap_blit_.width = webgpu_context.width();
           swap_blit_.height = webgpu_context.height();
           swap_blit_.clear_color = clear_color;
+          swap_blit_.gamma_mode = uint32_t(gamma_mode);
+          swap_blit_.gamma_rb_swap = swap_needs_rb_swap;
           EndRenderPass();
           command_stream().CmdEncoderCallback(EncodeSwap, this);
           // The contract: the writes are queue-submitted when this returns.
@@ -995,7 +1050,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     const WebGPUTextureCache::Statistics& textures = texture_cache_->statistics();
     REXGPU_INFO(
         "WebGPU: swap #{} front buffer {:08X} {}x{} presented={} swap texture {}x{} fmt {} ({}) | "
-        "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | pipelines {} "
+        "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | drops: render "
+        "targets {} (no attachments {}), pipeline {} (ps memexport {}, bindings {}, tessellation "
+        "{}, cull both {}, no pipeline {}), constants {}, sampler {} | pipelines {} "
         "requested {} created {} failed | textures {} loads {} failures {} | constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
@@ -1004,6 +1061,11 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
         statistics_.draws_culled, pipelines.draws_unsupported, statistics_.copies,
+        statistics_.drops_render_targets, render_target_cache_->statistics().updates_without_attachments,
+        statistics_.drops_pipeline, pipelines.draws_refused_ps_memexport,
+        pipelines.draws_refused_bindings, pipelines.draws_refused_tessellation,
+        pipelines.draws_refused_cull_both, pipelines.draws_refused_no_pipeline,
+        statistics_.drops_constants, statistics_.drops_sampler,
         pipelines.pipelines_requested, pipeline_cache_->pipelines_created(),
         pipeline_cache_->pipelines_failed(), textures.textures_created, textures.loads,
         textures.load_failures, statistics_.constant_bytes >> 10, submission_tracker_.submitted(),

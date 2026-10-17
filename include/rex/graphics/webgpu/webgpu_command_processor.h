@@ -103,6 +103,14 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint64_t swaps = 0;
     uint64_t draws = 0;
     uint64_t draws_dropped = 0;
+    // draws_dropped by reason: RenderTargetCache::Update failed (of which
+    // WebGPURenderTargetCache::Statistics::updates_without_attachments had no
+    // attachment at all), ConfigurePipeline refused (WebGPUPipelineCache
+    // draws_refused_*), the constant arena was full, a sampler couldn't be made.
+    uint64_t drops_render_targets = 0;
+    uint64_t drops_pipeline = 0;
+    uint64_t drops_constants = 0;
+    uint64_t drops_sampler = 0;
     // Draws with an empty viewport or scissor (nothing to rasterize).
     uint64_t draws_culled = 0;
     // Draws recorded with a pipeline and bind groups.
@@ -175,8 +183,14 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint32_t width = 0;
     uint32_t height = 0;
     WGPUColor clear_color = {0.0, 0.0, 0.0, 1.0};
+    // WebGPUPresentPass::Frame::GammaRamp and its data (PWL: 128 x 3 dwords,
+    // table: the first 256).
+    uint32_t gamma_mode = 0;
+    bool gamma_rb_swap = false;
+    uint32_t gamma_ramp[128 * 3] = {};
   };
   SwapBlit swap_blit_;
+  uint64_t logged_gamma_ramp_hash_ = 0;
   // Last RB_COLOR_CLEAR seen in a resolve with color clear.
   bool has_last_color_clear_ = false;
   uint32_t last_color_clear_ = 0;
