@@ -32,7 +32,7 @@
 #endif
 #include <rex/audio/audio_system.h>
 #if REX_PLATFORM_WEB
-#include <rex/audio/nop/nop_audio_system.h>
+#include <rex/audio/web/web_audio_system.h>
 #else
 #include <rex/audio/sdl/sdl_audio_system.h>
 #endif
@@ -144,8 +144,8 @@ bool ReXApp::OnInitialize() {
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::null::NullGraphicsSystem);
 #endif
 #if REX_PLATFORM_WEB
-  // STUB: no browser audio driver yet (WS-E); see docs/port/STUBS.md.
-  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::nop::NopAudioSystem);
+  // AudioWorklet driver (src/audio/web); paces silently until the autoplay gate opens.
+  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::web::WebAudioSystem);
 #else
   config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
 #endif
