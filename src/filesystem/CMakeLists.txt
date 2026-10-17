@@ -17,6 +17,15 @@ add_library(rexfilesystem STATIC
 )
 add_library(rex::filesystem ALIAS rexfilesystem)
 
+if(EMSCRIPTEN)
+    # Web-only: game:/cache: over HTTP Range (+ OPFS block cache) and OPFS mounting for
+    # xstorage:. See docs/port/vfs.md in the project repo.
+    target_sources(rexfilesystem PRIVATE
+        devices/http_range_device.cpp
+        web_storage.cpp
+    )
+endif()
+
 target_link_libraries(rexfilesystem PUBLIC rexcore)
 target_include_directories(rexfilesystem PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
