@@ -647,6 +647,24 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
   var words = vec4<u32>(0u);
   if (xe_resolve.raw != 0u) {
     words = vec4<u32>(xe_load_source(x0, y, xe_resolve.sample_select, tile_w), 0u, 0u);
+    if (xe_resolve.dest_swap != 0u) {
+      // Red/blue swap of the bitwise-equivalent formats, as xenia's
+      // resolve_fast_32bpp/64bpp shaders (by the EDRAM format): 8_8_8_8(_GAMMA)
+      // bytes 0 <-> 2, 2_10_10_10 (incl. FLOAT / AS_10_10_10_10 / AS_16_16_16_16)
+      // bits 0-9 <-> 20-29, 16_16_16_16(_FLOAT) the low halves of the two words.
+      let f = xe_resolve.edram_format;
+      if (xe_resolve.edram_is_64bpp != 0u) {
+        if (f == 5u || f == 7u) {
+          words = vec4<u32>((words.x & 0xFFFF0000u) | (words.y & 0xFFFFu),
+                            (words.y & 0xFFFF0000u) | (words.x & 0xFFFFu), 0u, 0u);
+        }
+      } else if (f == 0u || f == 1u) {
+        words.x = (words.x & 0xFF00FF00u) | ((words.x & 0xFFu) << 16u) | ((words.x >> 16u) & 0xFFu);
+      } else if (f == 2u || f == 3u || f == 10u || f == 12u) {
+        words.x = (words.x & 0xC00FFC00u) | ((words.x & 0x3FFu) << 20u) |
+                  ((words.x >> 20u) & 0x3FFu);
+      }
+    }
   } else {
     let scale = ldexp(1.0, xe_resolve.dest_exp_bias);
     for (var k = 0u; k < (1u << ppi_log2); k = k + 1u) {
