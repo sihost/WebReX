@@ -123,10 +123,56 @@ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
 #define PPC_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2)))
 
+// Checked indirect calls (debug builds, or force with -DPPC_CHECKED_INDIRECT_CALLS=1).
+// Rejects targets outside [CODE_BASE, CODE_BASE + CODE_SIZE + thunk reserve) - the range
+// Memory::SetFunction accepts - and null slots, with the guest target in the log. Without
+// the check an out-of-range target reads guest data as a function pointer, and a null slot
+// is a segfault natively / an unrecoverable "null function" trap on wasm.
+#ifndef PPC_CHECKED_INDIRECT_CALLS
+#ifdef NDEBUG
+#define PPC_CHECKED_INDIRECT_CALLS 0
+#else
+#define PPC_CHECKED_INDIRECT_CALLS 1
+#endif
+#endif
+
 #undef PPC_CALL_INDIRECT_FUNC
+#if PPC_CHECKED_INDIRECT_CALLS
+// Must match kThunkReserveSize in Memory::InitializeFunctionTable (src/system/xmemory.cpp).
+#define PPC_FUNC_TABLE_THUNK_RESERVE 0x10000u
+#define PPC_CALL_INDIRECT_FUNC(x)                                                           \
+  do {                                                                                      \
+    const uint32_t _ppc_target = uint32_t(x);                                               \
+    PPCFunc* _ppc_fn = nullptr;                                                             \
+    if (_ppc_target - uint32_t(PPC_CODE_BASE) <                                             \
+        uint32_t(PPC_CODE_SIZE) + PPC_FUNC_TABLE_THUNK_RESERVE) {                           \
+      _ppc_fn = PPC_LOOKUP_FUNC(base, _ppc_target);                                         \
+    }                                                                                       \
+    if (!_ppc_fn) [[unlikely]] {                                                            \
+      ::rex::detail::PPCBadIndirectCall(_ppc_target, ctx.lr, uint32_t(PPC_CODE_BASE),       \
+                                        uint32_t(PPC_CODE_SIZE) + PPC_FUNC_TABLE_THUNK_RESERVE); \
+    }                                                                                       \
+    _ppc_fn(ctx, base);                                                                     \
+  } while (0);
+#else
 #define PPC_CALL_INDIRECT_FUNC(x) PPC_LOOKUP_FUNC(base, x)(ctx, base);
+#endif
 
 #endif  // PPC_CONFIG_H_INCLUDED
+
+namespace rex::detail {
+// Cold path of the checked PPC_CALL_INDIRECT_FUNC: logs and aborts.
+[[noreturn, gnu::cold, gnu::noinline]] inline void PPCBadIndirectCall(uint32_t target, uint64_t lr,
+                                                                       uint32_t code_base,
+                                                                       uint32_t table_span) {
+  if (target - code_base >= table_span) {
+    REX_FATAL("indirect call to {:08X} (lr={:08X}) outside the function table [{:08X}, {:08X})",
+              target, uint32_t(lr), code_base, code_base + table_span);
+  }
+  REX_FATAL("indirect call to {:08X} (lr={:08X}): no host function registered", target,
+            uint32_t(lr));
+}
+}  // namespace rex::detail
 
 //=============================================================================
 // Unimplemented Instruction Exception

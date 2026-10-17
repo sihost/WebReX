@@ -61,7 +61,12 @@ constexpr uint32_t HEAP_ZERO_MEMORY = 0x00000008;
 namespace rex::kernel::crt {
 
 void* ReXHeap::GuestToHost(uint32_t guest_addr) const {
+#if REX_PLATFORM_WEB
+  // No aliasing views on web: fold like Memory::TranslateVirtual (identity below physical).
+  return membase_ + rex::fold::Fold(guest_addr);
+#else
   return membase_ + guest_addr;
+#endif
 }
 
 uint32_t ReXHeap::HostToGuest(void* host_ptr) const {

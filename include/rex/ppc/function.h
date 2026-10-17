@@ -186,8 +186,13 @@ struct ArgTranslator {
       }
     }
     // Stack arguments at r1 + 0x54 + ((arg - 8) * 8)
+#if REX_PLATFORM_WEB
+    return __builtin_bswap32(*reinterpret_cast<uint32_t*>(
+        PPC_HOST_ADDR(base, uint32_t(ctx.r1.u32 + 0x54 + ((arg - 8) * 8)))));
+#else
     return __builtin_bswap32(
         *reinterpret_cast<uint32_t*>(base + ctx.r1.u32 + 0x54 + ((arg - 8) * 8)));
+#endif
   }
 
   // Get float/double argument value from FPR
@@ -327,8 +332,7 @@ struct ArgTranslator {
       return T(nullptr);
     }
     uint32_t guest_addr = static_cast<uint32_t>(v);
-    inner_t* host_ptr =
-        reinterpret_cast<inner_t*>(base + guest_addr + detail::PhysicalHostOffset(guest_addr));
+    inner_t* host_ptr = reinterpret_cast<inner_t*>(PPC_HOST_ADDR(base, guest_addr));
     return T(host_ptr, guest_addr);
   }
 
@@ -362,7 +366,7 @@ struct ArgTranslator {
       return nullptr;
     }
     uint32_t guest_addr = static_cast<uint32_t>(v);
-    return reinterpret_cast<T>(base + guest_addr + detail::PhysicalHostOffset(guest_addr));
+    return reinterpret_cast<T>(PPC_HOST_ADDR(base, guest_addr));
   }
 
   // Set typed value
@@ -569,7 +573,11 @@ T GuestToHostFunction(const TFunction& func, TArgs&&... argv) {
     return;
   } else if constexpr (std::is_pointer_v<T>) {
     uint32_t guest_addr = newCtx.r3.u32;
+#if REX_PLATFORM_WEB
+    return guest_addr ? reinterpret_cast<T>(PPC_HOST_ADDR(base, guest_addr)) : nullptr;
+#else
     return guest_addr ? reinterpret_cast<T>(base + guest_addr) : nullptr;
+#endif
   } else if constexpr (is_precise_v<T>) {
     return static_cast<T>(newCtx.f1.f64);
   } else {

@@ -44,7 +44,12 @@ std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
   // Install exception handler for memory coherence (SharedMemory write tracking).
   // Note: MMIO operations are handled at the recompiler level via PPC_MM_LOAD/STORE
   // macros that call CheckLoad/CheckStore directly.
+#if !REX_PLATFORM_WEB
   arch::ExceptionHandler::Install(ExceptionCallbackThunk, handler.get());
+#else
+  // Web: nothing faults (no page protection); MMIO is routed by the fold's 0x7F rare path
+  // and write watches by the dirty map (rex/ppc/fold_web.h).
+#endif
 
   global_handler_ = handler.get();
   return handler;
@@ -64,7 +69,9 @@ MMIOHandler::MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, ui
       access_violation_callback_context_(access_violation_callback_context) {}
 
 MMIOHandler::~MMIOHandler() {
+#if !REX_PLATFORM_WEB
   arch::ExceptionHandler::Uninstall(ExceptionCallbackThunk, this);
+#endif
 
   if (global_handler_ == this) {
     global_handler_ = nullptr;

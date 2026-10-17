@@ -27,6 +27,10 @@
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
 
+#if REX_PLATFORM_WEB
+#include <rex/ppc/fold_web.h>
+#endif
+
 //=============================================================================
 // Physical Heap Offset (Windows Granularity Workaround)
 //=============================================================================
@@ -38,14 +42,62 @@
 // everywhere and adding it to every single memory access.
 // Maybe a separate base pointer for the 0xE0 heap?
 //=============================================================================
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WEB
+// Web: the fold (rex/ppc/fold_web.h) already contains the 0xE0 +0x1000. Kept as a symbol
+// for SDK users that still add it.
+#define PPC_PHYS_HOST_OFFSET(addr) 0u
+#elif REX_PLATFORM_WIN32
 #define PPC_PHYS_HOST_OFFSET(addr) (((uint32_t)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define PPC_PHYS_HOST_OFFSET(addr) 0u  // Linux has 4KB granularity, file offset works
 #endif
 
+//=============================================================================
+// Guest -> host translation (portable spellings)
+//=============================================================================
+// PPC_FOLD(x)          host offset of guest address x relative to the guest window base.
+// PPC_HOST_ADDR(b, x)  host pointer for guest address x, given the window base b.
+// Native: x + PPC_PHYS_HOST_OFFSET(x) (the aliasing views do the rest).
+// Web:    the Layout B fold (top-byte delta table, memory.md section 4).
+#if REX_PLATFORM_WEB
+#define PPC_FOLD(x) (::rex::fold::Fold((uint32_t)(x)))
+#define PPC_IS_RARE(x) (::rex::fold::IsRare((uint32_t)(x)))
+#define PPC_PHYS_OFF (::rex::fold::kPhysOffset)
+#define PPC_MARK_DIRTY(o) (::rex::fold::MarkDirtyHostOffset(o))
+#else
+#define PPC_FOLD(x) ((uint64_t)(uint32_t)(x) + PPC_PHYS_HOST_OFFSET(x))
+#endif
+#define PPC_HOST_ADDR(b, x) ((b) + PPC_FOLD(x))
+
 // Raw address calculation with physical offset (for operations that don't use PPC_LOAD/PPC_STORE)
+// PPC_RAW_ADDR is for reads (lvx, lwarx, ...). PPC_RAW_ADDR_W is for raw *writes* (stvx,
+// stwcx./stdcx., dcbz/dcbz128): on web it also marks the physical page dirty (write-watch
+// replacement); natively it is identical to PPC_RAW_ADDR.
+#if REX_PLATFORM_WEB
+#define PPC_RAW_ADDR(x) (base + PPC_FOLD(x))
+#define PPC_RAW_ADDR_W(x) (::rex::fold::RawAddrW(base, (uint32_t)(x)))
+#else
 #define PPC_RAW_ADDR(x) (base + (uint32_t)(x) + PPC_PHYS_HOST_OFFSET(x))
+#define PPC_RAW_ADDR_W(x) PPC_RAW_ADDR(x)
+#endif
+
+//=============================================================================
+// Web Load/Store (folded; the native #ifndef definitions below are then skipped)
+//=============================================================================
+// Every access folds through the constexpr table; top byte 0x7F goes out of line
+// (MMIO window -> MMIOHandler, else the physical alias). Stores mark physical pages dirty.
+#if REX_PLATFORM_WEB
+#define PPC_LOAD_U8(x) (::rex::fold::Load8(base, (uint32_t)(x)))
+#define PPC_LOAD_U16(x) (::rex::fold::Load16(base, (uint32_t)(x)))
+#define PPC_LOAD_U32(x) (::rex::fold::Load32(base, (uint32_t)(x)))
+#define PPC_LOAD_U64(x) (::rex::fold::Load64(base, (uint32_t)(x)))
+#define PPC_LOAD_STRING(x, len) \
+  std::string_view(reinterpret_cast<const char*>(base + PPC_FOLD(x)), (len))
+#define PPC_STORE_U8(x, y) (::rex::fold::Store8(base, (uint32_t)(x), (uint8_t)(y)))
+#define PPC_STORE_U16(x, y) (::rex::fold::Store16(base, (uint32_t)(x), (uint16_t)(y)))
+#define PPC_STORE_U32(x, y) (::rex::fold::Store32(base, (uint32_t)(x), (uint32_t)(y)))
+#define PPC_STORE_U64(x, y) (::rex::fold::Store64(base, (uint32_t)(x), (uint64_t)(y)))
+#endif  // REX_PLATFORM_WEB
 
 //=============================================================================
 // Load Macros (Big-Endian to Host)
@@ -123,6 +175,19 @@
 //=============================================================================
 // If the address is in MMIO range, dispatch to MMIOHandler.
 // Otherwise, perform a regular memory store with physical offset compensation.
+
+#if REX_PLATFORM_WEB
+// Web: every plain access is already MMIO-checked (top byte 0x7F rare path), so the
+// MMIO-annotated forms are aliases of the checked macros.
+#define PPC_MM_STORE_U8(addr, val) PPC_STORE_U8(addr, val)
+#define PPC_MM_STORE_U16(addr, val) PPC_STORE_U16(addr, val)
+#define PPC_MM_STORE_U32(addr, val) PPC_STORE_U32(addr, val)
+#define PPC_MM_STORE_U64(addr, val) PPC_STORE_U64(addr, val)
+#define PPC_MM_LOAD_U8(addr) PPC_LOAD_U8(addr)
+#define PPC_MM_LOAD_U16(addr) PPC_LOAD_U16(addr)
+#define PPC_MM_LOAD_U32(addr) PPC_LOAD_U32(addr)
+#define PPC_MM_LOAD_U64(addr) PPC_LOAD_U64(addr)
+#else  // !REX_PLATFORM_WEB
 
 #define PPC_MM_STORE_U8(addr, val)                                                         \
   do {                                                                                     \
@@ -215,6 +280,8 @@
            (static_cast<uint64_t>(_hi) << 32) | _lo;                                 \
          })                                                                          \
        : __builtin_bswap64(*(volatile uint64_t*)(base + (addr) + PPC_PHYS_HOST_OFFSET(addr))))
+
+#endif  // REX_PLATFORM_WEB
 
 namespace rex {
 

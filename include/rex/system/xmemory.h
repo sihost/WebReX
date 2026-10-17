@@ -18,7 +18,9 @@
 #include <vector>
 
 #include <rex/memory/utils.h>
+#include <rex/platform.h>
 #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
+#include <rex/ppc/fold_web.h>  // Layout B fold (used under REX_PLATFORM_WEB, tests natively)
 #include <rex/system/mmio_handler.h>
 #include <rex/thread/mutex.h>
 
@@ -123,7 +125,22 @@ class BaseHeap {
 
   template <typename T = uint8_t*>
   inline T TranslateRelative(size_t relative_address) const {
+#if REX_PLATFORM_WEB
+    // No aliasing views on web: the physical views (vA0/vC0/vE0, membase_ = virtual base)
+    // and the 0x9 xex view must fold onto their canonical host range. For the raw
+    // physical heap (membase_ = physical base, heap_base_ 0) the fold delta is 0.
+    return reinterpret_cast<T>(membase_ +
+                               fold::Fold(uint32_t(heap_base_ + relative_address)));
+#else
     return reinterpret_cast<T>(membase_ + heap_base_ + host_address_offset_ + relative_address);
+#endif
+  }
+
+  // True if the page containing address is reserved or committed. Lock-free read of the
+  // page table (a racing allocation may be missed); used for the web reverse lookup.
+  bool IsPageReserved(uint32_t address) const {
+    const uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+    return page_number < page_table_.size() && page_table_[page_number].state != 0;
   }
 
   // Disposes and decommits all memory and clears the page table.
@@ -282,6 +299,14 @@ class PhysicalHeap : public BaseHeap {
   std::vector<SystemPageFlagsBlock> system_page_flags_;
 };
 
+// One aliasing host view of the native guest window (xmemory.cpp map_info): guest
+// [virtual_address_start, virtual_address_end] is backed by mapping offset target_address.
+struct GuestViewMapEntry {
+  uint64_t virtual_address_start;
+  uint64_t virtual_address_end;
+  uint64_t target_address;
+};
+
 // Models the entire guest memory system on the console.
 // This exposes interfaces to both virtual and physical memory and a TLB and
 // page table for allocation, mapping, and protection.
@@ -321,12 +346,17 @@ class Memory {
   // Note that the contents at the specified host address are big-endian.
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) const {
+#if REX_PLATFORM_WEB
+    // Layout B fold (rex/ppc/fold_web.h); host_address_offset is always 0 on web.
+    return reinterpret_cast<T>(virtual_membase_ + fold::Fold(guest_address));
+#else
     uint8_t* host_address = virtual_membase_ + guest_address;
     const auto heap = LookupHeap(guest_address);
     if (heap) {
       host_address += heap->host_address_offset();
     }
     return reinterpret_cast<T>(host_address);
+#endif
   }
 
   // Base address of physical memory in the host address space.
@@ -357,6 +387,32 @@ class Memory {
 
   // Copies a non-overlapping range of guest memory (like a memcpy).
   void Copy(uint32_t dest, uint32_t src, uint32_t size);
+
+  // Write-watch replacement for hosts without page protection (web, memory.md section 7).
+  //
+  // Host code that writes guest memory without going through the PPC_STORE_* macros must
+  // call MarkPhysicalDirty (guest virtual address) or MarkPhysicalDirtyPhysical (guest
+  // physical address, i.e. writes through TranslatePhysical) after the write. Zero, Fill and
+  // Copy already do. GPU-side writers (memexport/resolve) must NOT mark: they validate the
+  // range themselves. Natively these are no-ops: page protection faults deliver the
+  // invalidation callbacks synchronously.
+#if REX_PLATFORM_WEB
+  void MarkPhysicalDirty(uint32_t guest_address, uint32_t length);
+  void MarkPhysicalDirtyPhysical(uint32_t physical_address, uint32_t length);
+#else
+  void MarkPhysicalDirty(uint32_t, uint32_t) {}
+  void MarkPhysicalDirtyPhysical(uint32_t, uint32_t) {}
+#endif
+
+  // Consumes the dirty map for guest physical [physical_address, +length): clears the dirty
+  // pages atomically and calls every registered PhysicalMemoryInvalidationCallback for each
+  // dirty run (exact range, with the global critical region held). Returns true if any page
+  // was dirty. GPU caches (SharedMemory::RequestRange, PrimitiveProcessor) call this before
+  // trusting their copy on web. Natively nothing marks the map, so it returns false.
+  bool ConsumePhysicalDirty(uint32_t physical_address, uint32_t length);
+
+  // The native aliasing view table (map_info), exposed for the fold unit tests.
+  static const GuestViewMapEntry* GetViewMapInfo(size_t* out_count);
 
   // Searches the given range of guest memory for a run of dword values in
   // big-endian order.
@@ -532,6 +588,8 @@ class Memory {
 
   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
   uint8_t* mapping_base_ = nullptr;
+  // Web: the malloc'd block holding the (64 KiB aligned) guest window.
+  void* web_window_allocation_ = nullptr;
   union {
     struct {
       uint8_t* v00000000;

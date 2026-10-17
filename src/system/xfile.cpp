@@ -164,6 +164,9 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                   buffer_length),
               size_t(byte_offset), &bytes_read);
           if (XSUCCEEDED(result)) {
+            // Web write-watch replacement (no-op natively): the host read bypassed the
+            // store macros, so mark the physical pages it filled dirty for the GPU.
+            memory()->MarkPhysicalDirty(buffer_guest_address, uint32_t(bytes_read));
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
                   rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,

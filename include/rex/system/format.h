@@ -163,8 +163,7 @@ class StackArgList {
     } else {
       // Stack arguments: 8-byte big-endian values at r1 + 0x54 + ((index - 8) * 8)
       uint32_t stack_addr = ctx_.r1.u32 + 0x54 + ((index_ - 8) * 8);
-      value = __builtin_bswap64(
-          *reinterpret_cast<uint64_t*>(base_ + stack_addr + PPC_PHYS_HOST_OFFSET(stack_addr)));
+      value = __builtin_bswap64(*reinterpret_cast<uint64_t*>(PPC_HOST_ADDR(base_, stack_addr)));
     }
     ++index_;
     return value;
@@ -189,8 +188,7 @@ class ArrayArgList {
 
   uint64_t get64() {
     uint32_t addr = arg_ptr_ + (8 * index_);
-    uint64_t value =
-        __builtin_bswap64(*reinterpret_cast<uint64_t*>(base_ + addr + PPC_PHYS_HOST_OFFSET(addr)));
+    uint64_t value = __builtin_bswap64(*reinterpret_cast<uint64_t*>(PPC_HOST_ADDR(base_, addr)));
     ++index_;
     return value;
   }
@@ -711,7 +709,7 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
               text.length = std::min((int32_t)strlen(nullstr), cap);
               text.is_wide = false;
             } else {
-              void* str = reinterpret_cast<void*>(base + pointer + PPC_PHYS_HOST_OFFSET(pointer));
+              void* str = reinterpret_cast<void*>(PPC_HOST_ADDR(base, pointer));
               bool is_wide;
               if (flags & (FF_IsLong | FF_IsWide)) {
                 is_wide = true;

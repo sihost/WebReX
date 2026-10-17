@@ -5,6 +5,7 @@ set(REXSYSTEM_SOURCES
     runtime.cpp
     kernel_state.cpp
     xmemory.cpp
+    memory_fold_web.cpp  # Layout B fold runtime (used on web; compiled everywhere for tests)
     kernel_module.cpp
     user_module.cpp
     xthread.cpp
