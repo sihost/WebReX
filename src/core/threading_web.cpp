@@ -27,12 +27,14 @@
 #include <rex/platform.h>
 #include <rex/thread.h>
 #include <rex/thread/safe_point.h>
+#include <rex/thread/thread_report.h>
 
 static_assert(REX_PLATFORM_WEB, "This file is web-only (Emscripten)");
 
 #include <emscripten/threading.h>
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +43,7 @@ static_assert(REX_PLATFORM_WEB, "This file is web-only (Emscripten)");
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
@@ -74,9 +77,22 @@ std::atomic<uint32_t> g_next_system_id{1};
 class WebObject;
 class WebThread;
 
+// What a thread is doing, for DescribeThreadsForDiagnostics only (written by the thread itself,
+// read racily by the report).
+struct ThreadDiagnostics {
+  std::atomic<int> tid{0};                        // pthread tid (gettid), 0 until started
+  std::atomic<const char*> state{"created"};     // static strings
+  std::atomic<const void*> wait_object{nullptr};  // first object of the wait
+  std::atomic<const char*> wait_kind{nullptr};
+  std::atomic<uint32_t> wait_count{0};
+  std::atomic<bool> wait_timed{false};
+  std::atomic<int64_t> state_since_us{0};  // steady clock
+};
+
 // Per-thread scheduling state. Shared (shared_ptr) between the thread itself and its Thread
 // object, so either may go away first. Every field is guarded by g_dispatcher unless noted.
 struct ThreadControl {
+  ThreadDiagnostics diag;  // not guarded (atomics)
   std::condition_variable cv;  // only its own thread waits on it (with g_dispatcher)
   uint32_t system_id = 0;      // immutable after creation
   pthread_t pthread{};
@@ -99,6 +115,29 @@ struct ThreadControl {
 thread_local std::shared_ptr<ThreadControl> tls_control_ref;
 thread_local ThreadControl* tls_control = nullptr;
 
+// Every control block ever created (kept alive; a few dozen per process), for the report.
+std::mutex g_registry_mutex;
+std::vector<std::shared_ptr<ThreadControl>>* g_registry = nullptr;
+
+void RegisterControl(const std::shared_ptr<ThreadControl>& control) {
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  if (!g_registry) {
+    g_registry = new std::vector<std::shared_ptr<ThreadControl>>();
+  }
+  g_registry->push_back(control);
+}
+
+int64_t SteadyMicros() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void SetDiagState(ThreadControl* c, const char* state) {
+  c->diag.state_since_us.store(SteadyMicros(), std::memory_order_relaxed);
+  c->diag.state.store(state, std::memory_order_relaxed);
+}
+
 uint64_t AllProcessorsMask() {
   uint32_t n = std::clamp<uint32_t>(logical_processor_count(), 1u, 64u);
   return n >= 64 ? ~uint64_t(0) : ((uint64_t(1) << n) - 1);
@@ -120,6 +159,9 @@ ThreadControl* CurrentControl() {
   control->pthread = pthread_self();
   control->started = true;
   control->affinity_mask = AllProcessorsMask();
+  control->diag.tid.store(gettid(), std::memory_order_relaxed);
+  SetDiagState(control.get(), "running");
+  RegisterControl(control);
   tls_control_ref = std::move(control);
   tls_control = tls_control_ref.get();
   return tls_control;
@@ -146,12 +188,14 @@ SafePointAction SafePointLocked(ThreadControl* c, std::unique_lock<std::mutex>& 
     if (!c->parked) {
       c->parked = true;
       UpdateSafePointFlagLocked(c);
+      SetDiagState(c, "suspended");
     }
     c->cv.wait(lock);
   }
   if (c->parked) {
     c->parked = false;
     UpdateSafePointFlagLocked(c);
+    SetDiagState(c, "running");
   }
   return c->terminate_requested ? SafePointAction::kTerminate : SafePointAction::kContinue;
 }
@@ -168,6 +212,8 @@ class WebObject {
     assert_true(waiters_.empty());
   }
 
+  // For the diagnostics report.
+  virtual const char* KindName() const = 0;
   // True if a wait by `waiter` would be satisfied right now.
   virtual bool IsSignaledLocked(const ThreadControl* waiter) const = 0;
   // Applies the side effect of a satisfied wait (auto-reset, count--, take ownership).
@@ -324,12 +370,21 @@ std::pair<WaitResult, size_t> WaitCore(WebObject* const* objects, size_t count, 
         objects[i]->AddWaiterLocked(self);
       }
       registered = true;
+      self->diag.wait_object.store(count ? objects[0] : nullptr, std::memory_order_relaxed);
+      self->diag.wait_kind.store(count ? objects[0]->KindName() : nullptr,
+                                 std::memory_order_relaxed);
+      self->diag.wait_count.store(uint32_t(count), std::memory_order_relaxed);
+      self->diag.wait_timed.store(deadline != Clock::time_point::max(), std::memory_order_relaxed);
+      SetDiagState(self, !count ? "sleep(alertable)" : wait_all ? "wait-all" : "wait");
     }
     if (deadline == Clock::time_point::max()) {
       self->cv.wait(lock);
     } else {
       self->cv.wait_until(lock, deadline);
     }
+  }
+  if (registered) {
+    SetDiagState(self, "running");
   }
   unregister();
   lock.unlock();
@@ -376,6 +431,9 @@ class WebEvent final : public Event, public WebObject {
 
   void* native_handle() const override { return const_cast<WebEvent*>(this); }
 
+  const char* KindName() const override {
+    return manual_reset_ ? "event(manual)" : "event(auto)";
+  }
   bool IsSignaledLocked(const ThreadControl*) const override { return signaled_; }
   void AcquireLocked(ThreadControl*) override {
     if (!manual_reset_) {
@@ -412,6 +470,7 @@ class WebSemaphore final : public Semaphore, public WebObject {
 
   void* native_handle() const override { return const_cast<WebSemaphore*>(this); }
 
+  const char* KindName() const override { return "semaphore"; }
   bool IsSignaledLocked(const ThreadControl*) const override { return count_ > 0; }
   void AcquireLocked(ThreadControl*) override { --count_; }
   bool SignalLocked(ThreadControl*) override { return ReleaseLocked(1, nullptr); }
@@ -454,6 +513,7 @@ class WebMutant final : public Mutant, public WebObject {
 
   void* native_handle() const override { return const_cast<WebMutant*>(this); }
 
+  const char* KindName() const override { return "mutant"; }
   bool IsSignaledLocked(const ThreadControl* waiter) const override {
     return count_ == 0 || owner_ == waiter;
   }
@@ -624,6 +684,7 @@ class WebTimer final : public Timer, public WebObject {
 
   void* native_handle() const override { return const_cast<WebTimer*>(this); }
 
+  const char* KindName() const override { return "timer"; }
   bool IsSignaledLocked(const ThreadControl*) const override { return signaled_; }
   void AcquireLocked(ThreadControl*) override {
     if (!manual_reset_) {
@@ -826,6 +887,7 @@ class WebThread final : public Thread, public WebObject {
     control_->cv.notify_all();
   }
 
+  const char* KindName() const override { return "thread"; }
   bool IsSignaledLocked(const ThreadControl*) const override { return control_->finished; }
   void AcquireLocked(ThreadControl*) override {}
   bool SignalLocked(ThreadControl*) override { return true; }
@@ -837,6 +899,7 @@ class WebThread final : public Thread, public WebObject {
 };
 
 void MarkFinishedLocked(ThreadControl* c, int exit_code) {
+  SetDiagState(c, "finished");
   c->finished = true;
   c->exit_code = exit_code;
   UpdateSafePointFlagLocked(c);
@@ -867,6 +930,8 @@ void* ThreadMain(void* parameter) {
   }
   ThreadControl* c = tls_control_ref.get();
   tls_control = c;
+  c->diag.tid.store(gettid(), std::memory_order_relaxed);
+  SetDiagState(c, "starting");
 
   std::string name;
   {
@@ -883,6 +948,7 @@ void* ThreadMain(void* parameter) {
   }
   ApplyNativeThreadName(name);
 
+  SetDiagState(c, "running");
   start_routine();
   start_routine = nullptr;
 
@@ -940,12 +1006,20 @@ void Sleep(std::chrono::microseconds duration) {
   ThreadControl* self = CurrentControl();
   const auto deadline = DeadlineAfter(std::chrono::duration_cast<Clock::duration>(duration));
   std::unique_lock<std::mutex> lock(g_dispatcher);
+  bool marked = false;
   for (;;) {
     if (SafePointLocked(self, lock) == SafePointAction::kTerminate) {
       ExitCurrentThreadLocked(self, lock, self->terminate_exit_code);
     }
     if (Clock::now() >= deadline) {
+      if (marked) {
+        SetDiagState(self, "running");
+      }
       return;
+    }
+    if (!marked) {
+      marked = true;
+      SetDiagState(self, "sleep");
     }
     if (deadline == Clock::time_point::max()) {
       self->cv.wait(lock);
@@ -1052,6 +1126,7 @@ std::unique_ptr<Thread> Thread::Create(CreationParameters params,
   control->priority = params.initial_priority;
   control->affinity_mask = AllProcessorsMask();
   control->suspend_count = params.create_suspended ? 1 : 0;
+  RegisterControl(control);
 
   auto thread = std::make_unique<WebThread>(control);
 
@@ -1099,6 +1174,59 @@ void Thread::Exit(int exit_code) {
   ThreadControl* c = CurrentControl();
   std::unique_lock<std::mutex> lock(g_dispatcher);
   ExitCurrentThreadLocked(c, lock, exit_code);
+}
+
+std::string DescribeThreadsForDiagnostics() {
+  std::vector<std::shared_ptr<ThreadControl>> controls;
+  {
+    std::lock_guard<std::mutex> lock(g_registry_mutex);
+    if (g_registry) {
+      controls = *g_registry;
+    }
+  }
+  // Names are std::strings guarded by the dispatcher: copy them if it is free (it is only ever
+  // held briefly), otherwise read them anyway (they are set once at thread start).
+  bool dispatcher_locked = false;
+  for (int i = 0; i < 1000 && !dispatcher_locked; ++i) {
+    dispatcher_locked = g_dispatcher.try_lock();
+    if (!dispatcher_locked) {
+      sched_yield();
+    }
+  }
+  std::vector<std::string> names;
+  names.reserve(controls.size());
+  for (const auto& c : controls) {
+    names.push_back(c->name);
+  }
+  if (dispatcher_locked) {
+    g_dispatcher.unlock();
+  }
+  const int64_t now = SteadyMicros();
+  std::string out;
+  char line[512];
+  std::snprintf(line, sizeof(line), "threads: %zu known to rex::thread (dispatcher %s)\n",
+                controls.size(), dispatcher_locked ? "free" : "BUSY - names read racily");
+  out += line;
+  for (size_t i = 0; i < controls.size(); ++i) {
+    const ThreadDiagnostics& d = controls[i]->diag;
+    const char* state = d.state.load(std::memory_order_relaxed);
+    const double since_s = double(now - d.state_since_us.load(std::memory_order_relaxed)) / 1e6;
+    int n = std::snprintf(line, sizeof(line), "  tid %d sys %u '%s': %s for %.1f s",
+                          d.tid.load(std::memory_order_relaxed), controls[i]->system_id,
+                          names[i].c_str(), state ? state : "?", since_s);
+    if (n > 0 && size_t(n) < sizeof(line) && state && std::strncmp(state, "wait", 4) == 0) {
+      std::snprintf(line + n, sizeof(line) - size_t(n), " on %u object(s), first %s %p%s",
+                    d.wait_count.load(std::memory_order_relaxed),
+                    d.wait_kind.load(std::memory_order_relaxed)
+                        ? d.wait_kind.load(std::memory_order_relaxed)
+                        : "?",
+                    d.wait_object.load(std::memory_order_relaxed),
+                    d.wait_timed.load(std::memory_order_relaxed) ? " (timed)" : "");
+    }
+    out += line;
+    out += '\n';
+  }
+  return out;
 }
 
 }  // namespace rex::thread

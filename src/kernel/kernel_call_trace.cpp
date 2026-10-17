@@ -8,6 +8,13 @@
  * whether it is currently inside the call (blocked in a wait, for example), the
  * export name, its guest return address and a short guest back-chain walk. Used
  * to find where a guest thread stalls and to compare call sequences with native.
+ * `--kernel_call_trace` records without the watchdog thread (no periodic logging).
+ *
+ * Web: the `rex_debug_dump_threads` export (called from the page, e.g. by
+ * server/tools/gate1.mjs --stall) prints the owner of the global critical region
+ * (pthread tid), every rex::thread thread's state (rex/thread/thread_report.h) and
+ * the recorded kernel calls, straight to console.log from the calling (browser main)
+ * thread without taking any lock a stuck thread could hold.
  */
 
 #include <algorithm>
@@ -24,15 +31,30 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/memory/utils.h>
 #include <rex/ppc/function.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
+#include <rex/thread/mutex.h>
+
+#if REX_PLATFORM_WEB
+#include <emscripten/console.h>
+#include <emscripten/emscripten.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <rex/thread/thread_report.h>
+#endif
 
 REXCVAR_DEFINE_INT32(kernel_call_watchdog_ms, 0, "Kernel",
                      "Diagnostics: if > 0, record each guest thread's last kernel export/hook "
                      "call and log all threads (with a guest stack walk) every N ms");
+REXCVAR_DEFINE_BOOL(kernel_call_trace, false, "Kernel",
+                    "Diagnostics: record each guest thread's last kernel export/hook call (as "
+                    "kernel_call_watchdog_ms) without the periodic watchdog log; read on demand "
+                    "(web: the rex_debug_dump_threads export)");
 REXCVAR_DEFINE_STRING(guest_trace_trigger, "", "Kernel",
                       "Diagnostics (recompiled code built with -DREX_GUEST_TRACE=1): guest "
                       "function whose entry starts recording guest function entries on that "
@@ -54,6 +76,7 @@ struct Record {
   std::atomic<uint32_t> lr{0}, r1{0}, r3{0}, r4{0}, r5{0};
   std::atomic<bool> inside{false};
   uint32_t thread_id = 0;
+  int tid = 0;  // web: pthread tid (matches rex_debug_dump_threads' thread list)
   std::string thread_name;
   uint64_t last_logged_count = 0;  // watchdog thread only
 };
@@ -71,14 +94,18 @@ std::string WalkGuestStack(uint32_t sp) {
     return out;
   }
   auto* mem = ks->memory();
-  // Natively an unmapped guest page faults the host, so only read readable pages.
+  // Natively an unmapped guest page faults the host, so only read readable pages. On the web
+  // nothing faults (the stack range is in linear memory), and QueryProtect takes the global
+  // critical region, which a stuck thread may hold (rex_debug_dump_threads must not block).
   auto read32 = [mem](uint32_t address, uint32_t* out) {
+#if !REX_PLATFORM_WEB
     auto* heap = mem->LookupHeap(address);
     uint32_t protect = 0;
     if (!heap || !heap->QueryProtect(address, &protect) ||
         !(protect & memory::kMemoryProtectRead)) {
       return false;
     }
+#endif
     *out = memory::load_and_swap<uint32_t>(mem->TranslateVirtual(address));
     return true;
   };
@@ -126,6 +153,9 @@ void KernelCallTraceEnter(const char* name, const PPCContext& ctx) {
   Record* r = t_record;
   if (!r) {
     r = new Record();
+#if REX_PLATFORM_WEB
+    r->tid = gettid();
+#endif
     if (rex::system::XThread::IsInThread()) {
       auto* thread = rex::system::XThread::GetCurrentThread();
       r->thread_id = thread->thread_id();
@@ -155,13 +185,77 @@ void KernelCallTraceExit() {
 
 void StartKernelCallTrace() {
   const int period_ms = REXCVAR_GET(kernel_call_watchdog_ms);
-  if (period_ms <= 0 || g_kernel_call_trace) {
+  if ((period_ms <= 0 && !REXCVAR_GET(kernel_call_trace)) || g_kernel_call_trace) {
     return;
   }
   g_kernel_call_trace = true;
+  if (period_ms <= 0) {
+    REXKRNL_WARN("kcall-wd: kernel call trace on (no watchdog)");
+    return;
+  }
   REXKRNL_WARN("kcall-wd: kernel call trace on, watchdog every {} ms", period_ms);
   std::thread(WatchdogMain, period_ms).detach();
 }
+
+#if REX_PLATFORM_WEB
+namespace {
+// musl pthread_mutex_t: __u.__vi[1] = _m_lock (owner tid in the low 30 bits, bit 31 = waiters),
+// __u.__i[5] = _m_count (recursion count - 1 for a recursive mutex).
+std::string DescribeMutex(const char* what, std::recursive_mutex& mutex) {
+  const volatile int* words = reinterpret_cast<const volatile int*>(mutex.native_handle());
+  const int lock = words[1];
+  const int count = words[5];
+  return fmt::format("{}: _m_lock={:#010x} -> {} (owner tid {}{}), _m_count={}\n", what,
+                     uint32_t(lock), lock & 0x3fffffff ? "HELD" : "free", lock & 0x3fffffff,
+                     lock < 0 ? ", waiters" : "", count);
+}
+}  // namespace
+#endif
+
+}  // namespace rex::detail
+
+#if REX_PLATFORM_WEB
+// Diagnostics export (see the file comment). Each line goes to console.log separately.
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_debug_dump_threads() {
+  using namespace rex::detail;
+  std::string out = fmt::format("rex_debug_dump_threads (called on tid {})\n", gettid());
+  out += DescribeMutex("global critical region", rex::thread::global_critical_region::mutex());
+  out += rex::thread::DescribeThreadsForDiagnostics();
+  if (!g_kernel_call_trace) {
+    out += "kernel calls: not recorded (--kernel_call_trace or --kernel_call_watchdog_ms)\n";
+  } else {
+    std::vector<Record*> records;
+    if (g_records_mutex.try_lock()) {
+      records = g_records;
+      g_records_mutex.unlock();
+    }
+    out += fmt::format("kernel calls: {} guest threads\n", records.size());
+    for (Record* r : records) {
+      const char* name = r->name.load(std::memory_order_relaxed);
+      const uint32_t r1 = r->r1.load(std::memory_order_relaxed);
+      out += fmt::format(
+          "  tid {} thid {} '{}' calls={} {} {} lr={:08X} r3={:08X} r4={:08X} r5={:08X} "
+          "sp={:08X} stack:{}\n",
+          r->tid, r->thread_id, r->thread_name, r->count.load(std::memory_order_relaxed),
+          r->inside.load(std::memory_order_acquire) ? "IN" : "after", name ? name : "?",
+          r->lr.load(std::memory_order_relaxed), r->r3.load(std::memory_order_relaxed),
+          r->r4.load(std::memory_order_relaxed), r->r5.load(std::memory_order_relaxed), r1,
+          WalkGuestStack(r1));
+    }
+  }
+  size_t start = 0;
+  while (start < out.size()) {
+    size_t end = out.find('\n', start);
+    if (end == std::string::npos) {
+      end = out.size();
+    }
+    emscripten_out(out.substr(start, end - start).c_str());
+    start = end + 1;
+  }
+}
+#endif
+
+namespace rex::detail {
 
 //=============================================================================
 // Guest function entry trace (only with recompiled code built -DREX_GUEST_TRACE=1)
