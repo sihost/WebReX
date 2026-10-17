@@ -127,6 +127,10 @@ endif()
 
 if(REXGLUE_USE_WEBGPU)
     list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_WEBGPU_SOURCES})
+    if(NOT REXGLUE_USE_VULKAN)
+        # The WebGPU pipeline cache translates with SpirvShaderTranslator.
+        list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_SPIRV_SOURCES})
+    endif()
 endif()
 
 if(REXGLUE_USE_D3D12)
@@ -174,6 +178,25 @@ if(REXGLUE_USE_WEBGPU)
     # link gets it from rexglue_configure_target.
     target_compile_options(rexgraphics PUBLIC --use-port=emdawnwebgpu)
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_WEBGPU=1)
+    if(NOT REXGLUE_USE_VULKAN)
+        target_link_libraries(rexgraphics PUBLIC rexspvbuilder)
+    endif()
+    # SpirvToWgsl (libtint_web.a: Tint + src/graphics/webgpu/webgpu_shader_tint.cpp),
+    # built outside the SDK by thirdparty/tint (project tools/tint/build_web.bat).
+    # Without it the pipeline cache cannot convert shaders and drops draws.
+    set(REXGLUE_TINT_WEB_LIBRARY "${REXGLUE_ROOT}/out/tint-web/libtint_web.a"
+        CACHE FILEPATH "libtint_web.a (SpirvToWgsl) for the WebGPU backend")
+    if(EXISTS "${REXGLUE_TINT_WEB_LIBRARY}")
+        message(STATUS "WebGPU: SpirvToWgsl from ${REXGLUE_TINT_WEB_LIBRARY}")
+        target_compile_definitions(rexgraphics PRIVATE REX_WEBGPU_HAS_TINT=1)
+        # Installed next to the SDK libraries as librex_tint_web.a (rexglue_install.cmake).
+        target_link_libraries(rexgraphics PUBLIC
+            $<BUILD_INTERFACE:${REXGLUE_TINT_WEB_LIBRARY}>
+            $<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/librex_tint_web.a>)
+    else()
+        message(WARNING "WebGPU: no libtint_web.a at ${REXGLUE_TINT_WEB_LIBRARY} "
+            "(REXGLUE_TINT_WEB_LIBRARY); shaders are not converted, draws are dropped")
+    endif()
 endif()
 
 if(REXGLUE_USE_D3D12)

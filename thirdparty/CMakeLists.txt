@@ -25,6 +25,10 @@ if(REXGLUE_USE_VULKAN)
         spirv-headers spirv-tools glslang
     )
 endif()
+if(EMSCRIPTEN AND NOT REXGLUE_USE_VULKAN)
+    # spv::Builder sources only, for the SPIR-V shader translator (WebGPU: SPIR-V -> WGSL).
+    list(APPEND REQUIRED_SUBMODULES glslang)
+endif()
 
 if(REXGLUE_ENABLE_FIDELITYFX)
     list(APPEND REQUIRED_SUBMODULES FidelityFX)
@@ -324,6 +328,25 @@ if(REXGLUE_USE_D3D12)
     target_include_directories(dxc-headers INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/dxc/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dxc>)
+endif()
+
+#=============================================================================
+# WebGPU without Vulkan: only glslang's spv::Builder (SpvBuilder.cpp and what it
+# needs), which SpirvShaderTranslator emits SPIR-V with before Tint converts it
+# to WGSL. No glslang front end, no SPIRV-Tools.
+#=============================================================================
+if(EMSCRIPTEN AND NOT REXGLUE_USE_VULKAN)
+    add_library(rexspvbuilder STATIC
+        glslang/SPIRV/SpvBuilder.cpp
+        glslang/SPIRV/SpvPostProcess.cpp
+        glslang/SPIRV/InReadableOrder.cpp
+        glslang/SPIRV/Logger.cpp
+    )
+    target_include_directories(rexspvbuilder PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/glslang>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/rexspvbuilder>)
+    target_compile_options(rexspvbuilder PRIVATE -w)
+    set_target_properties(rexspvbuilder PROPERTIES CXX_STANDARD 17)
 endif()
 
 #=============================================================================

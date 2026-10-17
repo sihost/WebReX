@@ -40,6 +40,18 @@ if(REXGLUE_USE_D3D12)
     list(APPEND REXGLUE_INSTALL_TARGETS dxc-headers)
 endif()
 
+if(TARGET rexspvbuilder)
+    list(APPEND REXGLUE_INSTALL_TARGETS rexspvbuilder)
+    install(DIRECTORY thirdparty/glslang/SPIRV
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rexspvbuilder
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+    )
+endif()
+if(REXGLUE_USE_WEBGPU AND REXGLUE_TINT_WEB_LIBRARY AND EXISTS "${REXGLUE_TINT_WEB_LIBRARY}")
+    install(FILES "${REXGLUE_TINT_WEB_LIBRARY}"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR} RENAME librex_tint_web.a)
+endif()
+
 set(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
 if(TARGET amd_fidelityfx_vk)
     list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS amd_fidelityfx_vk)

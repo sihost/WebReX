@@ -21,7 +21,16 @@
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/translator.h>
 #include <rex/graphics/xenos.h>
+#if REX_HAS_VULKAN
 #include <rex/ui/vulkan/device.h>
+#endif
+
+#if !REX_HAS_VULKAN
+// WebGPU builds translate without the Vulkan backend (and its headers).
+namespace rex::ui::vulkan {
+class VulkanDevice;
+}  // namespace rex::ui::vulkan
+#endif
 
 namespace rex::graphics {
 
