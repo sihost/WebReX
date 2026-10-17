@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
+#include <mutex>
+#include <string>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -36,7 +39,83 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
 #endif
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(input_log_state, false, "Input",
+                    "Log the controller state returned to the guest (XamInputGetState) whenever it "
+                    "changes, per user index, with each driver's result (and the web DOM bridge "
+                    "counters); diagnostics");
 namespace rex::input {
+
+namespace {
+
+// input_log_state: last logged state per user index. Thumbs are compared at 1/16 of the
+// range so analog noise does not flood the log.
+struct LoggedState {
+  bool valid = false;
+  X_RESULT result = 0;
+  uint16_t buttons = 0;
+  uint8_t left_trigger = 0, right_trigger = 0;
+  int16_t thumbs[4] = {};
+  uint64_t calls = 0;
+};
+std::mutex g_log_mutex;
+LoggedState g_logged[4];
+
+void LogGuestState(uint32_t user_index, X_RESULT result, const X_INPUT_STATE& s,
+                   const X_RESULT* driver_results, size_t driver_count) {
+  if (user_index >= 4) {
+    return;
+  }
+  std::lock_guard lock(g_log_mutex);
+  LoggedState& l = g_logged[user_index];
+  ++l.calls;
+  const uint16_t buttons = result == X_ERROR_SUCCESS ? uint16_t(s.gamepad.buttons) : 0;
+  const uint8_t lt = result == X_ERROR_SUCCESS ? uint8_t(s.gamepad.left_trigger) : 0;
+  const uint8_t rt = result == X_ERROR_SUCCESS ? uint8_t(s.gamepad.right_trigger) : 0;
+  int16_t thumbs[4] = {};
+  if (result == X_ERROR_SUCCESS) {
+    thumbs[0] = int16_t(s.gamepad.thumb_lx);
+    thumbs[1] = int16_t(s.gamepad.thumb_ly);
+    thumbs[2] = int16_t(s.gamepad.thumb_rx);
+    thumbs[3] = int16_t(s.gamepad.thumb_ry);
+  }
+  bool changed = !l.valid || l.result != result || l.buttons != buttons ||
+                 l.left_trigger != lt || l.right_trigger != rt;
+  for (int i = 0; i < 4; ++i) {
+    changed |= (thumbs[i] >> 12) != (l.thumbs[i] >> 12);
+  }
+  if (!changed) {
+    return;
+  }
+  std::string drivers;
+  for (size_t i = 0; i < driver_count; ++i) {
+    fmt::format_to(std::back_inserter(drivers), "{}{:X}", i ? "," : "", driver_results[i]);
+  }
+#if REX_PLATFORM_WEB
+  const web::BridgeStats b = web::GetBridgeStats();
+  REXLOG_INFO(
+      "input: user {} GetState -> {:X} buttons {:04X} lt {} rt {} lx {} ly {} rx {} ry {} "
+      "packet {} (drivers [{}], call {}) | bridge keys {} mouse {} focus_events {} pad_polls {} "
+      "focus {} pointer_lock {} dropped {} forwarded {}",
+      user_index, result, buttons, lt, rt, thumbs[0], thumbs[1], thumbs[2], thumbs[3],
+      result == X_ERROR_SUCCESS ? uint32_t(s.packet_number) : 0u, drivers, l.calls, b.key_events,
+      b.mouse_events, b.focus_events, b.gamepad_polls, b.has_focus, b.pointer_locked,
+      b.dropped_events, b.forwarded_events);
+#else
+  REXLOG_INFO(
+      "input: user {} GetState -> {:X} buttons {:04X} lt {} rt {} lx {} ly {} rx {} ry {} "
+      "packet {} (drivers [{}], call {})",
+      user_index, result, buttons, lt, rt, thumbs[0], thumbs[1], thumbs[2], thumbs[3],
+      result == X_ERROR_SUCCESS ? uint32_t(s.packet_number) : 0u, drivers, l.calls);
+#endif
+  l.valid = true;
+  l.result = result;
+  l.buttons = buttons;
+  l.left_trigger = lt;
+  l.right_trigger = rt;
+  std::copy(std::begin(thumbs), std::end(thumbs), std::begin(l.thumbs));
+}
+
+}  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
@@ -90,10 +169,16 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   bool any_connected = false;
   bool first_result = true;
   X_INPUT_STATE merged = {};
+  constexpr size_t kMaxLoggedDrivers = 8;
+  X_RESULT driver_results[kMaxLoggedDrivers] = {};
+  size_t driver_count = 0;
 
   for (auto& driver : drivers_) {
     X_INPUT_STATE state = {};
     X_RESULT result = driver->GetState(user_index, &state);
+    if (driver_count < kMaxLoggedDrivers) {
+      driver_results[driver_count++] = result;
+    }
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
@@ -127,9 +212,16 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (first_result) {
-    return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+    X_RESULT result = any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+    if (REXCVAR_GET(input_log_state)) {
+      LogGuestState(user_index, result, merged, driver_results, driver_count);
+    }
+    return result;
   }
 
+  if (REXCVAR_GET(input_log_state)) {
+    LogGuestState(user_index, X_ERROR_SUCCESS, merged, driver_results, driver_count);
+  }
   if (out_state) {
     *out_state = merged;
   }
