@@ -16,19 +16,34 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 
 namespace rex::chrono {
 
+namespace {
+#if REX_PLATFORM_WEB
+// Emscripten maps clock_gettime/clock_getres onto WASI clocks and rejects
+// CLOCK_MONOTONIC_RAW (EINVAL, output left uninitialized). CLOCK_MONOTONIC is
+// performance.timeOrigin + performance.now(), consistent across pthreads.
+constexpr clockid_t kHostTickClock = CLOCK_MONOTONIC;
+#else
+constexpr clockid_t kHostTickClock = CLOCK_MONOTONIC_RAW;
+#endif
+}  // namespace
+
 uint64_t Clock::host_tick_frequency_platform() {
   timespec res;
-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+  int error = clock_getres(kHostTickClock, &res);
   assert_zero(error);
   assert_zero(res.tv_sec);  // Sub second resolution is required.
+  (void)error;
 
-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-  return 1000000000ull / res.tv_nsec;
+  // host_tick_count_platform() counts nanoseconds whatever the clock's
+  // resolution is (1 ns on Linux, 1 us for performance.now() on the web), so
+  // the tick frequency is 1 GHz. Deriving it from the resolution would make
+  // a 1 us clock run 1000x fast.
+  return 1000000000ull;
 }
 
 uint64_t Clock::host_tick_count_platform() {
   timespec tp;
-  int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+  int error = clock_gettime(kHostTickClock, &tp);
   assert_zero(error);
 
   return tp.tv_nsec + tp.tv_sec * 1000000000ull;
