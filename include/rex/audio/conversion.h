@@ -91,8 +91,9 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
     float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
     float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
-    float br = rex::byte_swap(input[4 * ch_sample_count + sample]);
-    float bl = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    // Same channel order as the SSE path above: index 4 = back left, 5 = back right.
+    float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
+    float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
     float center_halved = fc * 0.5f;
     output[sample * 2] = (fl + bl + center_halved) * (1.0f / 2.5f);
     output[sample * 2 + 1] = (fr + br + center_halved) * (1.0f / 2.5f);
