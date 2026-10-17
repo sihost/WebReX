@@ -36,12 +36,12 @@
 
 REXCVAR_DEFINE_BOOL(webgpu_log_frames, false, "GPU",
                     "WebGPU: log submission/upload statistics on every swap (else every 600)");
-REXCVAR_DEFINE_BOOL(webgpu_vertex_memexport, false, "GPU",
-                    "WebGPU (experimental): run memexporting vertex shaders as compute "
-                    "dispatches (HostVertexShaderType::kMemExportCompute) before their draw. "
-                    "Off: the exports are dropped (WGSL has no vertex-stage storage writes). Not "
-                    "validated against native yet; one of three riverworld boots stalled at the "
-                    "map change with it on (docs/port/gates/README.md, gate 4)");
+REXCVAR_DEFINE_BOOL(webgpu_vertex_memexport, true, "GPU",
+                    "WebGPU: run memexporting vertex shaders as compute dispatches "
+                    "(HostVertexShaderType::kMemExportCompute) before their draw. Off: the "
+                    "exports are dropped (WGSL has no vertex-stage storage writes). Compared "
+                    "with native D3D12 through gpu_draw_dump mx-in/mx-out "
+                    "(docs/port/gates/README.md, gate 4)");
 REXCVAR_DEFINE_BOOL(webgpu_readback_memexport, false, "GPU",
                     "WebGPU: after each vertex memexport dispatch, copy the exported ranges "
                     "back into guest memory (synchronous, like readback_memexport with "
