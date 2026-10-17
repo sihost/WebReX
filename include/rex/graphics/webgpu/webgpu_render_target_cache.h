@@ -153,6 +153,12 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   static constexpr bool IsFixedRG16TruncatedToMinus1To1() { return false; }
   static constexpr bool IsFixedRGBA16TruncatedToMinus1To1() { return false; }
   WGPUBuffer edram_buffer() const { return edram_ ? edram_->buffer() : nullptr; }
+  // Copies [address, address + length) of the shared memory buffer into guest
+  // memory (submits the current stream and waits; no dirty marking, the range
+  // stays valid). Resolve readback, and vertex memexport readback
+  // (webgpu_readback_memexport).
+  bool ReadbackResolve(memory::Memory& memory, WebGPUSharedMemory& shared_memory,
+                       uint32_t address, uint32_t length);
 
   struct Statistics {
     uint64_t render_targets_created = 0;
@@ -219,8 +225,6 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   // pass must be open.
   void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
-  bool ReadbackResolve(memory::Memory& memory, WebGPUSharedMemory& shared_memory,
-                       uint32_t address, uint32_t length);
 
   WebGPUCommandProcessor& command_processor_;
   TraceWriter& trace_writer_;

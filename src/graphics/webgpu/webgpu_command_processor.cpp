@@ -42,6 +42,11 @@ REXCVAR_DEFINE_BOOL(webgpu_vertex_memexport, false, "GPU",
                     "Off: the exports are dropped (WGSL has no vertex-stage storage writes). Not "
                     "validated against native yet; one of three riverworld boots stalled at the "
                     "map change with it on (docs/port/gates/README.md, gate 4)");
+REXCVAR_DEFINE_BOOL(webgpu_readback_memexport, false, "GPU",
+                    "WebGPU: after each vertex memexport dispatch, copy the exported ranges "
+                    "back into guest memory (synchronous, like readback_memexport with "
+                    "readback_memexport_fast=false natively). Diagnostics: makes the "
+                    "gpu_draw_dump_swap memexport output hashes comparable with native");
 REXCVAR_DEFINE_BOOL(webgpu_swap_gamma_ramp, true, "GPU",
                     "WebGPU: apply the guest display gamma ramp (PWL for 2_10_10_10 front "
                     "buffers, else the 256-entry table) when copying the front buffer to the "
@@ -702,6 +707,12 @@ bool WebGPUCommandProcessor::IssueMemExportCompute(
   // (textures over the exported data are reloaded).
   for (const draw_util::MemExportRange& range : ranges) {
     shared_memory_->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
+  }
+  if (REXCVAR_GET(webgpu_readback_memexport)) {
+    for (const draw_util::MemExportRange& range : ranges) {
+      render_target_cache_->ReadbackResolve(*memory_, *shared_memory_,
+                                            range.base_address_dwords << 2, range.size_bytes);
+    }
   }
   return true;
 }

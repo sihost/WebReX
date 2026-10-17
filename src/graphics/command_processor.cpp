@@ -29,6 +29,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -1523,6 +1524,10 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      // Memexporting draws (shader already analyzed) are hashed before
+      // IssueDraw too, so the dump has the destination before and after.
+      DumpDrawInputs(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                     is_indexed ? &index_buffer_info : nullptr, true);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       // After IssueDraw: the backend has analyzed the shaders by now.
@@ -1552,7 +1557,72 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 }
 
 void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t index_count,
-                                      const IndexBufferInfo* index_buffer_info) {
+                                      const IndexBufferInfo* index_buffer_info,
+                                      bool before_issue) {
+  const RegisterFile& regs = *register_file_;
+  // Vertex memexport destinations (with memexport readback the exported data,
+  // else what the CPU last wrote there).
+  // mx-in keeps a copy of each destination; mx-out then also prints how many
+  // dwords and 16-byte elements the draw changed, and how many of the changed
+  // dwords are NaN/Inf as floats (to compare exports whose inputs differ).
+  auto append_memexport = [&](std::string& text, const char* label) {
+    const Shader* shader = active_vertex_shader_;
+    std::vector<draw_util::MemExportRange> ranges;
+    draw_util::AddMemExportRanges(regs, *shader, ranges);
+    const bool in = label[2] == '-' && label[3] == 'i';
+    const bool out_with_in = label[2] == '-' && label[3] == 'o';
+    if (in) {
+      draw_dump_pre_memexport_.clear();
+    }
+    auto o = std::back_inserter(text);
+    fmt::format_to(o, " | {} n={}", label, ranges.size());
+    for (size_t r = 0; r < ranges.size(); ++r) {
+      const draw_util::MemExportRange& range = ranges[r];
+      uint32_t base = (range.base_address_dwords << 2) & 0x1FFFFFFF;
+      uint32_t size = std::min(range.size_bytes, UINT32_C(0x20000000) - base);
+      const uint8_t* p = memory_->TranslatePhysical<const uint8_t*>(base);
+      fmt::format_to(o, " {:08X}+{:X} h={:016X} w=", base, size, XXH3_64bits(p, size));
+      for (uint32_t i = 0; i < 8 && (i + 1) * 4 <= size; ++i) {
+        uint32_t w;
+        std::memcpy(&w, p + i * 4, 4);
+        fmt::format_to(o, "{}{:08X}", i ? "," : "", rex::byte_swap(w));
+      }
+      if (in) {
+        draw_dump_pre_memexport_.emplace_back(p, p + size);
+      } else if (out_with_in && r < draw_dump_pre_memexport_.size() &&
+                 draw_dump_pre_memexport_[r].size() == size) {
+        const uint8_t* q = draw_dump_pre_memexport_[r].data();
+        uint32_t changed = 0, rows = 0, non_finite = 0;
+        for (uint32_t i = 0; i + 4 <= size; i += 4) {
+          if (std::memcmp(p + i, q + i, 4)) {
+            ++changed;
+            uint32_t w;
+            std::memcpy(&w, p + i, 4);
+            if (((rex::byte_swap(w) >> 23) & 0xFF) == 0xFF) {
+              ++non_finite;
+            }
+          }
+        }
+        for (uint32_t i = 0; i + 16 <= size; i += 16) {
+          rows += std::memcmp(p + i, q + i, 16) != 0;
+        }
+        fmt::format_to(o, " chg={}/{} rows={}/{} nonfinite={}", changed, size / 4, rows,
+                       size / 16, non_finite);
+      }
+    }
+  };
+  if (!before_issue && !draw_dump_pre_line_.empty()) {
+    // The line was built before IssueDraw (inputs, "mx-in"); add the result.
+    std::string line = std::move(draw_dump_pre_line_);
+    draw_dump_pre_line_.clear();
+    append_memexport(line, "mx-out");
+    REXGPU_INFO("{}", line);
+    return;
+  }
+  if (before_issue && (!active_vertex_shader_ || !active_vertex_shader_->is_ucode_analyzed() ||
+                       !active_vertex_shader_->memexport_eM_written())) {
+    return;
+  }
   // Swaps (XE_SWAP packets) seen, not counter_ (that also counts vblanks).
   const uint32_t swap = draw_dump_swap_index_;
   int32_t first_swap = REXCVAR_GET(gpu_draw_dump_swap);
@@ -1566,7 +1636,6 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
     draw_dump_index_ = 0;
   }
   uint32_t draw_index = draw_dump_index_++;
-  const RegisterFile& regs = *register_file_;
   auto hash_physical = [&](uint32_t address, uint32_t length) -> uint64_t {
     address &= 0x1FFFFFFF;
     length = std::min(length, UINT32_C(0x20000000) - address);
@@ -1653,6 +1722,13 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
   };
   print_floats("cvf", vs, XE_GPU_REG_SHADER_CONSTANT_000_X, 12);
   print_floats("cpf", ps, XE_GPU_REG_SHADER_CONSTANT_256_X, 6);
+  if (vs && vs->is_ucode_analyzed() && vs->memexport_eM_written()) {
+    // Before IssueDraw: "mx-in" (and "mx-out" is added after it). A first-use
+    // shader (analyzed only by IssueDraw) gets the post-draw "mx" only. Natively
+    // --readback_memexport_fast=false makes the result immediate; on web
+    // --webgpu_readback_memexport.
+    append_memexport(line, before_issue ? "mx-in" : "mx");
+  }
   if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
     // Resolve: an 8x6 grid of destination texels in guest memory order (only
     // meaningful with resolve readback: --readback_resolve=full natively,
@@ -1797,6 +1873,10 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
                      hash_physical(base, 0x1000), hash_physical(base, 0x10000),
                      mips ? hash_physical(mips, 0x1000) : 0);
     }
+  }
+  if (before_issue) {
+    draw_dump_pre_line_ = std::move(line);
+    return;
   }
   REXGPU_INFO("{}", line);
 }

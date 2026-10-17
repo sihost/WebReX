@@ -239,8 +239,13 @@ class CommandProcessor {
   // draw of the selected swaps with the shader hashes, render state words,
   // fetch constants and XXH3 hashes of the guest memory the draw fetches, to
   // diff the same scene between builds (native D3D12 vs web WebGPU).
+  // before_issue: called before IssueDraw for memexporting draws whose vertex
+  // shader is analyzed; the line (with the destination hashes "mx-in") is kept
+  // and logged by the call after IssueDraw with "mx-out".
   void DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t index_count,
-                      const IndexBufferInfo* index_buffer_info);
+                      const IndexBufferInfo* index_buffer_info, bool before_issue = false);
+  std::string draw_dump_pre_line_;
+  std::vector<std::vector<uint8_t>> draw_dump_pre_memexport_;
   uint32_t draw_dump_counter_ = UINT32_MAX;
   uint32_t draw_dump_index_ = 0;
   uint32_t draw_dump_swap_index_ = 0;
