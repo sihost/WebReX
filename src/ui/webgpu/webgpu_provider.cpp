@@ -9,6 +9,7 @@
 #include <rex/ui/webgpu/webgpu_provider.h>
 
 #include <rex/graphics/webgpu/webgpu_log.h>
+#include <rex/ui/webgpu/webgpu_immediate_drawer.h>
 #include <rex/ui/webgpu/webgpu_presenter.h>
 
 namespace rex {
@@ -28,7 +29,9 @@ std::unique_ptr<Presenter> WebGPUProvider::CreatePresenter(
   return WebGPUPresenter::Create(host_gpu_loss_callback, device_);
 }
 
-std::unique_ptr<ImmediateDrawer> WebGPUProvider::CreateImmediateDrawer() { return nullptr; }
+std::unique_ptr<ImmediateDrawer> WebGPUProvider::CreateImmediateDrawer() {
+  return WebGPUImmediateDrawer::Create(device_);
+}
 
 }  // namespace webgpu
 }  // namespace ui

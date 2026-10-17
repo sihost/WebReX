@@ -99,6 +99,7 @@ set(REXUI_WEBGPU OFF)
 if(EMSCRIPTEN AND NOT (DEFINED REXGLUE_USE_WEBGPU AND NOT REXGLUE_USE_WEBGPU))
     set(REXUI_WEBGPU ON)
     list(APPEND REXUI_SOURCES
+        webgpu/webgpu_immediate_drawer.cpp
         webgpu/webgpu_presenter.cpp
         webgpu/webgpu_provider.cpp
     )

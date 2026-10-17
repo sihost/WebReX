@@ -11,6 +11,7 @@
 #include <rex/ui/webgpu/webgpu_presenter.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -19,6 +20,7 @@
 
 #include <rex/graphics/webgpu/webgpu_log.h>
 #include <rex/ui/surface_web.h>
+#include <rex/ui/webgpu/webgpu_immediate_drawer.h>
 
 namespace rex {
 namespace ui {
@@ -47,6 +49,13 @@ class WebGPUPresenter::RefreshContext final
 };
 
 namespace {
+
+class WebGPUUIDrawContext final : public UIDrawContext {
+ public:
+  WebGPUUIDrawContext(Presenter& presenter, uint32_t render_target_width,
+                      uint32_t render_target_height)
+      : UIDrawContext(presenter, render_target_width, render_target_height) {}
+};
 
 // State of a presented-frame readback in flight (device thread, owned by the
 // mapAsync callback; independent of the presenter's lifetime).
@@ -132,6 +141,9 @@ WebGPUPresenter::~WebGPUPresenter() {
       ReleaseGuestOutputImage(image);
     }
     present_pass_.reset();
+    // The recordings' resources are released here (on the device thread).
+    std::lock_guard<std::mutex> lock(ui_mutex_);
+    ui_recordings_.reset();
   });
   painting_connected_ = false;
 }
@@ -273,12 +285,73 @@ bool WebGPUPresenter::RefreshGuestOutputImpl(
   return refresher(context);
 }
 
-Presenter::PaintResult WebGPUPresenter::PaintAndPresentImpl(bool /*execute_ui_drawers*/) {
+void WebGPUPresenter::AddUIRecordingFromUIThread(
+    std::shared_ptr<const WebGPUImmediateRecording> recording) {
+  if (in_ui_paint_ && recording && !recording->empty()) {
+    ui_recordings_building_.push_back(std::move(recording));
+  }
+}
+
+Presenter::PaintResult WebGPUPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   if (device_.is_lost()) {
     return PaintResult::kGpuLostExternally;
   }
-  // Painted by the device thread on its next animation frame.
-  paint_requested_.store(true, std::memory_order_release);
+  std::shared_ptr<const UIRecordingList> new_ui;
+  if (execute_ui_drawers) {
+    // Pacing (see the header): at most one UI paint per animation frame.
+    {
+      std::unique_lock<std::mutex> lock(stats_mutex_);
+      animation_frame_cv_.wait_for(lock, std::chrono::milliseconds(100), [this]() {
+        return stats_.animation_frames != last_ui_paint_animation_frame_ || stats_.device_lost;
+      });
+      last_ui_paint_animation_frame_ = stats_.animation_frames;
+      ++stats_.ui_paints;
+    }
+    // The canvas size the device thread last configured (the canvas texture of
+    // the next paint, unless it is resized in between).
+    uint32_t width = 0, height = 0;
+    device_.GetPublishedCanvasSize(width, height);
+    if (width && height) {
+      WebGPUUIDrawContext ui_draw_context(*this, width, height);
+      ui_recordings_building_.clear();
+      in_ui_paint_ = true;
+      ExecuteUIDrawersFromUIThread(ui_draw_context);
+      in_ui_paint_ = false;
+      if (!ui_recordings_building_.empty()) {
+        new_ui = std::make_shared<const UIRecordingList>(std::move(ui_recordings_building_));
+      }
+      ui_recordings_building_.clear();
+    }
+  }
+  bool has_ui = new_ui != nullptr;
+  if (has_ui != ui_overlay_shown_) {
+    // Transitions only (an overlay opened / closed), for logs and tests.
+    ui_overlay_shown_ = has_ui;
+    size_t draws = 0;
+    if (new_ui) {
+      for (const auto& recording : *new_ui) {
+        draws += recording->draw_count();
+      }
+    }
+    REXWGPU_INFO("WebGPUPresenter: UI overlay {} ({} recordings, {} draws, UI paint {})",
+                 has_ui ? "shown" : "hidden", new_ui ? new_ui->size() : 0, draws,
+                 GetPaintStats().ui_paints);
+  }
+  bool had_ui;
+  {
+    std::lock_guard<std::mutex> lock(ui_mutex_);
+    had_ui = ui_recordings_ != nullptr;
+    ui_recordings_ = std::move(new_ui);
+    if (ui_recordings_) {
+      had_ui = true;
+    }
+  }
+  // Painted by the device thread on its next animation frame. A UI paint with
+  // no UI before or after doesn't need to repaint the canvas (the device thread
+  // repaints new guest output by itself).
+  if (!execute_ui_drawers || had_ui) {
+    paint_requested_.store(true, std::memory_order_release);
+  }
   return PaintResult::kPresented;
 }
 
@@ -442,6 +515,7 @@ void WebGPUPresenter::OnAnimationFrame(double time) {
       intervals_.push_back(float(time - last_animation_frame_time_));
     }
   }
+  animation_frame_cv_.notify_all();
   last_animation_frame_time_ = time;
 
   // Picks up a canvas resize (the shared size block is updated by the browser
@@ -502,6 +576,24 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
     }
   }
 
+  std::shared_ptr<const UIRecordingList> ui_recordings;
+  {
+    std::lock_guard<std::mutex> lock(ui_mutex_);
+    ui_recordings = ui_recordings_;
+  }
+  uint32_t ui_draws = 0;
+  if (ui_recordings) {
+    for (const auto& recording : *ui_recordings) {
+      ui_draws += uint32_t(recording->draw_count());
+    }
+    frame.overlay = [&ui_recordings](WGPUCommandEncoder encoder, WGPUTextureView target,
+                                     WGPUTextureFormat format, uint32_t width, uint32_t height) {
+      for (const auto& recording : *ui_recordings) {
+        recording->Encode(encoder, target, format, width, height);
+      }
+    };
+  }
+
   std::unique_ptr<FrameReadback> readback;
   if (!readbacks.empty()) {
     readback = std::make_unique<FrameReadback>();
@@ -547,6 +639,13 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     ++stats_.presented_frames;
+    if (ui_recordings) {
+      ++stats_.ui_overlay_frames;
+      stats_.ui_recordings = uint32_t(ui_recordings->size());
+    } else {
+      stats_.ui_recordings = 0;
+    }
+    stats_.ui_draws = ui_draws;
     stats_.width = presented_width;
     stats_.height = presented_height;
     if (frame.source) {

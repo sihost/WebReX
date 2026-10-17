@@ -27,8 +27,15 @@
  *   presenter's host GPU loss callback. RefreshGuestOutputImpl and
  *   CaptureGuestOutput fail once the device is lost.
  *
- * UI drawers (ImGui) aren't drawn yet: the provider has no immediate drawer
- * until gate 4.
+ * UI drawers (ImGui, WebGPUImmediateDrawer): PaintAndPresentImpl with
+ * execute_ui_drawers runs them on the UI thread, which only records their draws
+ * (WebGPUImmediateRecording); the recordings of the latest UI paint are
+ * published to the device thread, which encodes them over the guest output in
+ * every canvas paint (WebGPUPresentPass::Frame::overlay) until the next UI
+ * paint, or a paint without UI, replaces them. As the connection reports
+ * implicit vsync, the base class does not limit the UI frame rate; instead a
+ * UI paint waits for the next animation frame (at most 100 ms), as a blocking
+ * vsync present would natively.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -38,6 +45,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -58,6 +66,8 @@ namespace ui {
 class WebCanvasSurface;
 
 namespace webgpu {
+
+class WebGPUImmediateRecording;
 
 class WebGPUPresenter final : public Presenter {
  public:
@@ -88,6 +98,13 @@ class WebGPUPresenter final : public Presenter {
     int32_t guest_output_y = 0;
     uint32_t guest_output_width = 0;
     uint32_t guest_output_height = 0;
+    // UI thread paints that ran the UI drawers, and presented frames with a UI
+    // overlay (immediate drawer recordings) drawn over the guest output.
+    uint64_t ui_paints = 0;
+    uint64_t ui_overlay_frames = 0;
+    // Recordings / draws in the last presented frame.
+    uint32_t ui_recordings = 0;
+    uint32_t ui_draws = 0;
     bool device_lost = false;
   };
 
@@ -122,6 +139,10 @@ class WebGPUPresenter final : public Presenter {
 
   // Any thread. Tests: destroys the WebGPU device (the device lost path).
   void LoseDeviceForTesting();
+
+  // UI thread, while the UI drawers run (WebGPUImmediateDrawer::End): adds a
+  // recording to the UI paint in progress.
+  void AddUIRecordingFromUIThread(std::shared_ptr<const WebGPUImmediateRecording> recording);
 
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
@@ -178,6 +199,15 @@ class WebGPUPresenter final : public Presenter {
 
   // UI thread.
   bool painting_connected_ = false;
+  bool in_ui_paint_ = false;
+  bool ui_overlay_shown_ = false;
+  std::vector<std::shared_ptr<const WebGPUImmediateRecording>> ui_recordings_building_;
+  uint64_t last_ui_paint_animation_frame_ = 0;
+
+  // UI recordings of the latest UI paint (UI thread -> device thread).
+  using UIRecordingList = std::vector<std::shared_ptr<const WebGPUImmediateRecording>>;
+  std::mutex ui_mutex_;
+  std::shared_ptr<const UIRecordingList> ui_recordings_;
 
   // Any thread.
   std::atomic<bool> paint_requested_{false};
@@ -186,6 +216,8 @@ class WebGPUPresenter final : public Presenter {
   std::atomic<bool> notify_window_on_loss_{false};
 
   mutable std::mutex stats_mutex_;
+  // Signaled (with stats_mutex_) at every animation frame, for UI paint pacing.
+  std::condition_variable animation_frame_cv_;
   PaintStats stats_;
   bool record_intervals_ = false;
   std::vector<float> intervals_;

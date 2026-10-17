@@ -371,6 +371,9 @@ WebGPUPresentPass::Result WebGPUPresentPass::PresentToSurface(const Frame& frame
   encoder_desc.label = MakeStringView("rex present");
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device_.device(), &encoder_desc);
   EncodeClearAndBlit(encoder, view, device_.surface_format(), width, height, frame);
+  if (frame.overlay) {
+    frame.overlay(encoder, view, device_.surface_format(), width, height);
+  }
   if (frame.readback_buffer) {
     WGPUTexelCopyTextureInfo copy_source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     copy_source.texture = surface_texture.texture;

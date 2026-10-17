@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include <webgpu/webgpu.h>
@@ -46,6 +47,13 @@ class WebGPUPresentPass {
     GammaRamp gamma_ramp = GammaRamp::kNone;
     const uint32_t* gamma_ramp_data = nullptr;
     bool gamma_rb_swap = false;
+    // Optional: PresentToSurface encodes this after the blit into the same canvas
+    // texture (in its own render passes, loading the blit result), before the
+    // readback copy. The UI overlay (WebGPUImmediateDrawer recordings).
+    std::function<void(WGPUCommandEncoder encoder, WGPUTextureView target,
+                       WGPUTextureFormat target_format, uint32_t target_width,
+                       uint32_t target_height)>
+        overlay;
     // Optional: copy the whole presented image here after drawing (usage must
     // include CopyDst, row pitch ReadbackRowPitch(width), at least
     // ReadbackRowPitch(width) * height bytes). For tests and capture.

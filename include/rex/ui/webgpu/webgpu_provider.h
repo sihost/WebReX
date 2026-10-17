@@ -34,8 +34,8 @@ class WebGPUProvider final : public GraphicsProvider {
       Presenter::HostGpuLossCallback host_gpu_loss_callback =
           Presenter::FatalErrorHostGpuLossCallback) override;
 
-  // No WebGPU immediate drawer (ImGui overlay) until gate 4: nullptr, so the app
-  // creates no ImGui drawer.
+  // UI thread. A WebGPUImmediateDrawer (the ImGui overlay), or nullptr if the
+  // device is lost.
   std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
 
  private:
