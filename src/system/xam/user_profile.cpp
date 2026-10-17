@@ -143,10 +143,14 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
       fseek(file, 0, SEEK_SET);
 
       std::vector<uint8_t> serialized_data(input_file_size);
-      fread(serialized_data.data(), 1, serialized_data.size(), file);
+      size_t read = fread(serialized_data.data(), 1, serialized_data.size(), file);
       fclose(file);
       setting->Deserialize(serialized_data);
       setting->loaded_title_id = kernel_state()->title_id();
+      // INFO on purpose: a profile read back from disk is the evidence that title
+      // settings persist (web: OPFS across a page reload, docs/port/gates gate 6).
+      REXSYS_INFO("UserProfile: loaded setting {} from {} ({} of {} bytes)", setting_id,
+                  file_path.string(), read, input_file_size);
     }
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
@@ -163,8 +167,14 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
-    fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
-    fclose(file);
+    if (!file) {
+      REXSYS_ERROR("UserProfile: cannot write setting {} to {}", setting_id, file_path.string());
+      return;
+    }
+    size_t written = fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+    int close_result = fclose(file);
+    REXSYS_INFO("UserProfile: saved setting {} to {} ({} of {} bytes, fclose {})", setting_id,
+                file_path.string(), written, serialized_setting.size(), close_result);
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
     // stored some other way.
