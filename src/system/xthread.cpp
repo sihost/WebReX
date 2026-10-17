@@ -546,8 +546,8 @@ X_STATUS XThread::Terminate(int exit_code) {
 }
 
 void XThread::Execute() {
-  REXSYS_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
-               thread_name_, thread_->system_id());
+  REXSYS_INFO("XThread::Execute thid {} (handle={:08X}, '{}', native={:08X}, guest)", thread_id_,
+              handle(), thread_name_, thread_->system_id());
 
   // Let the kernel know we are starting.
   kernel_state()->OnThreadExecute(this);
@@ -622,6 +622,13 @@ void XThread::Execute() {
 
   // Execute the function
   REXSYS_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+  // One-time proof that recompiled guest code is entered (the launch thread's
+  // entry point, normally mainCRTStartup, is the first host-to-guest call).
+  static std::atomic_flag first_guest_call = ATOMIC_FLAG_INIT;
+  if (!first_guest_call.test_and_set(std::memory_order_relaxed)) {
+    REXSYS_INFO("First guest code: calling {:08X} on '{}' (r1={:08X} r13={:08X})", address,
+                thread_name_, ctx->r1.u32, ctx->r13.u32);
+  }
   func(*ctx, base);
 
   exit_code = static_cast<int>(ctx->r3.u32);

@@ -454,7 +454,8 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
   }
 
   SetExecutableModule(module);
-  REXSYS_INFO("KernelState: Launching module...");
+  REXSYS_INFO("KernelState: Launching module {} entry {:08X} stack {:X}", module->name(),
+              module->entry_point(), module->stack_size());
 
   // Create a thread to run in.
   // We start suspended so we can run the debugger prep.

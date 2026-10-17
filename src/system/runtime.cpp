@@ -296,7 +296,18 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
   }
 
   kernel_state_->SetExecutableModule(module);
-  REXSYS_DEBUG("  XEX image loaded successfully");
+  if (const auto* xex = module->xex_module()) {
+    REXSYS_INFO("XEX image loaded: {} (title {:08X}{}) base {:08X} size {:08X} entry {:08X} "
+                "stack {:X}",
+                module->name(), module->title_id(), xex->is_dev_kit() ? ", devkit key" : "",
+                xex->base_address(), xex->image_size(), module->entry_point(),
+                module->stack_size());
+    for (const auto& section : xex->binary_sections()) {
+      REXSYS_INFO("  section {:<8} {:08X}-{:08X} {}{}", section.name, section.virtual_address,
+                  section.virtual_address + section.virtual_size, section.executable ? 'x' : '-',
+                  section.writable ? 'w' : '-');
+    }
+  }
   return X_STATUS_SUCCESS;
 }
 
