@@ -11,9 +11,19 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
 #include <rex/graphics/webgpu/webgpu_device.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
+#if REX_PLATFORM_WEB
+#include <rex/ppc/fold_web.h>
+#endif
+
+REXCVAR_DEFINE_BOOL(webgpu_verify_shared_memory, false, "GPU",
+                    "Debug: hash every page uploaded to the WebGPU shared memory and recheck "
+                    "the fetched vertex/index/texture pages at each draw; pages the CPU changed "
+                    "without a dirty mark are logged, counted and re-uploaded");
 
 namespace rex::graphics::webgpu {
 
@@ -59,10 +69,84 @@ bool WebGPUSharedMemory::Initialize() {
   }
   REXGPU_INFO("WebGPU shared memory: {} MiB buffer, {} storage binding(s) of {} MiB",
               kBufferSize >> 20, binding_count_, binding_size_ >> 20);
+  if (REXCVAR_GET(webgpu_verify_shared_memory)) {
+    page_hashes_.assign(kBufferSize >> page_size_log2(), 0);
+    verify_watch_ = RegisterGlobalWatch(VerifyGlobalWatchCallback, this);
+    REXGPU_WARN("WebGPU shared memory: verify mode (every upload hashed, fetches rechecked)");
+  }
   return true;
 }
 
+void WebGPUSharedMemory::VerifyGlobalWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& /*global_lock*/, void* context,
+    uint32_t address_first, uint32_t address_last, bool /*invalidated_by_gpu*/) {
+  // Invalidated by the CPU (consumed dirty pages) or written by the GPU: the
+  // shared memory copy is no longer expected to equal the uploaded bytes.
+  auto* self = static_cast<WebGPUSharedMemory*>(context);
+  if (self->page_hashes_.empty()) {
+    return;
+  }
+  uint32_t log2 = self->page_size_log2();
+  uint32_t last = std::min<uint32_t>(address_last >> log2, uint32_t(self->page_hashes_.size()) - 1);
+  for (uint32_t page = address_first >> log2; page <= last; ++page) {
+    self->page_hashes_[page] = 0;
+  }
+}
+
+uint32_t WebGPUSharedMemory::VerifyRange(uint32_t start, uint32_t length, const char* what,
+                                         uint32_t id) {
+  if (page_hashes_.empty() || !length || start >= kBufferSize) {
+    return 0;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t log2 = page_size_log2();
+  const uint32_t page_size = UINT32_C(1) << log2;
+  uint32_t stale = 0;
+  for (uint32_t page = start >> log2; page <= (start + length - 1) >> log2; ++page) {
+    uint64_t expected = page_hashes_[page];
+    if (!expected) {
+      continue;
+    }
+    ++verified_pages_;
+    uint32_t address = page << log2;
+    uint64_t actual = XXH3_64bits(memory().TranslatePhysical(address), page_size) | 1;
+    if (actual == expected) {
+      continue;
+    }
+#if REX_PLATFORM_WEB
+    // A pending dirty mark is a legitimate CPU write the next request consumes.
+    bool marked = false;
+    for (uint32_t offset = 0; offset < page_size; offset += fold::kDirtyPageSize) {
+      marked |= fold::g_phys_dirty[(address + offset) >> fold::kDirtyPageShift] != 0;
+    }
+    if (marked) {
+      continue;
+    }
+#endif
+    ++stale;
+    ++stale_pages_;
+    if (stale_logged_ < 64) {
+      ++stale_logged_;
+      REXGPU_WARN(
+          "WebGPU shared memory verify: page {:08X} ({} {}) changed since its upload without a "
+          "dirty mark (stale GPU copy); re-uploading",
+          address, what, id);
+    }
+    page_hashes_[page] = 0;
+#if REX_PLATFORM_WEB
+    memory().MarkPhysicalDirtyPhysical(address, page_size);
+    memory().ConsumePhysicalDirty(address, page_size);
+#endif
+  }
+  return stale;
+}
+
 void WebGPUSharedMemory::Shutdown(bool from_destructor) {
+  if (verify_watch_) {
+    UnregisterGlobalWatch(verify_watch_);
+    verify_watch_ = nullptr;
+  }
+  page_hashes_.clear();
   if (buffer_) {
     WGPUBuffer buffer = buffer_;
     buffer_ = nullptr;
@@ -108,6 +192,15 @@ bool WebGPUSharedMemory::UploadRanges(
       // (the dirty map is set after guest stores, consumed by the next request).
       MakeRangeValid(start, length, false);
       std::memcpy(upload, memory().TranslatePhysical(start), length);
+      if (!page_hashes_.empty()) {
+        for (uint32_t page = 0; page < pages; ++page) {
+          page_hashes_[page_start + page] =
+              XXH3_64bits(static_cast<const uint8_t*>(upload) +
+                              (size_t(page) << page_size_log2_value),
+                          size_t(1) << page_size_log2_value) |
+              1;
+        }
+      }
       uploaded_bytes_ += length;
       ++upload_count_;
       page_start += pages;

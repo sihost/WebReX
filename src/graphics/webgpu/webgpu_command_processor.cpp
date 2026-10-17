@@ -345,6 +345,12 @@ bool WebGPUCommandProcessor::RequestVertexBuffers(const Shader& vertex_shader) {
                      vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
+      if (shared_memory_->VerifyRange(vfetch_constant.address << 2, vfetch_constant.size << 2,
+                                      "vertex fetch", vfetch_index) &&
+          !shared_memory_->RequestRange(vfetch_constant.address << 2,
+                                        vfetch_constant.size << 2)) {
+        return false;
+      }
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
@@ -649,6 +655,37 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return true;
   }
   // ---- end WP3 ----
+
+  if (shared_memory_->verifying()) {
+    // --webgpu_verify_shared_memory: the guest DMA indices and the first 64 KiB
+    // of each fetched texture's base and mip data.
+    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+      auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+      uint32_t index_bytes =
+          vgt_dma_size.num_words *
+          (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 2u : 4u);
+      shared_memory_->VerifyRange(regs[XE_GPU_REG_VGT_DMA_BASE] & 0x1FFFFFFF, index_bytes,
+                                  "index buffer", vgt_draw_initiator.num_indices);
+    }
+    for (const Shader* shader : {static_cast<const Shader*>(vertex_shader),
+                                 static_cast<const Shader*>(pixel_shader)}) {
+      if (!shader) {
+        continue;
+      }
+      for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant & 31);
+        if (fetch.base_address) {
+          shared_memory_->VerifyRange(fetch.base_address << 12, 0x10000, "texture base",
+                                      binding.fetch_constant);
+        }
+        if (fetch.mip_address) {
+          shared_memory_->VerifyRange(fetch.mip_address << 12, 0x10000, "texture mips",
+                                      binding.fetch_constant);
+        }
+      }
+    }
+  }
 
   // Textures (WP5): loads are recorded outside render passes, before the pass
   // of this draw is opened.
@@ -1068,6 +1105,13 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   slot = swap_submission;
   primitive_processor_->EndFrame();  // WP3: after the latency wait
+  // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
+  // on by default): pages not written by the GPU become invalid, so vertex and
+  // index data are uploaded again on their next request even if a CPU write
+  // escaped the dirty map. Textures still depend on invalidation (watches).
+  if (REXCVAR_GET(clear_memory_page_state)) {
+    shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+  }
 
   if (swap_index == 1 || swap_index % 600 == 0 || REXCVAR_GET(webgpu_log_frames)) {
     const WebGPUReplayStats replay = command_queue_->last_replay_stats();
@@ -1082,7 +1126,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "requested {} created {} failed | textures {} loads {} failures {} | constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
-        "{:.3f} ms, submit {:.3f} ms | uncaptured errors {}",
+        "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
+        "stale",
         swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, refreshed,
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
@@ -1099,7 +1144,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         submission_tracker_.replayed(), submission_tracker_.completed(),
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
-        replay.submit_ms, device_.uncaptured_error_count());
+        replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
+        shared_memory_->stale_pages());
   }
 }
 

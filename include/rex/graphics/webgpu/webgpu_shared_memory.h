@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -54,10 +55,25 @@ class WebGPUSharedMemory : public SharedMemory {
   uint64_t uploaded_bytes() const { return uploaded_bytes_; }
   uint64_t upload_count() const { return upload_count_; }
 
+  // --webgpu_verify_shared_memory: finds CPU-written pages whose guest bytes
+  // changed since their upload with no dirty mark pending and no invalidation
+  // since (a host writer that bypassed the web dirty map, docs/port/webgpu.md
+  // section 8). Such pages are marked dirty and consumed, so the next request
+  // uploads them again and textures/index caches on them are invalidated.
+  // Returns the number of stale pages found. No-op when the cvar is off.
+  uint32_t VerifyRange(uint32_t start, uint32_t length, const char* what, uint32_t id);
+  bool verifying() const { return !page_hashes_.empty(); }
+  uint64_t stale_pages() const { return stale_pages_; }
+  uint64_t verified_pages() const { return verified_pages_; }
+
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
+  static void VerifyGlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                        void* context, uint32_t address_first,
+                                        uint32_t address_last, bool invalidated_by_gpu);
+
   WebGPUCommandProcessor& command_processor_;
   TraceWriter& trace_writer_;
   WGPUBuffer buffer_ = nullptr;
@@ -65,6 +81,13 @@ class WebGPUSharedMemory : public SharedMemory {
   uint64_t binding_size_ = kBufferSize;
   uint64_t uploaded_bytes_ = 0;
   uint64_t upload_count_ = 0;
+  // Per page: XXH3 of the uploaded bytes | 1, 0 = not uploaded since the last
+  // invalidation / GPU write (verify mode only).
+  std::vector<uint64_t> page_hashes_;
+  GlobalWatchHandle verify_watch_ = nullptr;
+  uint64_t stale_pages_ = 0;
+  uint64_t verified_pages_ = 0;
+  uint32_t stale_logged_ = 0;
 };
 
 }  // namespace rex::graphics::webgpu

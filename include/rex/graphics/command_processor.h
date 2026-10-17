@@ -235,6 +235,15 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  // --gpu_draw_dump_swap (any backend, any platform): one DRAWDUMP log line per
+  // draw of the selected swaps with the shader hashes, render state words,
+  // fetch constants and XXH3 hashes of the guest memory the draw fetches, to
+  // diff the same scene between builds (native D3D12 vs web WebGPU).
+  void DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t index_count,
+                      const IndexBufferInfo* index_buffer_info);
+  uint32_t draw_dump_counter_ = UINT32_MAX;
+  uint32_t draw_dump_index_ = 0;
+
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }

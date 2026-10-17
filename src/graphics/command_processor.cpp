@@ -13,18 +13,23 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <iterator>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
 
+#include <rex/bit.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -76,6 +81,16 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
                     "pipelines are being prepared.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_draw_dump_swap, -1, "GPU",
+                     "Log a DRAWDUMP line for every draw from this swap number on (shader "
+                     "hashes, render state, fetch constants, XXH3 of the fetched guest memory), "
+                     "to diff the same scene between builds; -1 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_draw_dump_swaps, 1, "GPU",
+                     "Number of consecutive swaps gpu_draw_dump_swap logs")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
@@ -1508,6 +1523,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      // After IssueDraw: the backend has analyzed the shaders by now.
+      DumpDrawInputs(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                     is_indexed ? &index_buffer_info : nullptr);
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
@@ -1529,6 +1547,121 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // buffer processing as that would leave rendering in a way more inconsistent
   // state than just a single dropped draw command.
   return true;
+}
+
+void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                      const IndexBufferInfo* index_buffer_info) {
+  int32_t first_swap = REXCVAR_GET(gpu_draw_dump_swap);
+  if (first_swap < 0 || counter_ < uint32_t(first_swap) ||
+      counter_ - uint32_t(first_swap) >=
+          uint32_t(std::max(REXCVAR_GET(gpu_draw_dump_swaps), int32_t(1)))) {
+    return;
+  }
+  if (draw_dump_counter_ != counter_) {
+    draw_dump_counter_ = counter_;
+    draw_dump_index_ = 0;
+  }
+  uint32_t draw_index = draw_dump_index_++;
+  const RegisterFile& regs = *register_file_;
+  auto hash_physical = [&](uint32_t address, uint32_t length) -> uint64_t {
+    address &= 0x1FFFFFFF;
+    length = std::min(length, UINT32_C(0x20000000) - address);
+    return XXH3_64bits(memory_->TranslatePhysical<const uint8_t*>(address), length);
+  };
+  const Shader* vs = active_vertex_shader_;
+  const Shader* ps = active_pixel_shader_;
+  std::string line;
+  auto out = std::back_inserter(line);
+  fmt::format_to(out, "DRAWDUMP s={} d={} vs={:016X} ps={:016X} prim={} n={}", counter_,
+                 draw_index, vs ? vs->ucode_data_hash() : 0, ps ? ps->ucode_data_hash() : 0,
+                 uint32_t(prim_type), index_count);
+  if (index_buffer_info) {
+    uint32_t length = uint32_t(index_buffer_info->length);
+    fmt::format_to(out, " ib={:08X}+{:X} f={} e={} h={:016X}", index_buffer_info->guest_base,
+                   length, uint32_t(index_buffer_info->format),
+                   uint32_t(index_buffer_info->endianness),
+                   hash_physical(index_buffer_info->guest_base, length));
+  }
+  fmt::format_to(out,
+                 " mode={:X} surf={:08X} c0={:08X} c1={:08X} dep={:08X} cmask={:08X} dctl={:08X} "
+                 "blend0={:08X} colctl={:08X} vte={:08X} sc={:08X} clip={:08X} woff={:08X} "
+                 "ws={:08X},{:08X} vp={},{},{},{},{},{}",
+                 regs[XE_GPU_REG_RB_MODECONTROL], regs[XE_GPU_REG_RB_SURFACE_INFO],
+                 regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_COLOR1_INFO],
+                 regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_RB_COLOR_MASK],
+                 regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_BLENDCONTROL0],
+                 regs[XE_GPU_REG_RB_COLORCONTROL], regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+                 regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
+                 regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                 regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
+  // Used float constants in the order the shader sees them (packed), then the
+  // bool/loop constants.
+  auto hash_floats = [&](const Shader* shader, uint32_t first_register) -> uint64_t {
+    if (!shader || !shader->is_ucode_analyzed()) {
+      return 0;
+    }
+    XXH3_state_t state;
+    XXH3_64bits_reset(&state);
+    const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = map.float_bitmap[i];
+      uint32_t index;
+      while (rex::bit_scan_forward(bits, &index)) {
+        bits &= ~(UINT64_C(1) << index);
+        XXH3_64bits_update(&state, &regs[first_register + (i << 8) + (index << 2)],
+                           4 * sizeof(uint32_t));
+      }
+    }
+    return XXH3_64bits_digest(&state);
+  };
+  fmt::format_to(out, " cv={:016X} cp={:016X} cb={:016X}",
+                 hash_floats(vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
+                 hash_floats(ps, XE_GPU_REG_SHADER_CONSTANT_256_X),
+                 XXH3_64bits(&regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                             (8 + 32) * sizeof(uint32_t)));
+  if (vs && vs->is_ucode_analyzed()) {
+    for (const Shader::VertexBinding& binding : vs->vertex_bindings()) {
+      xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(binding.fetch_constant);
+      uint32_t address = (vf.address << 2) & 0x1FFFFFFF;
+      uint32_t size = vf.size << 2;
+      fmt::format_to(out, " | vf{} {:08X}:{:08X} st={} h={:016X} w=", binding.fetch_constant,
+                     vf.dword_0, vf.dword_1, binding.stride_words, hash_physical(address, size));
+      const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(address);
+      uint32_t word_count = std::min(size >> 2, UINT32_C(12));
+      for (uint32_t i = 0; i < word_count; ++i) {
+        fmt::format_to(out, "{}{:08X}", i ? "," : "", rex::byte_swap(words[i]));
+      }
+    }
+  }
+  uint32_t textures_dumped = 0;
+  for (const Shader* shader : {vs, ps}) {
+    if (!shader || !shader->is_ucode_analyzed()) {
+      continue;
+    }
+    for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+      uint32_t fetch = binding.fetch_constant & 31;
+      if (textures_dumped & (UINT32_C(1) << fetch)) {
+        continue;
+      }
+      textures_dumped |= UINT32_C(1) << fetch;
+      xenos::xe_gpu_texture_fetch_t tf = regs.GetTextureFetch(fetch);
+      uint32_t base = tf.base_address << 12;
+      uint32_t mips = tf.mip_address << 12;
+      fmt::format_to(out,
+                     " | tf{} {:08X}:{:08X}:{:08X}:{:08X}:{:08X}:{:08X} h4k={:016X} h64k={:016X} "
+                     "m4k={:016X}",
+                     fetch, tf.dword_0, tf.dword_1, tf.dword_2, tf.dword_3, tf.dword_4, tf.dword_5,
+                     hash_physical(base, 0x1000), hash_physical(base, 0x10000),
+                     mips ? hash_physical(mips, 0x1000) : 0);
+    }
+  }
+  REXGPU_INFO("{}", line);
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
