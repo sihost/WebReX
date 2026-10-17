@@ -18,14 +18,22 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
-#if !REX_PLATFORM_WEB  // SDL is not built for the web (browser input: WS-F)
+#if REX_PLATFORM_WEB
+#include <rex/input/web/web_input.h>
+#else  // SDL is not built for the web (browser input: rex/input/web)
 #include <rex/input/sdl/sdl_input_driver.h>
 #endif
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 
+#if REX_PLATFORM_WEB
+// "web": Gamepad API driver (+ the MnK driver fed by DOM events, see mnk_mode).
+REXCVAR_DEFINE_STRING(input_backend, "web", "Input", "Input backend: web")
+    .allowed({"web"});
+#else
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
+#endif
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 namespace rex::input {
@@ -174,7 +182,14 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     }
 #endif
 
-#if !REX_PLATFORM_WEB
+#if REX_PLATFORM_WEB
+    if (REXCVAR_GET(input_backend) == "web") {
+      auto web_driver = std::make_unique<web::WebGamepadInputDriver>(nullptr, 0);
+      if (web_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(web_driver));
+      }
+    }
+#else
     if (REXCVAR_GET(input_backend) == "sdl") {
       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {

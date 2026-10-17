@@ -15,7 +15,8 @@ target_include_directories(rexinput PUBLIC
 if(WIN32)
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
 elseif(EMSCRIPTEN)
-    # No SDL on the web (browser input is WS-F); MnK + NOP drivers only.
+    # No SDL on the web: Gamepad API driver + DOM keyboard/mouse bridge feeding MnK.
+    target_sources(rexinput PRIVATE web/dom_input_bridge.cpp web/web_gamepad_input_driver.cpp)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()

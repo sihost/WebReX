@@ -16,3 +16,4 @@
 REXCVAR_DECLARE(bool, guide_button);
 REXCVAR_DECLARE(std::string, hid_mappings_file);
 REXCVAR_DECLARE(std::string, input_backend);
+REXCVAR_DECLARE(bool, mnk_mode);  // mnk/mnk_input_driver.cpp
