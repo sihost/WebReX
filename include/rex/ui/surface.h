@@ -33,12 +33,16 @@ class Surface {
     kTypeIndex_XcbWindow,
     // Windows.
     kTypeIndex_Win32Hwnd,
+    // Web (Emscripten): an HTML canvas presented through WebGPU
+    // (rex/ui/surface_web.h).
+    kTypeIndex_WebCanvas,
   };
   using TypeFlags = uint32_t;
   enum : TypeFlags {
     kTypeFlag_AndroidNativeWindow = TypeFlags(1) << kTypeIndex_AndroidNativeWindow,
     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
+    kTypeFlag_WebCanvas = TypeFlags(1) << kTypeIndex_WebCanvas,
   };
 
   Surface(const Surface& surface) = delete;
