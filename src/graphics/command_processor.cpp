@@ -88,7 +88,8 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 REXCVAR_DEFINE_INT32(gpu_draw_dump_swap, -1, "GPU",
                      "Log a DRAWDUMP line for every draw from this swap number on (shader "
                      "hashes, render state, fetch constants, XXH3 of the fetched guest memory), "
-                     "to diff the same scene between builds; -1 = off")
+                     "to diff the same scene between builds; -1 = off; -2 = the next swap (set at "
+                     "run time, e.g. by a game-tick trigger; becomes that swap's number)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(gpu_draw_dump_swaps, 1, "GPU",
@@ -1100,6 +1101,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   ++counter_;
   ++draw_dump_swap_index_;
+  if (REXCVAR_GET(gpu_draw_dump_swap) == -2) {
+    // Requested at run time (rex::cvar::SetFlagByName): dump the swap that starts now.
+    REXCVAR_SET(gpu_draw_dump_swap, int32_t(draw_dump_swap_index_));
+    REXGPU_WARN("gpu_draw_dump_swap=-2: dumping {} swap(s) from swap {}",
+                std::max(REXCVAR_GET(gpu_draw_dump_swaps), int32_t(1)), draw_dump_swap_index_);
+  }
   return true;
 }
 
