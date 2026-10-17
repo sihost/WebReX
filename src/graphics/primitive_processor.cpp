@@ -1350,6 +1350,13 @@ PrimitiveProcessor::CacheTransaction::CacheTransaction(PrimitiveProcessor& proce
   uint32_t size_bytes =
       (key_.format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t) : sizeof(uint32_t)) *
       key_.count;
+#if REX_PLATFORM_WEB
+  // Web write-watch replacement (docs/port/webgpu.md section 8): CPU writes to
+  // the guest indices since they were cached are only in the dirty map.
+  // Consuming it fires MemoryInvalidationCallback below, which drops the stale
+  // converted entries before the lookup.
+  processor_.memory_.ConsumePhysicalDirty(key_.base, size_bytes);
+#endif
   {
     auto global_lock = processor_.global_critical_region_.Acquire();
     auto cache_map_it = processor_.cache_map_.find(key_);

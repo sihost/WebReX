@@ -341,6 +341,16 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
     return;
   }
   length = std::min(length, kBufferSize - start);
+#if REX_PLATFORM_WEB
+  // No write faults on web: CPU writes reach the caches only through the dirty
+  // map (docs/port/webgpu.md section 8). CPU writes made before this GPU write
+  // (resolve, memexport) must invalidate first; otherwise a later RequestRange
+  // would see their stale dirty bits and upload the old CPU data over the GPU
+  // data. The CPU-upload path (written_by_gpu false) consumed in RequestRanges.
+  if (written_by_gpu) {
+    memory().ConsumePhysicalDirty(start, length);
+  }
+#endif
   uint32_t last = start + length - 1;
   uint32_t valid_page_first = start >> page_size_log2_;
   uint32_t valid_page_last = last >> page_size_log2_;
@@ -447,6 +457,16 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
   merged_ranges.resize(merged_write + 1);
+
+#if REX_PLATFORM_WEB
+  // Web write-watch replacement (docs/port/webgpu.md section 8): pages the CPU
+  // wrote since the last request are dirty in Memory's map. Consuming them
+  // fires MemoryInvalidationCallback (and the texture cache watches) for each
+  // dirty run before the validity scan below, so they are uploaded again.
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    memory().ConsumePhysicalDirty(range.first, range.second);
+  }
+#endif
 
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
