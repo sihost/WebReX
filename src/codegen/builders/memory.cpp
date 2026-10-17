@@ -622,7 +622,7 @@ bool build_stvrx(BuilderContext& ctx) {
 bool build_stvx(BuilderContext& ctx) {
   emitVectorEA(ctx, "0xF");
   ctx.println(
-      "\tsimde_mm_store_si128((simde__m128i*)PPC_RAW_ADDR({}), "
+      "\tsimde_mm_store_si128((simde__m128i*)PPC_RAW_ADDR_W({}), "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
       "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
       ctx.ea(), ctx.v(ctx.insn.operands[0]));

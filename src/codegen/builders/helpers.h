@@ -290,6 +290,7 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
  * Emit atomic store-conditional instruction (stwcx./stdcx. pattern).
  *
  * Pattern: EA = rA + rB; cr0 = CAS(EA, reserved, bswap(rS))
+ * Uses PPC_RAW_ADDR_W (store-side raw address: marks the page dirty on web).
  *
  * @param ctx The builder context
  * @param ptr_type The pointer type (e.g., "uint32_t", "uint64_t")
@@ -305,7 +306,7 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
   ctx.println("\t{}.lt = 0;", ctx.cr(0));
   ctx.println("\t{}.gt = 0;", ctx.cr(0));
   ctx.println(
-      "\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<{}*>(PPC_RAW_ADDR({})), "
+      "\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<{}*>(PPC_RAW_ADDR_W({})), "
       "{}.{}, {}({}.{}));",
       ctx.cr(0), ptr_type, ctx.ea(), ctx.reserved(), field, bswap_func, ctx.r(ctx.insn.operands[0]),
       field);
