@@ -62,7 +62,8 @@ if(WIN32)
         windowed_app_context_win.cpp
     )
 elseif(EMSCRIPTEN)
-    # STUB window (no canvas surface yet) + real pending-function UI loop.
+    # Canvas window (WebCanvasSurface, resize observer, input hook) +
+    # pending-function UI loop.
     set(REXUI_PLATFORM_SOURCES
         window_web.cpp
         windowed_app_context_web.cpp
@@ -90,8 +91,25 @@ if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
 endif()
 
+# WebGPU presenter + provider (Emscripten, REXGLUE_USE_WEBGPU, defined in
+# src/graphics which is configured after this directory, so "not explicitly
+# OFF"). They use rexgraphics' WebGPUDevice / WebGPUPresentPass; rexgraphics
+# already links rexui, and wasm-ld resolves the archive cycle in any order.
+set(REXUI_WEBGPU OFF)
+if(EMSCRIPTEN AND NOT (DEFINED REXGLUE_USE_WEBGPU AND NOT REXGLUE_USE_WEBGPU))
+    set(REXUI_WEBGPU ON)
+    list(APPEND REXUI_SOURCES
+        webgpu/webgpu_presenter.cpp
+        webgpu/webgpu_provider.cpp
+    )
+endif()
+
 add_library(rexui STATIC ${REXUI_SOURCES})
 add_library(rex::ui ALIAS rexui)
+
+if(REXUI_WEBGPU)
+    target_compile_options(rexui PRIVATE --use-port=emdawnwebgpu)
+endif()
 
 target_include_directories(rexui PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
