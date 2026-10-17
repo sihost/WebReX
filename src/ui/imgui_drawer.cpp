@@ -21,6 +21,9 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
+#if REX_PLATFORM_WEB
+#include <rex/ui/window_web.h>
+#endif
 
 #include <imgui.h>
 
@@ -359,6 +362,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
 
   if (dialogs_.empty()) {
+#if REX_PLATFORM_WEB
+    web::SetUIWantsPointer(false);
+#endif
     return;
   }
 
@@ -390,6 +396,13 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   dialog_loop_next_index_ = SIZE_MAX;
 
   ImGui::Render();
+#if REX_PLATFORM_WEB
+  // A focused or hovered overlay window owns the mouse: no Pointer Lock (see
+  // window_web.h). Natively the MnK driver checks WantCaptureMouse instead, but on
+  // the web a locked pointer never hovers anything, so focus counts too.
+  web::SetUIWantsPointer(io.WantCaptureMouse ||
+                         ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow));
+#endif
   ImDrawData* draw_data = ImGui::GetDrawData();
   if (draw_data) {
     RenderDrawLists(draw_data, ui_draw_context);

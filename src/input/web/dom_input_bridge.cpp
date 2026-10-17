@@ -395,7 +395,9 @@ bool OnMouseDown(int, const EmscriptenMouseEvent* e, void*) {
     CanvasPosition(e, &ev.x, &ev.y);
     Forward(ev);
   }
-  if (REXCVAR_GET(web_pointer_lock) && !g_pointer_locked.load(std::memory_order_relaxed)) {
+  // An ImGui overlay window owning the mouse gets plain clicks (no lock request).
+  if (REXCVAR_GET(web_pointer_lock) && !g_pointer_locked.load(std::memory_order_relaxed) &&
+      !rex::ui::web::UIWantsPointer()) {
     // Inside a user gesture: the browser allows the lock request here. The click
     // that acquires the lock is not a game input (it would otherwise fire).
     emscripten_request_pointerlock(g_canvas_selector, false);

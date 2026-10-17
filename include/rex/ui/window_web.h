@@ -97,6 +97,14 @@ void SetWindowLifecycleCallback(WindowLifecycleCallback callback);
 // resize observer (0x0 before the window opens).
 void GetCanvasPhysicalSize(uint32_t& width_out, uint32_t& height_out);
 
+// Whether the UI (an ImGui overlay window that takes input) owns the mouse. Set by
+// the ImGui drawer on the UI thread every UI frame; read by the DOM input bridge
+// on the browser main thread, which then does not request Pointer Lock on a canvas
+// click (the overlay needs a visible cursor and absolute positions). Turning it on
+// releases an active Pointer Lock (asynchronously, on the browser main thread).
+void SetUIWantsPointer(bool wants);
+bool UIWantsPointer();
+
 }  // namespace web
 }  // namespace ui
 }  // namespace rex

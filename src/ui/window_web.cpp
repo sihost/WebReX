@@ -447,6 +447,25 @@ void GetCanvasPhysicalSize(uint32_t& width_out, uint32_t& height_out) {
   height_out = uint32_t(packed >> 32);
 }
 
+namespace {
+std::atomic<bool> g_ui_wants_pointer{false};
+}  // namespace
+
+void SetUIWantsPointer(bool wants) {
+  if (g_ui_wants_pointer.exchange(wants, std::memory_order_acq_rel) == wants || !wants) {
+    return;
+  }
+  // The pointer lock is the browser main thread's (async: the UI thread must not
+  // wait on the main thread).
+  MAIN_THREAD_ASYNC_EM_ASM({
+    if (typeof document != 'undefined' && document.pointerLockElement) {
+      document.exitPointerLock();
+    }
+  });
+}
+
+bool UIWantsPointer() { return g_ui_wants_pointer.load(std::memory_order_acquire); }
+
 }  // namespace web
 
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
