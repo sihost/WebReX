@@ -73,6 +73,14 @@ if(WIN32)
     target_link_libraries(rexsystem PRIVATE ws2_32)
 endif()
 
+if(EMSCRIPTEN)
+    # Web port (Workstream G): virtual UDP over the server's /net WebSocket relay. The
+    # main-thread JS (web/net_relay.js) is compiled in with #embed.
+    target_sources(rexsystem PRIVATE web/net_relay.cpp)
+    set_source_files_properties(web/net_relay.cpp PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/net_relay.js")
+endif()
+
 # Propagate graphics backend selection
 if(REXGLUE_USE_D3D12)
     target_compile_definitions(rexsystem PUBLIC REX_HAS_D3D12=1)
