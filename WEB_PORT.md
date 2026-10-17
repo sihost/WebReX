@@ -1,6 +1,6 @@
-# ReXGlue web port: the Xbox 360 runtime on WebGPU + wasm64
+# WebReX: the ReXGlue runtime on WebGPU + wasm64
 
-This is a fork of [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) (branch `web-port`). It
+WebReX is a fork of [rexglue-sdk](https://github.com/rexglue/rexglue-sdk). It
 runs ReXGlue-recompiled Xbox 360 titles in the browser: the SDK runtime (kernel, memory,
 threads, filesystem, audio, input) is built with Emscripten for **wasm64**, and the Xenos GPU is
 emulated on **WebGPU**.

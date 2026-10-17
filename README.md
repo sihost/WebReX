@@ -1,3 +1,20 @@
+# WebReX
+
+**The ReXGlue Xbox 360 runtime in the browser, with the Xenos GPU on WebGPU.**
+
+WebReX runs ReXGlue-recompiled Xbox 360 titles in the browser. The runtime (kernel, threads,
+memory, filesystem, audio, input, system-link networking) is built for **wasm64** with
+Emscripten, and the Xenos GPU is emulated on **WebGPU**. It was originally built for a browser
+port of Halo 3. No game code or game data is included.
+
+- What the web port adds, its status, and how to build it: [WEB_PORT.md](WEB_PORT.md)
+- A runnable example: [WebGPU presenter demo](examples/webgpu_presenter_demo)
+
+WebReX is a fork of [ReXGlue](https://github.com/rexglue/rexglue-sdk). Native builds
+(Windows/Linux, D3D12/Vulkan) still work. The upstream ReXGlue README follows.
+
+---
+
 > [!CAUTION]
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 
@@ -18,11 +35,6 @@
     <img src="https://img.shields.io/github/stars/rexglue/rexglue-sdk" alt="rexglue-sdk stargazers">
   </a>
 </h1>
-
-> [!NOTE]
-> **Web port fork:** this branch also runs ReXGlue titles in the browser (wasm64 + a WebGPU
-> Xenos backend). See [WEB_PORT.md](WEB_PORT.md) and the
-> [WebGPU presenter demo](examples/webgpu_presenter_demo).
 
 ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
 

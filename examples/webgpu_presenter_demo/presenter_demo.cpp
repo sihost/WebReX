@@ -261,7 +261,7 @@ int main() {
   presenter->SetBackgroundColor(kBackground[0], kBackground[1], kBackground[2]);
 
   std::unique_ptr<rex::ui::Window> window =
-      rex::ui::Window::Create(app_context, "Xbox 360 WebGPU presenter demo", 640, 360);
+      rex::ui::Window::Create(app_context, "WebReX WebGPU presenter demo", 640, 360);
   window->Open();
   window->SetPresenter(presenter);
 
