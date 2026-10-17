@@ -12,11 +12,20 @@ add_library(rexaudio STATIC
     nop/nop_audio_system.cpp
 )
 if(NOT EMSCRIPTEN)
-    # SDL backend (not built for the web; browser audio is WS-E)
+    # SDL backend (not built for the web)
     target_sources(rexaudio PRIVATE
         sdl/sdl_audio_system.cpp
         sdl/sdl_audio_driver.cpp
     )
+else()
+    # Browser backend: AudioWorklet fed from a SharedArrayBuffer ring. The worklet source
+    # (web/rex_audio_worklet.js) is compiled in with #embed.
+    target_sources(rexaudio PRIVATE
+        web/web_audio_output.cpp
+        web/web_audio_system.cpp
+    )
+    set_source_files_properties(web/web_audio_output.cpp PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/rex_audio_worklet.js")
 endif()
 add_library(rex::audio ALIAS rexaudio)
 
