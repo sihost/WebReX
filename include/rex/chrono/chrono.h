@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include <rex/chrono/clock.h>
+#include <rex/std_compat.h>  // clock_time_conversion on libc++ (web)
 
 namespace rex {
 using hundrednano = std::ratio<1, 10000000>;

@@ -28,7 +28,11 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
 #include <rex/audio/audio_system.h>
+#if REX_PLATFORM_WEB
+#include <rex/audio/nop/nop_audio_system.h>
+#else
 #include <rex/audio/sdl/sdl_audio_system.h>
+#endif
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/system/kernel_state.h>
@@ -131,7 +135,12 @@ bool ReXApp::OnInitialize() {
 #elif REX_HAS_VULKAN
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
 #endif
+#if REX_PLATFORM_WEB
+  // STUB: no browser audio driver yet (WS-E); see docs/port/STUBS.md.
+  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::nop::NopAudioSystem);
+#else
   config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+#endif
   config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config.kernel_init = rex::kernel::InitializeKernel;
 

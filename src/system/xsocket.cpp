@@ -49,7 +49,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
   if (proto == Protocol::IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    // Spelled numerically: musl (Emscripten) #defines IPPROTO_UDP as 17,
+    // which breaks the qualified enumerator name.
+    proto = static_cast<Protocol>(17);  // Protocol::IPPROTO_UDP
   }
 
   native_handle_ = socket(af, type, proto);

@@ -342,7 +342,7 @@ HeapDiagnostics ReXHeap::GetDiagnosticsLocked() const {
     diagnostics.capacity += d.capacity;
     diagnostics.allocated += d.allocated;
     diagnostics.peak_allocated += d.peak_allocated;
-    diagnostics.peak_request_size = std::max(diagnostics.peak_request_size, d.peak_request_size);
+    diagnostics.peak_request_size = std::max<uint64_t>(diagnostics.peak_request_size, d.peak_request_size);
     diagnostics.oom_count += d.oom_count;
   }
   return diagnostics;

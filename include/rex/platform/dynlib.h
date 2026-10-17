@@ -56,6 +56,13 @@ inline constexpr const char* kVulkanLoader = "libvulkan.so.1";
 inline constexpr const char* kRenderDoc = "librenderdoc.so";
 inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
 
+#elif REX_PLATFORM_WEB
+
+// No dynamic loading on the web (no MAIN_MODULE); these never resolve.
+inline constexpr const char* kVulkanLoader = "";
+inline constexpr const char* kRenderDoc = "";
+inline constexpr const char* kSpirvToolsSdkPath = "";
+
 #else
 #error No library names provided for the target platform.
 #endif

@@ -33,11 +33,15 @@
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_WEB
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+#if REX_PLATFORM_WEB  // musl does not pull these in via sys/socket.h
+#include <sys/select.h>
+#include <sys/time.h>
+#endif
 #endif
 
 namespace rex {

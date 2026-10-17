@@ -1,7 +1,7 @@
 #include <rex/platform.h>
 #include <rex/platform/dynlib.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 
 #include <dlfcn.h>
 

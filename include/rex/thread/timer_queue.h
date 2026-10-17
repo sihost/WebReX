@@ -16,6 +16,8 @@
 #include <functional>
 #include <memory>
 
+#include <rex/std_compat.h>  // move_only_function on libc++ (web)
+
 // This is a platform independent implementation of a timer queue similar to
 // Windows CreateTimerQueueTimer with WT_EXECUTEINTIMERTHREAD.
 

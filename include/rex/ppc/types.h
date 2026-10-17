@@ -420,15 +420,29 @@ struct CRRegister {
     eq = !un && (left == right);
   }
 
+  // With SIMDe's wasm-simd128 backend simde__m128 and simde__m128i are both
+  // v128_t, so the two overloads below collapse into one. Codegen always pairs
+  // float masks with imm 0xF and integer (byte) masks with imm 0xFFFF, so the
+  // float overload dispatches on imm in that case.
+  static constexpr bool kM128SameAsM128i = std::is_same_v<simde__m128, simde__m128i>;
+
   inline void setFromMask(simde__m128 mask, int imm) noexcept {
-    int m = simde_mm_movemask_ps(mask);
+    int m;
+    if constexpr (kM128SameAsM128i) {
+      m = (imm == 0xF) ? simde_mm_movemask_ps(mask)
+                       : simde_mm_movemask_epi8(simde_mm_castps_si128(mask));
+    } else {
+      m = simde_mm_movemask_ps(mask);
+    }
     lt = m == imm;  // all equal
     gt = 0;
     eq = m == 0;  // none equal
     so = 0;
   }
 
-  inline void setFromMask(simde__m128i mask, int imm) noexcept {
+  template <typename T>
+    requires(std::is_same_v<T, simde__m128i> && !kM128SameAsM128i)
+  inline void setFromMask(T mask, int imm) noexcept {
     int m = simde_mm_movemask_epi8(mask);
     lt = m == imm;  // all equal
     gt = 0;

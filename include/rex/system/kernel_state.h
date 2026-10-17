@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/std_compat.h>  // move_only_function on libc++ (web)
+
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/thread/fiber.h>

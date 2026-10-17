@@ -352,6 +352,13 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
 
   return true;
 
+#elif REX_ARCH_WASM
+  // wasm has no signals / host instruction stream: MMIO is dispatched in
+  // software by the PPC_* load/store macros (RareLoad/RareStore), never here.
+  (void)p;
+  (void)decoded_out;
+  return false;
+
 #else
 #error TryDecodeLoadStore not implemented for the target CPU architecture.
   return false;
@@ -468,6 +475,8 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
       assert_true(value_reg == DecodedLoadStore::kArm64ValueRegZero);
       // Register write is ignored for X31.
     }
+#elif REX_ARCH_WASM
+    return false;  // unreachable: TryDecodeLoadStore always fails on wasm
 #else
 #error Register value writing not implemented for the target CPU architecture.
 #endif  // REX_ARCH
@@ -490,6 +499,8 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
         assert_true(value_reg == DecodedLoadStore::kArm64ValueRegZero);
         value = 0;
       }
+#elif REX_ARCH_WASM
+      return false;  // unreachable: TryDecodeLoadStore always fails on wasm
 #else
 #error Register value reading not implemented for the target CPU architecture.
 #endif  // REX_ARCH
