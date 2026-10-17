@@ -46,6 +46,12 @@ function(rexglue_configure_target target_name)
             # main() runs on a pthread so it may block (Atomics.wait).
             "SHELL:-s PROXY_TO_PTHREAD=1"
             "SHELL:-s OFFSCREENCANVAS_SUPPORT=1"
+            # libpthread's canvas transfer tracks OffscreenCanvases in the GL
+            # library object (GL.offscreenCanvases); without it pthread_create
+            # fails with "GL is not defined" even though we render via WebGPU.
+            # -lGL alone is dead-stripped (nothing references $GL), so force it.
+            -lGL
+            "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL"
             "SHELL:-s ENVIRONMENT=web,worker"
             # main()/runtime setup runs on this stack (default is only 64 KiB).
             "SHELL:-s STACK_SIZE=8MB"
