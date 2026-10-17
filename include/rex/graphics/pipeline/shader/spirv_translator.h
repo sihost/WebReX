@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -211,7 +212,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // - Structure members in BeginTranslation.
   //
   // Using the std140 layout - vec2 must be aligned to 8 bytes, vec3 and vec4 to
-  // 16 bytes.
+  // 16 bytes, and arrays to 16 bytes. The members are in increasing offset
+  // order, matching the SPIR-V block declaration in StartTranslation (SPIR-V
+  // validation and WGSL, where offsets follow declaration order, require
+  // that). The static_asserts after the structure check the 16-byte alignment.
   struct SystemConstants {
     uint32_t flags;
     uint32_t vertex_index_load_address;
@@ -219,10 +223,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // For non-indexed line loop draws, host vertex index that should map to
     // guest vertex 0.
     uint32_t line_loop_closing_index;
+
     int32_t vertex_base_index;
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
+    // One bit per texture fetch constant indicating that it references a
+    // draw-resolution-scaled texture.
+    uint32_t textures_resolution_scaled;
+
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
@@ -235,9 +244,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Diameter in guest screen coordinates > radius (0.5 * diameter) in the NDC
     // for the host viewport.
     float point_screen_diameter_to_ndc_radius[2];
-    // One bit per texture fetch constant indicating that it references a
-    // draw-resolution-scaled texture.
-    uint32_t textures_resolution_scaled;
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
@@ -308,6 +314,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
   };
+  static_assert(offsetof(SystemConstants, user_clip_planes) % 16 == 0);
+  static_assert(offsetof(SystemConstants, ndc_scale) % 16 == 0);
+  static_assert(offsetof(SystemConstants, ndc_offset) % 16 == 0);
+  static_assert(offsetof(SystemConstants, point_constant_diameter) % 8 == 0);
+  static_assert(offsetof(SystemConstants, texture_swizzled_signs) % 16 == 0);
+  static_assert(offsetof(SystemConstants, texture_swizzles) % 16 == 0);
+  static_assert(offsetof(SystemConstants, color_exp_bias) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_stencil_front) % 8 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_base_dwords_scaled) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_keep_mask) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_clamp) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_blend_constant) % 16 == 0);
+  static_assert(sizeof(SystemConstants) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -848,16 +867,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantVertexBaseIndex,
     kSystemConstantVertexIndexReset,
     kSystemConstantComputeMemExportVertexCount,
+    kSystemConstantTexturesResolutionScaled,
     kSystemConstantUserClipPlanes,
-    kSystemConstantVertexIndexMin,
-    kSystemConstantVertexIndexMax,
     kSystemConstantNdcScale,
     kSystemConstantPointVertexDiameterMin,
     kSystemConstantNdcOffset,
     kSystemConstantPointVertexDiameterMax,
     kSystemConstantPointConstantDiameter,
     kSystemConstantPointScreenDiameterToNdcRadius,
-    kSystemConstantTexturesResolutionScaled,
     kSystemConstantTextureSwizzledSigns,
     kSystemConstantTextureSwizzles,
     kSystemConstantAlphaTestReference,
@@ -879,6 +896,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantVertexIndexMin,
+    kSystemConstantVertexIndexMax,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

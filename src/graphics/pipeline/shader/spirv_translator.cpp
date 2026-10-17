@@ -263,9 +263,9 @@ void SpirvShaderTranslator::StartTranslation() {
       {"vertex_index_reset", offsetof(SystemConstants, vertex_index_reset), type_uint_},
       {"compute_memexport_vertex_count", offsetof(SystemConstants, compute_memexport_vertex_count),
        type_uint_},
+      {"textures_resolution_scaled", offsetof(SystemConstants, textures_resolution_scaled),
+       type_uint_},
       {"user_clip_planes", offsetof(SystemConstants, user_clip_planes), type_float4_array_6},
-      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min), type_uint_},
-      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max), type_uint_},
       {"ndc_scale", offsetof(SystemConstants, ndc_scale), type_float3_},
       {"point_vertex_diameter_min", offsetof(SystemConstants, point_vertex_diameter_min),
        type_float_},
@@ -275,8 +275,6 @@ void SpirvShaderTranslator::StartTranslation() {
       {"point_constant_diameter", offsetof(SystemConstants, point_constant_diameter), type_float2_},
       {"point_screen_diameter_to_ndc_radius",
        offsetof(SystemConstants, point_screen_diameter_to_ndc_radius), type_float2_},
-      {"textures_resolution_scaled", offsetof(SystemConstants, textures_resolution_scaled),
-       type_uint_},
       {"texture_swizzled_signs", offsetof(SystemConstants, texture_swizzled_signs),
        type_uint4_array_2},
       {"texture_swizzles", offsetof(SystemConstants, texture_swizzles), type_uint4_array_4},
@@ -305,7 +303,13 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min), type_uint_},
+      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max), type_uint_},
   };
+  // The member order must match SystemConstantIndex and increase in offset.
+  for (size_t i = 1; i < rex::countof(system_constants); ++i) {
+    assert_true(system_constants[i].offset > system_constants[i - 1].offset);
+  }
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
   for (size_t i = 0; i < rex::countof(system_constants); ++i) {
@@ -1522,6 +1526,14 @@ void SpirvShaderTranslator::ProcessAllocInstruction(const ParsedAllocInstruction
       instr.type == ucode::AllocType::kMemory && current_shader().memexport_eM_written();
   if (export_eM || start_memexport) {
     CloseExecConditionals();
+  }
+
+  // Without memory export support for this stage (vertex shaders on devices
+  // without vertexPipelineStoresAndAtomics, like WebGPU, where it is done by a
+  // separate kMemExportCompute translation), the eA / eM# variables are not
+  // created, so there is nothing to reset.
+  if (!IsMemoryExportUsed()) {
+    return;
   }
 
   if (export_eM) {
@@ -3586,6 +3598,10 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
     } break;
     case InstructionStorageTarget::kPosition: {
       assert_true(is_vertex_shader());
+      // No position output in the kMemExportCompute compute shader.
+      if (output_per_vertex_ == spv::NoResult) {
+        break;
+      }
       id_vector_temp_util_.clear();
       id_vector_temp_util_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
       target_pointer = builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
