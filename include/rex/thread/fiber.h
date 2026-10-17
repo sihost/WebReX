@@ -59,6 +59,10 @@ struct Fiber {
   bool is_thread_fiber_ = false;
 
   static void Trampoline();
+#elif REX_PLATFORM_WEB
+  // Only thread fibers exist on web (fiber_web.cpp): the handle stands for the
+  // thread's own execution context; switching to another fiber is unsupported.
+  bool is_thread_fiber_ = false;
 #endif
 };
 
