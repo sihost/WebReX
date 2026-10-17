@@ -109,9 +109,12 @@ class WebGPUCommandProcessor : public CommandProcessor {
     // attachment at all), ConfigurePipeline refused (WebGPUPipelineCache
     // draws_refused_*), the constant arena was full, a sampler couldn't be made.
     uint64_t drops_render_targets = 0;
-    // Of drops_render_targets: the vertex shader memexports; rasterization is off.
+    // Of drops_render_targets: the vertex shader memexports; rasterization is off;
+    // the draw writes nothing (no color mask, depth, stencil or memexport), which
+    // is also its whole effect natively.
     uint64_t drops_rt_memexport_vs = 0;
     uint64_t drops_rt_no_rasterization = 0;
+    uint64_t drops_rt_no_output = 0;
     // Vertex memexport as compute (webgpu_vertex_memexport): dispatches
     // recorded, and memexporting draws whose compute variant isn't available.
     uint64_t memexport_dispatches = 0;
