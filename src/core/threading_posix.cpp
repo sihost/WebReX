@@ -9,7 +9,8 @@
 #include <rex/platform.h>
 #include <rex/thread.h>
 
-static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC,
+              "This file is native POSIX only (the web build uses threading_web.cpp)");
 
 #include <signal.h>
 
@@ -24,9 +25,7 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 
 #include <pthread.h>
 #include <semaphore.h>
-#if !REX_PLATFORM_WEB  // WEB-BRIDGE(WS-B): no eventfd in Emscripten (unused here)
 #include <sys/eventfd.h>
-#endif
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -147,11 +146,7 @@ void EnableAffinityConfiguration() {}
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {
-#if REX_PLATFORM_WEB  // WEB-BRIDGE(WS-B): no SYS_gettid; musl gettid() is the pthread tid
-  return static_cast<uint32_t>(gettid());
-#else
   return static_cast<uint32_t>(syscall(SYS_gettid));
-#endif
 }
 
 void MaybeYield() {
@@ -785,17 +780,6 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
-#if REX_PLATFORM_WEB
-    // WEB-BRIDGE(WS-B) STUB: no RT-signal delivery on the web. The callback stays
-    // queued and runs at the target's next alertable wait only (see
-    // docs/port/STUBS.md; replaced by WS-C threading_web.cpp).
-    static std::atomic<bool> warned_web_apc{false};
-    if (!warned_web_apc.exchange(true)) {
-      REXSYS_WARN("[STUB] QueueUserCallback: cross-thread APC signal unsupported on web; "
-                  "deferred to next alertable wait");
-    }
-    return;
-#else
     sigval value{};
     value.sival_ptr = this;
 #if REX_PLATFORM_ANDROID
@@ -807,7 +791,6 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
     }
-#endif  // REX_PLATFORM_WEB
   }
 
   bool DispatchQueuedUserCallbacks() {
