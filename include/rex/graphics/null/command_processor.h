@@ -14,11 +14,10 @@
 
 namespace rex::graphics::null {
 
-class NullGraphicsSystem;
-
 class NullCommandProcessor : public CommandProcessor {
  public:
-  NullCommandProcessor(NullGraphicsSystem* graphics_system, system::KernelState* kernel_state);
+  // Any GraphicsSystem: also the WebGPU system's fallback when no device exists.
+  NullCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   ~NullCommandProcessor() override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;

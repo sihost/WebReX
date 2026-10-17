@@ -19,7 +19,7 @@
 
 namespace rex::graphics::null {
 
-NullCommandProcessor::NullCommandProcessor(NullGraphicsSystem* graphics_system,
+NullCommandProcessor::NullCommandProcessor(GraphicsSystem* graphics_system,
                                            system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}
 

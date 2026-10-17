@@ -71,6 +71,14 @@ endif()
 set(REXGRAPHICS_WEBGPU_SOURCES
     webgpu/webgpu_device.cpp
     webgpu/webgpu_present_pass.cpp
+    webgpu/webgpu_submission_tracker.cpp
+    webgpu/webgpu_command_stream.cpp
+    webgpu/webgpu_shared_memory.cpp
+    webgpu/webgpu_pipeline_cache.cpp
+    webgpu/webgpu_render_target_cache.cpp
+    webgpu/webgpu_texture_cache.cpp
+    webgpu/webgpu_command_processor.cpp
+    webgpu/webgpu_graphics_system.cpp
 )
 
 # D3D12 backend
