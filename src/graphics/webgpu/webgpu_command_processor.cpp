@@ -22,6 +22,7 @@
 #include <rex/graphics/webgpu/webgpu_guest_output.h>
 #include <rex/graphics/webgpu/webgpu_pipeline_cache.h>
 #include <rex/graphics/webgpu/webgpu_present_pass.h>
+#include <rex/graphics/webgpu/webgpu_primitive_processor.h>
 #include <rex/graphics/webgpu/webgpu_render_target_cache.h>
 #include <rex/graphics/webgpu/webgpu_shared_memory.h>
 #include <rex/graphics/webgpu/webgpu_texture_cache.h>
@@ -103,6 +104,16 @@ bool WebGPUCommandProcessor::SetupContext() {
     return false;
   }
 
+  // ---- WP3: primitive processor (docs/port/webgpu.md section 4). ----
+  primitive_processor_ = std::make_unique<WebGPUPrimitiveProcessor>(
+      *register_file_, *memory_, trace_writer_, *shared_memory_, *command_queue_,
+      [this]() { EndRenderPass(); }, shared_memory_->buffer());
+  if (!primitive_processor_->Initialize()) {
+    REXGPU_ERROR("WebGPU: primitive processor initialization failed");
+    return false;
+  }
+  // ---- end WP3 ----
+
   texture_cache_ = std::make_unique<WebGPUTextureCache>(*this, *register_file_, *shared_memory_);
   if (!texture_cache_->Initialize()) {
     REXGPU_ERROR("WebGPU: texture cache initialization failed");
@@ -154,6 +165,7 @@ void WebGPUCommandProcessor::ShutdownContext() {
     texture_cache_->Shutdown();
   }
   texture_cache_.reset();
+  primitive_processor_.reset();  // WP3
   if (shared_memory_) {
     shared_memory_->Shutdown();
   }
@@ -268,8 +280,8 @@ bool WebGPUCommandProcessor::RequestVertexBuffers(const Shader& vertex_shader) {
   return true;
 }
 
-bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                                       IndexBufferInfo* index_buffer_info,
+bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t /*index_count*/,
+                                       IndexBufferInfo* /*index_buffer_info*/,
                                        bool /*major_mode_explicit*/) {
   const RegisterFile& regs = *register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -331,17 +343,19 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!RequestVertexBuffers(*vertex_shader)) {
     return false;
   }
-  if (index_buffer_info && index_buffer_info->length) {
-    // Guest DMA index buffer (physical address). The host index conversion
-    // (endianness, primitive reset, list conversion) is the primitive
-    // processor's (WP3).
-    if (!shared_memory_->RequestRange(index_buffer_info->guest_base,
-                                      uint32_t(index_buffer_info->length))) {
-      REXGPU_ERROR("WebGPU: failed to request index buffer 0x{:08X} ({} bytes)",
-                   index_buffer_info->guest_base, index_buffer_info->length);
-      return false;
-    }
+  // ---- WP3: primitive processing. Index conversion (endianness stays for the
+  // VS, non-0xFFFF reset indices, quad lists / fans / loops), point and
+  // rectangle lists as VS-expanded two-triangle strips, and the guest DMA index
+  // range request in the shared memory. ----
+  PrimitiveProcessor::ProcessingResult primitive_processing_result;
+  if (!primitive_processor_->Process(primitive_processing_result)) {
+    return false;
   }
+  if (!primitive_processing_result.host_draw_vertex_count) {
+    // Nothing to draw.
+    return true;
+  }
+  // ---- end WP3 ----
 
   // Render targets (WP4), then the pipeline for them (WP2).
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
@@ -367,20 +381,21 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                   render_target_cache_->last_update_render_pass_key());
   WebGPUCommandStream& stream = command_stream();
   stream.CmdSetPipeline(pipeline);
-  // TODO(WP2/WP3/WP4): constant buffers (AllocateConstants + bind group 1),
-  // shared memory / texture bind groups, viewport/scissor from draw_util, and
-  // the primitive processor's host index buffer. Until then a draw that got
-  // this far uses guest-order vertices only.
-  if (index_buffer_info && index_buffer_info->length) {
-    stream.CmdSetIndexBuffer(shared_memory_->buffer(),
-                             index_buffer_info->format == xenos::IndexFormat::kInt32
-                                 ? WGPUIndexFormat_Uint32
-                                 : WGPUIndexFormat_Uint16,
-                             index_buffer_info->guest_base, index_buffer_info->length);
-    stream.CmdDrawIndexed(index_count);
+  // TODO(WP2/WP4): constant buffers (AllocateConstants + bind group 1; the
+  // index-related system constants come from
+  // WebGPUPrimitiveProcessor::ApplyIndexSystemConstants), shared memory /
+  // texture bind groups, viewport/scissor from draw_util.
+  // ---- WP3: the processed draw's host index buffer. ----
+  WebGPUPrimitiveProcessor::IndexBufferBinding index_buffer_binding;
+  if (primitive_processor_->GetIndexBufferBinding(primitive_processing_result,
+                                                  index_buffer_binding)) {
+    stream.CmdSetIndexBuffer(index_buffer_binding.buffer, index_buffer_binding.format,
+                             index_buffer_binding.offset, index_buffer_binding.size);
+    stream.CmdDrawIndexed(primitive_processing_result.host_draw_vertex_count);
   } else {
-    stream.CmdDraw(index_count);
+    stream.CmdDraw(primitive_processing_result.host_draw_vertex_count);
   }
+  // ---- end WP3 ----
   return true;
 }
 
@@ -470,6 +485,7 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                 device_.is_lost());
   }
   slot = swap_submission;
+  primitive_processor_->EndFrame();  // WP3: after the latency wait
 
   if (swap_index == 1 || swap_index % 600 == 0 || REXCVAR_GET(webgpu_log_frames)) {
     const WebGPUReplayStats replay = command_queue_->last_replay_stats();

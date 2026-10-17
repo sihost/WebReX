@@ -41,6 +41,7 @@ class WebGPUDevice;
 class WebGPUGraphicsSystem;
 class WebGPUPipelineCache;
 class WebGPUPresentPass;
+class WebGPUPrimitiveProcessor;
 class WebGPURenderTargetCache;
 class WebGPUSharedMemory;
 class WebGPUTextureCache;
@@ -70,6 +71,8 @@ class WebGPUCommandProcessor : public CommandProcessor {
   WebGPUCommandStream& command_stream() const { return command_queue_->stream(); }
   WebGPUSubmissionTracker& submission_tracker() { return submission_tracker_; }
   WebGPUSharedMemory* shared_memory() const { return shared_memory_.get(); }
+  // WP3: host index buffers and primitive type conversion.
+  WebGPUPrimitiveProcessor* primitive_processor() const { return primitive_processor_.get(); }
 
   // Id the next Submit() will get, and the last one the GPU finished.
   uint64_t GetCurrentSubmission() const { return submission_tracker_.submitted() + 1; }
@@ -124,6 +127,7 @@ class WebGPUCommandProcessor : public CommandProcessor {
   WebGPUSubmissionTracker submission_tracker_;
   std::unique_ptr<WebGPUCommandQueue> command_queue_;
   std::unique_ptr<WebGPUSharedMemory> shared_memory_;
+  std::unique_ptr<WebGPUPrimitiveProcessor> primitive_processor_;  // WP3
   std::unique_ptr<WebGPUTextureCache> texture_cache_;
   std::unique_ptr<WebGPURenderTargetCache> render_target_cache_;
   std::unique_ptr<WebGPUPipelineCache> pipeline_cache_;
