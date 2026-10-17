@@ -29,6 +29,9 @@
 #endif
 #if REX_PLATFORM_WEB
 #include <rex/graphics/null/graphics_system.h>
+#if REX_HAS_WEBGPU
+#include <rex/graphics/webgpu/webgpu_graphics_system.h>
+#endif
 #endif
 #include <rex/audio/audio_system.h>
 #if REX_PLATFORM_WEB
@@ -138,10 +141,13 @@ bool ReXApp::OnInitialize() {
 #elif REX_HAS_VULKAN
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
 #elif REX_PLATFORM_WEB
-  // STUB: no rendering WebGPU backend yet (WS-D). The kernel's Vd* exports and
-  // the guest's GPU synchronization need a GraphicsSystem, so the null backend
-  // executes the command stream without drawing; see docs/port/STUBS.md.
+#if REX_HAS_WEBGPU
+  // WebGPU backend (docs/port/webgpu.md). `--gpu=null` (URL ?arg=--gpu=null) selects the
+  // null backend, which is also used when the worker has no navigator.gpu.
+  config.graphics = rex::graphics::webgpu::CreateWebGraphicsSystem();
+#else
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::null::NullGraphicsSystem);
+#endif
 #endif
 #if REX_PLATFORM_WEB
   // AudioWorklet driver (src/audio/web); paces silently until the autoplay gate opens.
