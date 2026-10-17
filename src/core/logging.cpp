@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -110,6 +111,24 @@ void InitLogging(const LogConfig& config) {
   if (g_initialized) {
     // Re-initialization: update levels and config only
     g_config = config;
+    // ...plus a file sink if one is requested now and there was none before. The web entry
+    // point initializes console-only (no executable folder), and the app's InitLogging from
+    // --log_file runs after OnConfigurePaths has mounted OPFS, e.g. --log_file=/opfs/user/x.log.
+    // Natively the entry point already created the file sink, so nothing changes there.
+    if (config.log_file && *config.log_file && !g_file_sink) {
+      try {
+        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.log_file, true);
+        sink->set_level(spdlog::level::trace);
+        sink->set_pattern(config.file_pattern);
+        g_file_sink = sink;
+        for (auto& entry : g_registry) {
+          if (entry.logger)
+            entry.logger->sinks().push_back(sink);
+        }
+      } catch (const spdlog::spdlog_ex& e) {
+        std::fprintf(stderr, "Logging: cannot open log file '%s': %s\n", config.log_file, e.what());
+      }
+    }
     for (auto& entry : g_registry) {
       if (entry.logger) {
         entry.logger->set_level(ResolveCategoryLevel(entry.name));

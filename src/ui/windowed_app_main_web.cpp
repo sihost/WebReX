@@ -46,8 +46,10 @@ extern "C" int main(int argc, char** argv) {
     }
     app->SetParsedArguments(std::move(parsed));
 
-    // No writable executable folder on the web: log to the console only until
-    // the OPFS-backed filesystem (WS-C) provides a log location.
+    // No writable executable folder on the web: log to the console here. A file
+    // log is opt-in with --log_file=<path under OPFS>, e.g. /opfs/user/halo3.log:
+    // RexApp::OnInitialize mounts OPFS (OnConfigurePaths) and then re-runs
+    // InitLogging with the cvar, which adds the file sink (core/logging.cpp).
     rex::InitLogging(nullptr);
 
     if (app->OnInitialize()) {
