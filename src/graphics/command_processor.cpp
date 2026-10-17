@@ -1673,6 +1673,12 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
                  regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
                  regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
                  regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
+  // Per-RT blending (RB_BLENDCONTROL1..3) and the color targets the PS writes
+  // (bit i = oCi), for multi-RT passes.
+  fmt::format_to(out, " blend1={:08X} blend2={:08X} blend3={:08X} psrt={:X}",
+                 regs[XE_GPU_REG_RB_BLENDCONTROL1], regs[XE_GPU_REG_RB_BLENDCONTROL2],
+                 regs[XE_GPU_REG_RB_BLENDCONTROL3],
+                 ps && ps->is_ucode_analyzed() ? ps->writes_color_targets() : 0u);
   // Used float constants in the order the shader sees them (packed), then the
   // bool/loop constants.
   auto hash_floats = [&](const Shader* shader, uint32_t first_register) -> uint64_t {
