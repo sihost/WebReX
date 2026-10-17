@@ -35,6 +35,7 @@ set(REXKERNEL_SOURCES
     # xboxkrnl exports - provides __imp__ symbols for generated code
     # xboxkrnl/cert_monitor.cpp    # TODO: Translate JIT methods for AOT
     # xboxkrnl/debug_monitor.cpp   # TODO: Translate JIT methods for AOT
+    kernel_call_trace.cpp
     xboxkrnl/xboxkrnl_crypt.cpp
     xboxkrnl/xecrypt_rsa.cpp
     xboxkrnl/xboxkrnl_debug.cpp

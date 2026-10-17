@@ -95,6 +95,32 @@ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
 #define PPC_FUNC_PROLOGUE() ((void)0)
 #endif
 
+// Diagnostics: compile recompiled code with -DREX_GUEST_TRACE=1 to record guest
+// function entries per thread (src/kernel/kernel_call_trace.cpp, cvars
+// guest_trace_trigger / guest_trace_count / guest_trace_skip). Off by default:
+// it costs a thread-local check on every guest call.
+#if defined(REX_GUEST_TRACE) && REX_GUEST_TRACE
+namespace rex::detail {
+bool GuestTraceIsTrigger(const char* name);
+void GuestTraceEnter(const char* name, bool is_trigger);
+}  // namespace rex::detail
+#undef PPC_FUNC_PROLOGUE
+#if defined(__clang__)
+#define PPC_FUNC_PROLOGUE()                                                         \
+  __builtin_assume(((size_t)base & 0x1F) == 0);                                     \
+  do {                                                                              \
+    static const bool rex_trace_trigger_ = ::rex::detail::GuestTraceIsTrigger(__func__); \
+    ::rex::detail::GuestTraceEnter(__func__, rex_trace_trigger_);                   \
+  } while (0)
+#else
+#define PPC_FUNC_PROLOGUE()                                                         \
+  do {                                                                              \
+    static const bool rex_trace_trigger_ = ::rex::detail::GuestTraceIsTrigger(__func__); \
+    ::rex::detail::GuestTraceEnter(__func__, rex_trace_trigger_);                   \
+  } while (0)
+#endif
+#endif
+
 #ifndef PPC_CALL_FUNC
 #define PPC_CALL_FUNC(x) x(ctx, base)
 #endif

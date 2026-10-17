@@ -61,6 +61,7 @@ bool XboxkrnlModule::SendPIXCommand(const char* cmd) {
 XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
     : KernelModule(kernel_state, "xe:\\xboxkrnl.exe"), timestamp_timer_(nullptr) {
   RegisterExportTable(export_resolver_);
+  rex::detail::StartKernelCallTrace();  // no-op unless --kernel_call_watchdog_ms > 0
 
   // Register video variable exports (VdGlobalDevice, VdGpuClockInMHz, etc.)
   RegisterVideoExports(export_resolver_, kernel_state_);

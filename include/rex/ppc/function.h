@@ -606,10 +606,25 @@ T GuestToHostFunction(const TFunction& func, TArgs&&... argv) {
 // PPC Function Hooking and Aliasing Macros
 //=============================================================================
 
+namespace rex::detail {
+// Diagnostics (src/kernel/kernel_call_trace.cpp, cvar kernel_call_watchdog_ms):
+// when on, every PPC_HOOK thunk records the calling guest thread's last call.
+extern bool g_kernel_call_trace;
+void KernelCallTraceEnter(const char* name, const PPCContext& ctx);
+void KernelCallTraceExit();
+void StartKernelCallTrace();
+}  // namespace rex::detail
+
 // Hook a PPC function name to a native C++ function
-#define PPC_HOOK(subroutine, function)             \
-  extern "C" PPC_FUNC(subroutine) {                \
-    rex::HostToGuestFunction<function>(ctx, base); \
+#define PPC_HOOK(subroutine, function)                     \
+  extern "C" PPC_FUNC(subroutine) {                        \
+    if (rex::detail::g_kernel_call_trace) [[unlikely]] {   \
+      rex::detail::KernelCallTraceEnter(#subroutine, ctx); \
+      rex::HostToGuestFunction<function>(ctx, base);       \
+      rex::detail::KernelCallTraceExit();                  \
+    } else {                                               \
+      rex::HostToGuestFunction<function>(ctx, base);       \
+    }                                                      \
   }
 
 // Create a simple stub that does nothing
