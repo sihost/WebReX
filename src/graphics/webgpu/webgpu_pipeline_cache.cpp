@@ -8,6 +8,7 @@
 
 #include <rex/graphics/webgpu/webgpu_pipeline_cache.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -38,6 +39,12 @@
 REXCVAR_DEFINE_BOOL(webgpu_draw_with_pipelines, true, "GPU",
                     "WebGPU: record draws with the translated pipelines (diagnostics: false still "
                     "translates, stores and creates the pipelines, but drops every draw)");
+
+REXCVAR_DEFINE_INT32(webgpu_wgsl_threads, 2, "GPU",
+                     "WebGPU: threads converting the translated SPIR-V to WGSL (Tint, ~0.1-0.3 s "
+                     "per shader in the browser) off the CP thread; draws of a pipeline whose "
+                     "shaders are still converting are skipped, as while the browser creates it. "
+                     "0 = convert on the CP thread (it stalls; read at the first conversion)");
 
 namespace rex::graphics::webgpu {
 
@@ -308,6 +315,7 @@ bool WebGPUPipelineCache::Initialize() {
 }
 
 void WebGPUPipelineCache::Shutdown() {
+  StopConversionThreads();
   ClearCache();
   translator_.reset();
   std::vector<WGPUBindGroupLayout> layouts;
@@ -451,7 +459,11 @@ void WebGPUPipelineCache::ClearCache() {
   // stay in the command queue's table (released with it).
   pipelines_.clear();
   compute_pipelines_.clear();
-  wgsl_.clear();
+  {
+    // Pending slots stay alive in their jobs and deferred pipelines.
+    std::lock_guard<std::mutex> lock(wgsl_mutex_);
+    wgsl_.clear();
+  }
   depth_only_wgsl_.clear();
   shader_bindings_.clear();
   shaders_.clear();
@@ -512,13 +524,16 @@ Shader* WebGPUPipelineCache::LoadShader(xenos::ShaderType shader_type,
   return result;
 }
 
-std::shared_ptr<const std::string> WebGPUPipelineCache::GetWgsl(Shader& shader,
-                                                                uint64_t modification) {
+std::shared_ptr<WebGPUPipelineCache::WgslSlot> WebGPUPipelineCache::RequestWgsl(
+    Shader& shader, uint64_t modification) {
   WgslKey key{shader.ucode_data_hash(), modification};
-  auto it = wgsl_.find(key);
-  if (it != wgsl_.end()) {
-    ++statistics_.wgsl_memory_hits;
-    return it->second;
+  {
+    std::lock_guard<std::mutex> lock(wgsl_mutex_);
+    auto it = wgsl_.find(key);
+    if (it != wgsl_.end()) {
+      ++statistics_.wgsl_memory_hits;
+      return it->second;
+    }
   }
 #if defined(__EMSCRIPTEN__)
   if (!storage_initialized_) {
@@ -529,7 +544,7 @@ std::shared_ptr<const std::string> WebGPUPipelineCache::GetWgsl(Shader& shader,
   }
 #endif
   bool vertex = shader.type() == xenos::ShaderType::kVertex;
-  std::shared_ptr<const std::string> result;
+  auto slot = std::make_shared<WgslSlot>();
   std::filesystem::path path;
   if (!storage_dir_.empty()) {
     path = StoragePath(key.hash, modification, vertex);
@@ -541,49 +556,158 @@ std::shared_ptr<const std::string> WebGPUPipelineCache::GetWgsl(Shader& shader,
         std::string wgsl = std::move(text).str();
         if (!wgsl.empty()) {
           ++statistics_.wgsl_storage_hits;
-          result = std::make_shared<const std::string>(std::move(wgsl));
+          slot->text = std::make_shared<const std::string>(std::move(wgsl));
+          slot->ready = true;
         }
       }
     }
   }
-  if (!result && kHasTint) {
-    AnalyzeShaderUcode(shader);
-    Shader::Translation* translation = shader.GetOrCreateTranslation(modification);
-    if (!translation->is_translated()) {
-      translator_->TranslateAnalyzedShader(*translation);
-    }
-    std::string wgsl, error;
-    if (!translation->is_valid() || translation->translated_binary().empty()) {
-      REXGPU_ERROR("WebGPU: {} shader {:016X} modification {:016X} failed SPIR-V translation",
-                   vertex ? "vertex" : "pixel", key.hash, modification);
-    } else if (!ConvertSpirv(translation->translated_binary(), clip_distances_, wgsl, error)) {
-      REXGPU_ERROR("WebGPU: {} shader {:016X} modification {:016X}: SPIR-V -> WGSL failed: {}",
-                   vertex ? "vertex" : "pixel", key.hash, modification, error);
-    } else {
-      ++statistics_.wgsl_translated;
-      if (!path.empty()) {
-        // Write to a temporary name, then rename: a torn file is never read.
-        std::filesystem::path temp = path;
-        temp += ".tmp";
-        {
-          std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-          out.write(wgsl.data(), std::streamsize(wgsl.size()));
-        }
-        std::error_code ec;
-        std::filesystem::rename(temp, path, ec);
-        if (ec) {
-          REXGPU_WARN("WebGPU shader storage: cannot write {}: {}", path.string(), ec.message());
-        }
+  std::vector<uint8_t> spirv;
+  if (!slot->ready) {
+    // The SPIR-V translator is not thread-safe (and fast): CP thread.
+    if (kHasTint) {
+      AnalyzeShaderUcode(shader);
+      Shader::Translation* translation = shader.GetOrCreateTranslation(modification);
+      if (!translation->is_translated()) {
+        translator_->TranslateAnalyzedShader(*translation);
       }
-      result = std::make_shared<const std::string>(std::move(wgsl));
+      if (!translation->is_valid() || translation->translated_binary().empty()) {
+        REXGPU_ERROR("WebGPU: {} shader {:016X} modification {:016X} failed SPIR-V translation",
+                     vertex ? "vertex" : "pixel", key.hash, modification);
+      } else {
+        spirv = translation->translated_binary();
+      }
+    }
+    if (spirv.empty()) {
+      // Failures are remembered as ready with null text.
+      async_counters_->wgsl_failures.fetch_add(1, std::memory_order_relaxed);
+      slot->ready = true;
     }
   }
-  if (!result) {
-    ++statistics_.wgsl_failures;
+  std::lock_guard<std::mutex> lock(wgsl_mutex_);
+  if (!slot->ready && conversion_threads_.empty() && !conversion_stop_) {
+    int32_t threads = std::clamp(REXCVAR_GET(webgpu_wgsl_threads), int32_t(0), int32_t(8));
+    for (int32_t i = 0; i < threads; ++i) {
+      conversion_threads_.emplace_back([this]() { ConversionThreadMain(); });
+    }
+    REXGPU_INFO("WebGPU pipeline cache: {} WGSL conversion thread(s)", threads);
   }
-  // Failures are remembered as null.
-  wgsl_.emplace(key, result);
-  return result;
+  if (!slot->ready && conversion_threads_.empty()) {
+    // --webgpu_wgsl_threads=0: on the CP thread (nothing else can see the slot).
+    slot->text = ConvertAndStore(spirv, path, key.hash, modification, vertex);
+    slot->ready = true;
+  }
+  wgsl_.emplace(key, slot);
+  if (!slot->ready) {
+    async_counters_->wgsl_converting.fetch_add(1, std::memory_order_relaxed);
+    conversion_jobs_.push_back(
+        ConversionJob{slot, std::move(spirv), std::move(path), key.hash, modification, vertex});
+    wgsl_jobs_cv_.notify_one();
+  }
+  return slot;
+}
+
+std::shared_ptr<const std::string> WebGPUPipelineCache::GetWgsl(Shader& shader,
+                                                                 uint64_t modification) {
+  std::shared_ptr<WgslSlot> slot = RequestWgsl(shader, modification);
+  std::unique_lock<std::mutex> lock(wgsl_mutex_);
+  wgsl_ready_cv_.wait(lock, [&]() { return slot->ready || conversion_stop_; });
+  return slot->text;
+}
+
+std::shared_ptr<const std::string> WebGPUPipelineCache::ConvertAndStore(
+    const std::vector<uint8_t>& spirv, const std::filesystem::path& storage_path, uint64_t hash,
+    uint64_t modification, bool vertex) {
+  std::string wgsl, error;
+  if (!ConvertSpirv(spirv, clip_distances_, wgsl, error)) {
+    REXGPU_ERROR("WebGPU: {} shader {:016X} modification {:016X}: SPIR-V -> WGSL failed: {}",
+                 vertex ? "vertex" : "pixel", hash, modification, error);
+    async_counters_->wgsl_failures.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  async_counters_->wgsl_translated.fetch_add(1, std::memory_order_relaxed);
+  if (!storage_path.empty()) {
+    // Write to a temporary name, then rename: a torn file is never read.
+    std::filesystem::path temp = storage_path;
+    temp += ".tmp";
+    {
+      std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+      out.write(wgsl.data(), std::streamsize(wgsl.size()));
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, storage_path, ec);
+    if (ec) {
+      REXGPU_WARN("WebGPU shader storage: cannot write {}: {}", storage_path.string(),
+                  ec.message());
+    }
+  }
+  return std::make_shared<const std::string>(std::move(wgsl));
+}
+
+void WebGPUPipelineCache::CompleteSlot(const std::shared_ptr<WgslSlot>& slot,
+                                       std::shared_ptr<const std::string> text) {
+  std::vector<std::shared_ptr<DeferredPipeline>> complete;
+  {
+    std::lock_guard<std::mutex> lock(wgsl_mutex_);
+    slot->text = std::move(text);
+    slot->ready = true;
+    for (std::shared_ptr<DeferredPipeline>& pipeline : slot->waiters) {
+      if (!--pipeline->pending) {
+        complete.push_back(std::move(pipeline));
+      }
+    }
+    slot->waiters.clear();
+  }
+  async_counters_->wgsl_converting.fetch_sub(1, std::memory_order_relaxed);
+  wgsl_ready_cv_.notify_all();
+  // Every slot of these is ready: their texts don't change any more.
+  for (const std::shared_ptr<DeferredPipeline>& pipeline : complete) {
+    std::shared_ptr<const std::string> vs_wgsl = pipeline->vs->text;
+    std::shared_ptr<const std::string> ps_wgsl =
+        pipeline->ps ? pipeline->ps->text : pipeline->ps_text;
+    if (!vs_wgsl || (pipeline->ps && !ps_wgsl)) {
+      // Its draws stay skipped (the id never gets a pipeline).
+      async_counters_->pipelines_failed.fetch_add(1, std::memory_order_relaxed);
+      REXGPU_ERROR("WebGPU: render pipeline {} ({}) not created: a shader failed to convert",
+                   pipeline->id, pipeline->label);
+      continue;
+    }
+    CreateRenderPipelineAsync(pipeline->id, pipeline->description, std::move(vs_wgsl),
+                              std::move(ps_wgsl), pipeline->label, pipeline->layouts);
+  }
+}
+
+void WebGPUPipelineCache::ConversionThreadMain() {
+  for (;;) {
+    ConversionJob job;
+    {
+      std::unique_lock<std::mutex> lock(wgsl_mutex_);
+      wgsl_jobs_cv_.wait(lock, [this]() { return conversion_stop_ || !conversion_jobs_.empty(); });
+      if (conversion_stop_) {
+        return;
+      }
+      job = std::move(conversion_jobs_.front());
+      conversion_jobs_.pop_front();
+    }
+    CompleteSlot(job.slot,
+                 ConvertAndStore(job.spirv, job.storage_path, job.hash, job.modification, job.vertex));
+  }
+}
+
+void WebGPUPipelineCache::StopConversionThreads() {
+  {
+    std::lock_guard<std::mutex> lock(wgsl_mutex_);
+    conversion_stop_ = true;
+    conversion_jobs_.clear();
+  }
+  wgsl_jobs_cv_.notify_all();
+  wgsl_ready_cv_.notify_all();
+  for (std::thread& thread : conversion_threads_) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+  conversion_threads_.clear();
 }
 
 std::shared_ptr<const std::string> WebGPUPipelineCache::GetDepthOnlyFragmentWgsl(
@@ -897,11 +1021,12 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     return it->second;
   }
   const WebGPUPipelineDescription& d = description;
-  // Shaders (CP thread: SPIR-V translation and Tint run here).
-  std::shared_ptr<const std::string> vs_wgsl, ps_wgsl;
+  // Shaders: SPIR-V translation here (CP thread), Tint on the conversion threads.
+  std::shared_ptr<WgslSlot> vs_slot, ps_slot;
+  std::shared_ptr<const std::string> ps_fixed;
   auto vs_it = shaders_.find(d.vertex_shader_hash);
   if (vs_it != shaders_.end()) {
-    vs_wgsl = GetWgsl(*vs_it->second, d.vertex_shader_modification);
+    vs_slot = RequestWgsl(*vs_it->second, d.vertex_shader_modification);
   }
   RenderPassFormatKey pass_key;
   pass_key.key = d.render_pass_format_key;
@@ -909,32 +1034,16 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
   bool pixel_ok = true;
   if (d.pixel_shader_hash || d.pixel_shader_modification) {
     auto ps_it = shaders_.find(d.pixel_shader_hash);
-    ps_wgsl = ps_it != shaders_.end() ? GetWgsl(*ps_it->second, d.pixel_shader_modification)
-                                      : nullptr;
-    pixel_ok = ps_wgsl != nullptr;
+    if (ps_it != shaders_.end()) {
+      ps_slot = RequestWgsl(*ps_it->second, d.pixel_shader_modification);
+    }
+    pixel_ok = ps_slot != nullptr;
   } else if (has_color) {
     // Color attachments without a guest pixel shader: an empty fragment stage
     // with zero write masks keeps the pipeline compatible with the pass.
-    ps_wgsl = GetDepthOnlyFragmentWgsl(
+    ps_fixed = GetDepthOnlyFragmentWgsl(
         uint32_t(SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers));
-    pixel_ok = ps_wgsl != nullptr;
-  }
-  if (!vs_wgsl || !pixel_ok) {
-    pipelines_.emplace(description, kInvalidPipelineId);
-    return kInvalidPipelineId;
-  }
-
-  WebGPUPipelineTable& table = command_processor_.command_queue().pipeline_table();
-  PipelineId id = table.Allocate();
-  pipelines_.emplace(description, id);
-  ++statistics_.pipelines_requested;
-  if (statistics_.pipelines_requested <= 2 || !(statistics_.pipelines_requested % 32)) {
-    REXGPU_INFO(
-        "WebGPU pipeline cache: {} pipelines requested ({} created, {} failed); WGSL: {} "
-        "storage hits, {} translated, {} failures, {} memory hits",
-        statistics_.pipelines_requested, async_counters_->pipelines_created.load(),
-        async_counters_->pipelines_failed.load(), statistics_.wgsl_storage_hits,
-        statistics_.wgsl_translated, statistics_.wgsl_failures, statistics_.wgsl_memory_hits);
+    pixel_ok = ps_fixed != nullptr;
   }
 
   // Explicit layout (see the header); ConfigurePipeline has looked up the
@@ -952,13 +1061,69 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     }
   }
 
-  WebGPUDevice& device = command_processor_.device();
-  std::shared_ptr<AsyncCounters> stats = async_counters_;
   std::string label =
       fmt::format("xe vs {:016X}:{:016X} ps {:016X}:{:016X}", d.vertex_shader_hash,
                   d.vertex_shader_modification, d.pixel_shader_hash, d.pixel_shader_modification);
   std::array<WGPUBindGroupLayout, 4> layout_array = {layouts[0], layouts[1], layouts[2],
                                                      layouts[3]};
+
+  WebGPUPipelineTable& table = command_processor_.command_queue().pipeline_table();
+  PipelineId id = kInvalidPipelineId;
+  std::shared_ptr<const std::string> vs_wgsl, ps_wgsl = ps_fixed;
+  bool deferred = false;
+  {
+    // Checked and registered atomically with the conversion threads completing slots.
+    std::lock_guard<std::mutex> lock(wgsl_mutex_);
+    if (!vs_slot || !pixel_ok || (vs_slot->ready && !vs_slot->text) ||
+        (ps_slot && ps_slot->ready && !ps_slot->text)) {
+      // A shader is missing or failed: remembered, the draws are dropped.
+      pipelines_.emplace(description, kInvalidPipelineId);
+      return kInvalidPipelineId;
+    }
+    id = table.Allocate();
+    uint32_t pending = uint32_t(!vs_slot->ready) + uint32_t(ps_slot && !ps_slot->ready);
+    if (pending) {
+      auto pipeline = std::make_shared<DeferredPipeline>(
+          DeferredPipeline{id, d, label, layout_array, vs_slot, ps_slot, ps_fixed, pending});
+      for (const std::shared_ptr<WgslSlot>& slot : {vs_slot, ps_slot}) {
+        if (slot && !slot->ready) {
+          slot->waiters.push_back(pipeline);
+        }
+      }
+      deferred = true;
+    } else {
+      vs_wgsl = vs_slot->text;
+      if (ps_slot) {
+        ps_wgsl = ps_slot->text;
+      }
+    }
+  }
+  pipelines_.emplace(description, id);
+  ++statistics_.pipelines_requested;
+  if (statistics_.pipelines_requested <= 2 || !(statistics_.pipelines_requested % 32)) {
+    const Statistics& statistics = this->statistics();
+    REXGPU_INFO(
+        "WebGPU pipeline cache: {} pipelines requested ({} created, {} failed); WGSL: {} "
+        "storage hits, {} translated, {} converting, {} failures, {} memory hits",
+        statistics.pipelines_requested, async_counters_->pipelines_created.load(),
+        async_counters_->pipelines_failed.load(), statistics.wgsl_storage_hits,
+        statistics.wgsl_translated, async_counters_->wgsl_converting.load(),
+        statistics.wgsl_failures, statistics.wgsl_memory_hits);
+  }
+  if (!deferred) {
+    CreateRenderPipelineAsync(id, d, std::move(vs_wgsl), std::move(ps_wgsl), std::move(label),
+                              layout_array);
+  }
+  return id;
+}
+
+void WebGPUPipelineCache::CreateRenderPipelineAsync(
+    PipelineId id, const WebGPUPipelineDescription& d, std::shared_ptr<const std::string> vs_wgsl,
+    std::shared_ptr<const std::string> ps_wgsl, std::string label,
+    const std::array<WGPUBindGroupLayout, 4>& layout_array) {
+  WebGPUDevice& device = command_processor_.device();
+  WebGPUPipelineTable& table = command_processor_.command_queue().pipeline_table();
+  std::shared_ptr<AsyncCounters> stats = async_counters_;
   device.RunAsync([&device, &table, stats, id, d, vs_wgsl, ps_wgsl, label, layout_array]() {
     if (device.is_lost()) {
       return;
@@ -1097,7 +1262,6 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
       wgpuShaderModuleRelease(ps_module);
     }
   });
-  return id;
 }
 
 }  // namespace rex::graphics::webgpu

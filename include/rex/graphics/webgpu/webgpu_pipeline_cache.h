@@ -26,7 +26,13 @@
  *     Groups 2 and 3 have one layout per distinct texture dimension list +
  *     sampler count (WebGPUShaderBindings::layout), the empty layout without
  *     textures. Textures are float-sampled, samplers filtering.
- * Translation runs on the CP thread (never on the device thread).
+ * The SPIR-V translation runs on the CP thread (never on the device thread),
+ * the SPIR-V -> WGSL conversion (Tint, ~0.1-0.3 s per shader in the browser)
+ * on --webgpu_wgsl_threads conversion threads: a pipeline whose shaders are
+ * still converting gets its id at once and is created by the thread finishing
+ * the last of them, so its draws are skipped meanwhile, as while
+ * createRenderPipelineAsync runs. Converting on the CP thread stalled it for
+ * ~20 s on a first map load (gates/README.md gate 5), so no frame was presented.
  *
  * Without libtint_web.a (REX_WEBGPU_HAS_TINT unset) nothing is converted and
  * ConfigurePipeline fails (draws dropped), as the WP1 stub did.
@@ -37,11 +43,16 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -229,12 +240,20 @@ class WebGPUPipelineCache {
     // webgpu_draw_with_pipelines diagnostic is off.
     uint64_t draws_refused_no_pipeline = 0;
   };
-  const Statistics& statistics() const { return statistics_; }
-  // Written by createRenderPipelineAsync callbacks (device thread); shared so a
-  // late callback never touches a destroyed cache.
+  const Statistics& statistics() const {
+    statistics_.wgsl_translated = async_counters_->wgsl_translated.load(std::memory_order_relaxed);
+    statistics_.wgsl_failures = async_counters_->wgsl_failures.load(std::memory_order_relaxed);
+    return statistics_;
+  }
+  // Written by createRenderPipelineAsync callbacks (device thread) and the WGSL
+  // conversion threads; shared so a late callback never touches a destroyed cache.
   struct AsyncCounters {
     std::atomic<uint64_t> pipelines_created{0};
     std::atomic<uint64_t> pipelines_failed{0};
+    std::atomic<uint64_t> wgsl_translated{0};
+    std::atomic<uint64_t> wgsl_failures{0};
+    // Shaders queued for or in conversion.
+    std::atomic<uint64_t> wgsl_converting{0};
   };
   uint64_t pipelines_created() const { return async_counters_->pipelines_created.load(); }
   uint64_t pipelines_failed() const { return async_counters_->pipelines_failed.load(); }
@@ -257,10 +276,59 @@ class WebGPUPipelineCache {
     size_t operator()(const WgslKey& k) const;
   };
 
-  // WGSL for a shader modification (memory, then storage, then translation).
-  // Null on failure. The returned string is immutable and shared with the
-  // device thread.
+  // WGSL of one (ucode hash, modification). Ready with null text = failed.
+  // Guarded by wgsl_mutex_; the text never changes once ready.
+  struct DeferredPipeline;
+  struct WgslSlot {
+    bool ready = false;
+    std::shared_ptr<const std::string> text;
+    // Render pipelines waiting for this slot (while not ready).
+    std::vector<std::shared_ptr<DeferredPipeline>> waiters;
+  };
+  // A render pipeline whose shaders were still converting when requested.
+  struct DeferredPipeline {
+    PipelineId id;
+    WebGPUPipelineDescription description;
+    std::string label;
+    std::array<WGPUBindGroupLayout, 4> layouts;
+    std::shared_ptr<WgslSlot> vs;
+    // Null with ps_text set (the depth-only fragment stage) or without a PS.
+    std::shared_ptr<WgslSlot> ps;
+    std::shared_ptr<const std::string> ps_text;
+    uint32_t pending = 0;  // slots not ready yet
+  };
+  struct ConversionJob {
+    std::shared_ptr<WgslSlot> slot;
+    std::vector<uint8_t> spirv;
+    std::filesystem::path storage_path;
+    uint64_t hash = 0;
+    uint64_t modification = 0;
+    bool vertex = false;
+  };
+
+  // CP thread. The WGSL slot of a shader modification: from memory, from the
+  // storage, or translated to SPIR-V here and converted on a conversion thread
+  // (pending; converted here with --webgpu_wgsl_threads=0).
+  std::shared_ptr<WgslSlot> RequestWgsl(Shader& shader, uint64_t modification);
+  // CP thread. RequestWgsl, waiting for a pending conversion. Null on failure.
+  // The returned string is immutable and shared with the device thread.
   std::shared_ptr<const std::string> GetWgsl(Shader& shader, uint64_t modification);
+  // Any thread: Tint, then the storage file. Null on failure.
+  std::shared_ptr<const std::string> ConvertAndStore(const std::vector<uint8_t>& spirv,
+                                                     const std::filesystem::path& storage_path,
+                                                     uint64_t hash, uint64_t modification,
+                                                     bool vertex);
+  // Any thread: marks the slot ready and creates the pipelines it completes.
+  void CompleteSlot(const std::shared_ptr<WgslSlot>& slot,
+                    std::shared_ptr<const std::string> text);
+  void ConversionThreadMain();
+  void StopConversionThreads();
+  // Any thread: createShaderModule + createRenderPipelineAsync on the device
+  // thread; the callback stores the pipeline in the table under `id`.
+  void CreateRenderPipelineAsync(PipelineId id, const WebGPUPipelineDescription& d,
+                                 std::shared_ptr<const std::string> vs_wgsl,
+                                 std::shared_ptr<const std::string> ps_wgsl, std::string label,
+                                 const std::array<WGPUBindGroupLayout, 4>& layouts);
   std::shared_ptr<const std::string> GetDepthOnlyFragmentWgsl(uint32_t depth_stencil_mode);
   std::filesystem::path StoragePath(uint64_t hash, uint64_t modification, bool vertex) const;
   // Bindings of `shader` (translating `modification` if no modification of it
@@ -280,7 +348,14 @@ class WebGPUPipelineCache {
 
   bool storage_initialized_ = false;
   std::filesystem::path storage_dir_;
-  std::unordered_map<WgslKey, std::shared_ptr<const std::string>, WgslKeyHasher> wgsl_;
+  // wgsl_, the slots, conversion_jobs_ and conversion_stop_.
+  std::mutex wgsl_mutex_;
+  std::condition_variable wgsl_jobs_cv_;
+  std::condition_variable wgsl_ready_cv_;
+  std::unordered_map<WgslKey, std::shared_ptr<WgslSlot>, WgslKeyHasher> wgsl_;
+  std::deque<ConversionJob> conversion_jobs_;
+  std::vector<std::thread> conversion_threads_;
+  bool conversion_stop_ = false;
   std::unordered_map<uint32_t, std::shared_ptr<const std::string>> depth_only_wgsl_;
   std::unordered_map<WebGPUPipelineDescription, PipelineId, DescriptionHasher, DescriptionEqual>
       pipelines_;
@@ -296,7 +371,7 @@ class WebGPUPipelineCache {
   std::unordered_map<std::string, WGPUBindGroupLayout> texture_layouts_;
   // By ucode hash; null = the shader can't be bound.
   std::unordered_map<uint64_t, std::unique_ptr<WebGPUShaderBindings>> shader_bindings_;
-  Statistics statistics_;
+  mutable Statistics statistics_;
   std::shared_ptr<AsyncCounters> async_counters_ = std::make_shared<AsyncCounters>();
 };
 
