@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Xbox 360 WebGPU presenter demo</title>
+<style>
+  body { margin: 0; background: #0f0f12; color: #ddd; font: 13px/1.45 ui-monospace, Consolas, monospace; }
+  header { padding: 14px 18px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 14px; }
+  header h1 { font-size: 16px; margin: 0; color: #fff; }
+  #status { padding: 3px 10px; border-radius: 4px; background: #333; color: #fff; font-weight: bold; }
+  #status.pass { background: #107c10; }
+  #status.fail { background: #b3261e; }
+  main { display: flex; gap: 18px; padding: 18px; flex-wrap: wrap; }
+  /* CSS-sized: the window's ResizeObserver sets the physical size (CSS * devicePixelRatio). */
+  #canvas { display: block; width: 640px; height: 360px; background: #000; border: 1px solid #333; }
+  #log { white-space: pre-wrap; min-width: 380px; flex: 1; margin: 0; }
+  .ok { color: #6ccf6c; } .bad { color: #ff7b72; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Xbox 360 GPU (Xenos) &rarr; WebGPU presenter</h1>
+  <span id="status">RUNNING</span>
+</header>
+<main>
+  <canvas id="canvas"></canvas>
+  <pre id="log"></pre>
+</main>
+<script>
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  const canvas = document.getElementById('canvas');
+  const add = (t, cls) => {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = t + '\n';
+    logEl.appendChild(span);
+  };
+  function onLine(t) {
+    console.log(t);
+    if (t.startsWith('[info]')) return;  // SDK log lines: console only
+    if (t.startsWith('RESULT ')) {
+      let r;
+      try { r = JSON.parse(t.slice(7)); } catch (e) { r = { error: String(e) }; }
+      const pass = r.all_ok === true;
+      statusEl.textContent = pass ? 'PASS' : 'FAIL';
+      statusEl.className = pass ? 'pass' : 'fail';
+      add(t, pass ? 'ok' : 'bad');
+      return;
+    }
+    add(t, / PASS /.test(t) ? 'ok' : / FAIL /.test(t) ? 'bad' : '');
+    // The test thread waits for the canvas to change size (resize phase).
+    if (t.includes('READY_FOR_RESIZE')) {
+      setTimeout(() => { canvas.style.width = '800px'; canvas.style.height = '450px'; }, 300);
+    }
+  }
+  if (!crossOriginIsolated) {
+    add('Page is not cross-origin isolated (SharedArrayBuffer unavailable). Serve it with serve.mjs.', 'bad');
+  }
+  if (!navigator.gpu) {
+    add('navigator.gpu is missing: use a browser with WebGPU enabled (Chrome/Edge 113+).', 'bad');
+  }
+  var Module = {
+    canvas,
+    print: onLine,
+    printErr: (t) => { console.warn(t); add(t); },
+  };
+</script>
+<script src="presenter_demo.js"></script>
+</body>
+</html>

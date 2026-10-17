@@ -5,11 +5,11 @@
 # toolchain file and object flags (-m64 -pthread -msimd128 -fwasm-exceptions
 # -sSUPPORT_LONGJMP=wasm), into <build>/tint-web/libtint_web.a (first build ~10 min; later builds
 # are a no-op sub-ninja). It needs the sparse Dawn checkout in thirdparty/dawn (Dawn 31e25af2,
-# the emdawnwebgpu v20260423.175430 revision; the project's tools/tint/fetch_dawn.bat).
+# the emdawnwebgpu v20260423.175430 revision; scripts/fetch_dawn.bat / fetch_dawn.sh).
 #
 # Alternatives:
 #   -DREXGLUE_TINT_WEB_LIBRARY=<path>/libtint_web.a  link a prebuilt archive (for example the
-#                                                    project's tools/tint/build_web.bat output)
+#                                                    archive from an earlier SDK build)
 #   -DREXGLUE_BUILD_TINT_WEB=OFF                     no Tint: shaders are not converted and the
 #                                                    WebGPU backend drops every draw
 #

@@ -420,5 +420,5 @@ FodyWeavers.xsd
 # CMake User Overrides
 CMakeUserPresets.json
  
-# Dawn sparse checkout for Tint (thirdparty/tint; recreated by the project's tools/tint/fetch_dawn.bat) 
+# Dawn sparse checkout for Tint (thirdparty/tint; recreated by scripts/fetch_dawn.bat or .sh) 
 /thirdparty/dawn/ 

@@ -82,14 +82,14 @@
             "name": "wasm64-release",
             "displayName": "wasm64 Release (Emscripten)",
             "inherits": "wasm64-base",
-            "binaryDir": "C:/rex/b/w64r",
+            "binaryDir": "${sourceDir}/out/w64r",
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
         },
         {
             "name": "wasm64-debug",
             "displayName": "wasm64 Debug (Emscripten)",
             "inherits": "wasm64-base",
-            "binaryDir": "C:/rex/b/w64d",
+            "binaryDir": "${sourceDir}/out/w64d",
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
         }
     ],

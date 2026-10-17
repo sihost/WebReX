@@ -5,9 +5,9 @@
 # (cmake/rexglue_tint.cmake) so Dawn's compile settings stay separate from the
 # SDK's, and directly on the host for rex_spirv_to_wgsl:
 #
-#   host:  cmake -S thirdparty/tint -B C:/rex/b/tint-host -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   host:  cmake -S thirdparty/tint -B out/tint-host -G Ninja -DCMAKE_BUILD_TYPE=Release
 #          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl   (MSVC environment)
-#          cmake --build C:/rex/b/tint-host --target rex_spirv_to_wgsl
+#          cmake --build out/tint-host --target rex_spirv_to_wgsl
 #   web:   emcmake cmake -S thirdparty/tint -B <dir> -G Ninja -DCMAKE_BUILD_TYPE=Release
 #          -DCMAKE_C_FLAGS=... (same -m64 -pthread -fwasm-exceptions ... as the SDK)
 #          cmake --build <dir> --target tint_web      -> <dir>/libtint_web.a
@@ -15,7 +15,7 @@
 # thirdparty/dawn is a sparse checkout of Dawn 31e25af254ab (the emdawnwebgpu
 # v20260423.175430 revision): src/cmake, src/tint, src/utils, include,
 # third_party + the abseil-cpp, spirv-headers/src, spirv-tools/src submodules.
-# The project's tools/tint/fetch_dawn.bat recreates it.
+# scripts/fetch_dawn.bat (or .sh) recreates it.
 cmake_minimum_required(VERSION 3.25)
 project(rex_tint LANGUAGES C CXX)
 
@@ -24,7 +24,7 @@ set(REX_DAWN_DIR "${REX_SDK_DIR}/thirdparty/dawn" CACHE PATH "Dawn checkout")
 set(REX_DAWN_REVISION "31e25af254ab572c77054edec4946d2244e184dd")
 
 if(NOT EXISTS "${REX_DAWN_DIR}/src/tint/CMakeLists.txt")
-  message(FATAL_ERROR "rex_tint: no Dawn checkout at ${REX_DAWN_DIR} (run tools/tint/fetch_dawn.bat)")
+  message(FATAL_ERROR "rex_tint: no Dawn checkout at ${REX_DAWN_DIR} (run scripts/fetch_dawn.bat or scripts/fetch_dawn.sh)")
 endif()
 
 # Only Tint: no Dawn backends, samples, tests or tools.
