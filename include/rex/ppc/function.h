@@ -155,6 +155,24 @@ constexpr uint32_t PhysicalHostOffset([[maybe_unused]] uint32_t guest_addr) noex
 }
 }  // namespace detail
 
+// Host pointer into guest memory -> guest virtual address (inverse of PPC_HOST_ADDR), used
+// when a hook passes a host pointer back to guest code (GuestToHostFunction arguments,
+// HostToGuestFunction pointer results).
+// Web: the Layout B fold is not invertible by subtraction. The 0xA0/0xC0/0xE0 views of
+// physical memory fold onto one block, so `host - base` gave the physical block offset
+// (0xBB150040 came back as 0xAB150040: a different physical page). Memory::HostToGuestVirtual
+// picks the view whose heap owns the page. Native keeps the plain subtraction.
+template <typename T>
+inline uint32_t HostPointerToGuest(T* host, uint8_t* base) noexcept {
+#if REX_PLATFORM_WEB
+  if (auto* ks = ::rex::system::kernel_state(); ks && ks->memory()) {
+    return ks->memory()->HostToGuestVirtual(host);
+  }
+#endif
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(host) -
+                               reinterpret_cast<uintptr_t>(base));
+}
+
 //=============================================================================
 // Argument Translator
 //=============================================================================
@@ -377,9 +395,7 @@ struct ArgTranslator {
     } else if constexpr (std::is_null_pointer_v<T>) {
       SetIntegerArgumentValue(ctx, base, idx, 0);
     } else if constexpr (std::is_pointer_v<T>) {
-      SetIntegerArgumentValue(ctx, base, idx,
-                              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(value) -
-                                                    reinterpret_cast<uintptr_t>(base)));
+      SetIntegerArgumentValue(ctx, base, idx, HostPointerToGuest(value, base));
     } else {
       SetIntegerArgumentValue(ctx, base, idx, value);
     }
@@ -506,8 +522,7 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
 
     if constexpr (std::is_pointer<ret_t>()) {
       if (v != nullptr) {
-        ctx.r3.u64 =
-            static_cast<uint32_t>(reinterpret_cast<size_t>(v) - reinterpret_cast<size_t>(base));
+        ctx.r3.u64 = HostPointerToGuest(v, base);
       } else {
         ctx.r3.u64 = 0;
       }
