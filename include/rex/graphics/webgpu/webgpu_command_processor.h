@@ -51,6 +51,7 @@ class WebGPUPresentPass;
 class WebGPUPrimitiveProcessor;
 class WebGPURenderTargetCache;
 class WebGPUSharedMemory;
+class WebGPUTessellator;
 class WebGPUTextureCache;
 
 class WebGPUCommandProcessor : public CommandProcessor {
@@ -116,6 +117,10 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint64_t memexport_dispatches = 0;
     uint64_t memexport_unsupported = 0;
     uint64_t drops_pipeline = 0;
+    // WebGPUTessellator refused the draw (index buffer kind, size).
+    uint64_t drops_tessellation = 0;
+    // Tessellated draws recorded (compute pre-pass + indexed draw).
+    uint64_t draws_tessellated = 0;
     uint64_t drops_constants = 0;
     uint64_t drops_sampler = 0;
     // Draws with an empty viewport or scissor (nothing to rasterize).
@@ -143,6 +148,10 @@ class WebGPUCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+
+  // Guest occlusion queries (ZPD begin / end around the query draws).
+  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
+                                          uint32_t count) override;
 
  private:
   // Device thread, recorded with CmdEncoderCallback by IssueSwap.
@@ -176,6 +185,8 @@ class WebGPUCommandProcessor : public CommandProcessor {
   std::unique_ptr<WebGPUTextureCache> texture_cache_;
   std::unique_ptr<WebGPURenderTargetCache> render_target_cache_;
   std::unique_ptr<WebGPUPipelineCache> pipeline_cache_;
+  // Tessellated draws (compute pre-pass; null if it couldn't be created).
+  std::unique_ptr<WebGPUTessellator> tessellator_;
   // Device-thread object.
   WebGPUPresentPass* present_pass_ = nullptr;
 
@@ -212,6 +223,18 @@ class WebGPUCommandProcessor : public CommandProcessor {
   Statistics statistics_;
   bool memexport_logged_ = false;
   uint32_t drop_details_logged_ = 0;
+
+  // Draws since the last ZPD event (webgpu_occlusion_query_log).
+  struct QueryDrawCounts {
+    uint32_t draws = 0;
+    uint32_t recorded = 0;
+    uint32_t no_attachments = 0;
+    uint32_t depth_test = 0;
+    uint32_t point_lists = 0;
+    uint32_t no_color = 0;
+  };
+  QueryDrawCounts query_draws_;
+  uint32_t zpd_events_logged_ = 0;
 };
 
 }  // namespace rex::graphics::webgpu

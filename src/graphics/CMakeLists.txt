@@ -76,6 +76,7 @@ set(REXGRAPHICS_WEBGPU_SOURCES
     webgpu/webgpu_shared_memory.cpp
     webgpu/webgpu_primitive_processor.cpp
     webgpu/webgpu_pipeline_cache.cpp
+    webgpu/webgpu_tessellator.cpp
     webgpu/webgpu_edram.cpp
     webgpu/webgpu_render_target_cache.cpp
     webgpu/webgpu_texture_load.cpp

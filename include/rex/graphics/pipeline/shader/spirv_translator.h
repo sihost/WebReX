@@ -439,6 +439,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // shared memory needs multiple bindings (max_storage_buffer_range below
     // 512 MB), they become separate variables at bindings 0...count-1.
     bool storage_buffer_arrays;
+
+    // Whether domain host vertex shader types become tessellation evaluation
+    // shaders (always on Vulkan). False for WebGPU, which has no tessellation
+    // stages: the guest vertex shader of a tessellated draw is then a vertex
+    // shader whose domain inputs are vertex attributes filled by a host
+    // tessellator (WebGPUTessellator): location 0 = float4(gl_TessCoord, 0) and
+    // location 1 = the patch input the tessellation control shader would pass
+    // (control point indices or the patch index, as floats).
+    bool tessellation_shader;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -562,8 +571,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
                                      GetSpirvShaderModification().vertex.host_vertex_shader_type);
   }
   bool IsSpirvTessEvalShader() const {
-    return is_vertex_shader() && Shader::IsHostVertexShaderTypeDomain(
-                                     GetSpirvShaderModification().vertex.host_vertex_shader_type);
+    return features_.tessellation_shader && is_vertex_shader() &&
+           Shader::IsHostVertexShaderTypeDomain(
+               GetSpirvShaderModification().vertex.host_vertex_shader_type);
+  }
+  // A domain host vertex shader type without tessellation stages
+  // (Features::tessellation_shader false): a vertex shader reading the domain
+  // location and the patch input from vertex attributes 0 and 1.
+  bool IsSpirvDomainAsVertexShader() const {
+    return !features_.tessellation_shader && is_vertex_shader() &&
+           Shader::IsHostVertexShaderTypeDomain(
+               GetSpirvShaderModification().vertex.host_vertex_shader_type);
   }
   bool IsSpirvComputeShader() const {
     return is_vertex_shader() && GetSpirvShaderModification().vertex.host_vertex_shader_type ==

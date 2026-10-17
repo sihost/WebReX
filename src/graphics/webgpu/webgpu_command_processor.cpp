@@ -26,6 +26,7 @@
 #include <rex/graphics/webgpu/webgpu_primitive_processor.h>
 #include <rex/graphics/webgpu/webgpu_render_target_cache.h>
 #include <rex/graphics/webgpu/webgpu_shared_memory.h>
+#include <rex/graphics/webgpu/webgpu_tessellator.h>
 #include <rex/graphics/webgpu/webgpu_texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -51,6 +52,10 @@ REXCVAR_DEFINE_BOOL(webgpu_swap_gamma_ramp, true, "GPU",
                     "WebGPU: apply the guest display gamma ramp (PWL for 2_10_10_10 front "
                     "buffers, else the 256-entry table) when copying the front buffer to the "
                     "guest output, as the Vulkan and D3D12 backends do");
+
+REXCVAR_DEFINE_INT32(webgpu_occlusion_query_log, 0, "GPU",
+                     "WebGPU: log the first N guest occlusion query events (EVENT_WRITE_ZPD begin / "
+                     "end, the sample count address, and the draws since the previous event)");
 
 namespace rex::graphics::webgpu {
 
@@ -203,6 +208,12 @@ bool WebGPUCommandProcessor::SetupContext() {
     return false;
   }
 
+  // Tessellated draws: not fatal if missing (they are dropped then).
+  tessellator_ = std::make_unique<WebGPUTessellator>(*this, *register_file_);
+  if (!tessellator_->Initialize()) {
+    tessellator_.reset();
+  }
+
   bool present_pass_ok = false;
   device_.RunSync([&]() {
     present_pass_ = new WebGPUPresentPass(device_);
@@ -228,6 +239,10 @@ void WebGPUCommandProcessor::ShutdownContext() {
   active_vertex_shader_ = nullptr;
   active_pixel_shader_ = nullptr;
   pipeline_cache_.reset();
+  if (tessellator_) {
+    tessellator_->Shutdown();
+  }
+  tessellator_.reset();
   if (render_target_cache_) {
     render_target_cache_->Shutdown();
   }
@@ -727,6 +742,10 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return IssueCopy();
   }
   ++statistics_.draws;
+  ++query_draws_.draws;
+  if (prim_type == xenos::PrimitiveType::kPointList) {
+    ++query_draws_.point_lists;
+  }
 
   Shader* vertex_shader = active_vertex_shader();
   if (!vertex_shader) {
@@ -767,6 +786,12 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  if (normalized_depth_control.z_enable) {
+    ++query_draws_.depth_test;
+  }
+  if (!normalized_color_mask) {
+    ++query_draws_.no_color;
+  }
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
       pixel_shader ? (vertex_shader->writes_interpolators() &
@@ -847,6 +872,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                     normalized_color_mask, *vertex_shader)) {
     ++statistics_.draws_dropped;
     ++statistics_.drops_render_targets;
+    ++query_draws_.no_attachments;
     if (memexport_used_vertex) {
       ++statistics_.drops_rt_memexport_vs;
     }
@@ -885,6 +911,9 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   pipeline_state.host_primitive_type = primitive_processing_result.host_primitive_type;
   pipeline_state.host_vertex_shader_type = primitive_processing_result.host_vertex_shader_type;
   pipeline_state.host_vertex_shader_type_valid = true;
+  bool tessellated =
+      Shader::IsHostVertexShaderTypeDomain(primitive_processing_result.host_vertex_shader_type);
+  pipeline_state.tessellation_available = tessellator_ && tessellator_->available();
   if (primitive_processing_result.index_buffer_type !=
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     pipeline_state.index_format =
@@ -1002,6 +1031,15 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         uint64_t(reinterpret_cast<uintptr_t>(layout));
   }
 
+  // Tessellated draws: the compute pre-pass writing the domain points and the
+  // triangle list (outside the render pass, which is reopened below).
+  WebGPUTessellator::Output tessellation;
+  if (tessellated && !tessellator_->RecordTessellation(primitive_processing_result, tessellation)) {
+    ++statistics_.draws_dropped;
+    ++statistics_.drops_tessellation;
+    return true;
+  }
+
   BeginRenderPass(render_target_cache_->last_update_render_pass(),
                   render_target_cache_->last_update_render_pass_key());
   if (draw_state.pass_serial != render_pass_serial_) {
@@ -1107,6 +1145,15 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   ++statistics_.draws_recorded;
+  ++query_draws_.recorded;
+  if (tessellated) {
+    ++statistics_.draws_tessellated;
+    stream.CmdSetVertexBuffer(0, tessellation.vertex_buffer, 0, tessellation.vertex_buffer_size);
+    stream.CmdSetIndexBuffer(tessellation.index_buffer, WGPUIndexFormat_Uint32, 0,
+                             tessellation.index_buffer_size);
+    stream.CmdDrawIndexed(tessellation.index_count);
+    return true;
+  }
   // ---- WP3: the processed draw's host index buffer. ----
   WebGPUPrimitiveProcessor::IndexBufferBinding index_buffer_binding;
   if (primitive_processor_->GetIndexBufferBinding(primitive_processing_result,
@@ -1119,6 +1166,30 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   // ---- end WP3 ----
   return true;
+}
+
+bool WebGPUCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
+  if (zpd_events_logged_ < uint32_t(std::max(REXCVAR_GET(webgpu_occlusion_query_log), 0))) {
+    ++zpd_events_logged_;
+    uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    const auto* counts =
+        memory_->TranslatePhysical<const xenos::xe_gpu_depth_sample_counts*>(address);
+    const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
+    bool is_end = counts && ((counts->ZPass_A == kQueryFinished &&
+                              counts->ZPass_B == kQueryFinished) ||
+                             (counts->ZFail_A == kQueryFinished &&
+                              counts->ZFail_B == kQueryFinished));
+    REXGPU_INFO(
+        "WebGPU ZPD #{}: {} sample counts {:08X} (swap {}) | draws since the last ZPD: {} "
+        "(recorded {}, dropped without attachments {}, depth test {}, no color writes {}, "
+        "point lists {})",
+        zpd_events_logged_, is_end ? "end" : "begin", address, statistics_.swaps,
+        query_draws_.draws, query_draws_.recorded, query_draws_.no_attachments,
+        query_draws_.depth_test, query_draws_.no_color, query_draws_.point_lists);
+  }
+  query_draws_ = {};
+  return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
 }
 
 bool WebGPUCommandProcessor::IssueCopy() {
@@ -1278,7 +1349,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
         "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
-        "stale | vs memexport compute: {} dispatches, {} without a compute variant or off",
+        "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
+        "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
+        "the tessellator",
         swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, refreshed,
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
@@ -1297,7 +1370,11 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
         replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
         shared_memory_->stale_pages(), statistics_.memexport_dispatches,
-        statistics_.memexport_unsupported);
+        statistics_.memexport_unsupported, statistics_.draws_tessellated,
+        tessellator_ ? tessellator_->statistics().patches : 0,
+        tessellator_ ? tessellator_->statistics().max_slot_points : 0,
+        tessellator_ ? tessellator_->statistics().max_slot_indices : 0,
+        statistics_.drops_tessellation);
   }
 }
 

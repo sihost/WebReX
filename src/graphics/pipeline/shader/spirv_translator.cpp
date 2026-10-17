@@ -44,7 +44,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
       switch_fallthrough(all),
-      storage_buffer_arrays(all) {}
+      storage_buffer_arrays(all),
+      tessellation_shader(all) {}
 
 #if REX_HAS_VULKAN
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
@@ -64,7 +65,8 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
       switch_fallthrough(true),
-      storage_buffer_arrays(true) {
+      storage_buffer_arrays(true),
+      tessellation_shader(true) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -1692,7 +1694,19 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     builder_->addDecoration(input_patch_control_point_indices_, spv::DecorationLocation, 0);
     builder_->addDecoration(input_patch_control_point_indices_, spv::DecorationPatch);
     main_interface_.push_back(input_patch_control_point_indices_);
-  } else {
+  } else if (IsSpirvDomainAsVertexShader()) {
+    // The same inputs as vertex attributes, one vertex per domain point
+    // (written by the host tessellator).
+    input_tess_coord_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                 type_float4_, "xe_in_domain_location");
+    builder_->addDecoration(input_tess_coord_, spv::DecorationLocation, 0);
+    main_interface_.push_back(input_tess_coord_);
+    input_patch_control_point_indices_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_float4_,
+                                 "xe_in_patch_control_point_indices");
+    builder_->addDecoration(input_patch_control_point_indices_, spv::DecorationLocation, 1);
+    main_interface_.push_back(input_patch_control_point_indices_);
+    } else {
     input_vertex_index_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                    type_int_, "gl_VertexIndex");
     builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
@@ -1896,7 +1910,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
           value, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
                                              id_vector_temp_));
     };
-    if (IsSpirvTessEvalShader()) {
+    if (IsSpirvTessEvalShader() || IsSpirvDomainAsVertexShader()) {
       auto load_tess_coord_component = [this](uint32_t component) {
         return builder_->createCompositeExtract(
             builder_->createLoad(input_tess_coord_, spv::NoPrecision), type_float_, component);

@@ -29,6 +29,7 @@
 #include <rex/graphics/webgpu/webgpu_render_target_cache.h>
 #include <rex/graphics/webgpu/webgpu_shader.h>
 #include <rex/graphics/webgpu/webgpu_shared_memory.h>
+#include <rex/graphics/webgpu/webgpu_tessellator.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
 
@@ -249,6 +250,9 @@ bool WebGPUPipelineCache::Initialize() {
   features.clip_distance = clip_distances_;
   features.cull_distance = false;
   features.image_view_format_swizzle = false;
+  // Tessellated draws: the guest VS is a vertex shader over the domain points of
+  // WebGPUTessellator (attributes 0 and 1), not a tessellation evaluation shader.
+  features.tessellation_shader = false;
   translator_ = std::make_unique<SpirvShaderTranslator>(
       features, WebGPURenderTargetCache::IsMsaa2xSupported(),
       WebGPURenderTargetCache::IsMsaa2xSupported(), false);
@@ -759,12 +763,18 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
     host_primitive = host_vs_type == HVST::kVertex ? state.guest_primitive_type
                                                    : xenos::PrimitiveType::kTriangleStrip;
   }
-  if (Shader::IsHostVertexShaderTypeDomain(host_vs_type) ||
-      host_vs_type == HVST::kMemExportCompute) {
-    // No tessellation on WebGPU; memexport compute is not a render pipeline.
+  bool domain_as_vertex = Shader::IsHostVertexShaderTypeDomain(host_vs_type);
+  if (host_vs_type == HVST::kMemExportCompute ||
+      (domain_as_vertex && !state.tessellation_available)) {
+    // Memexport compute is not a render pipeline; tessellated draws need the
+    // WebGPUTessellator pre-pass (the domain points as vertex attributes).
     ++statistics_.draws_unsupported;
     ++statistics_.draws_refused_tessellation;
     return false;
+  }
+  if (domain_as_vertex) {
+    // The tessellator writes a triangle list of domain points.
+    host_primitive = xenos::PrimitiveType::kTriangleList;
   }
 
   WebGPUPipelineDescription desc;
@@ -881,8 +891,8 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
   }
   WGPUPrimitiveTopology topology = ToTopology(host_primitive);
   desc.primitive_topology = uint8_t(topology);
-  if (topology == WGPUPrimitiveTopology_TriangleStrip ||
-      topology == WGPUPrimitiveTopology_LineStrip) {
+  if (!domain_as_vertex && (topology == WGPUPrimitiveTopology_TriangleStrip ||
+                            topology == WGPUPrimitiveTopology_LineStrip)) {
     desc.strip_index_format = uint8_t(state.index_format);
   }
   if (draw_util::IsPrimitivePolygonal(regs)) {
@@ -1152,6 +1162,26 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
     desc.layout = pipeline_layout;
     desc.vertex.module = vs_module;
     desc.vertex.entryPoint = MakeStringView("main");
+    // Tessellated draws: the domain points of WebGPUTessellator, two float4
+    // attributes per vertex (location 0 domain location, 1 patch input).
+    WGPUVertexAttribute domain_attributes[2];
+    WGPUVertexBufferLayout domain_layout = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+    if (Shader::IsHostVertexShaderTypeDomain(
+            SpirvShaderTranslator::Modification(d.vertex_shader_modification)
+                .vertex.host_vertex_shader_type)) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        domain_attributes[i] = WGPU_VERTEX_ATTRIBUTE_INIT;
+        domain_attributes[i].format = WGPUVertexFormat_Float32x4;
+        domain_attributes[i].offset = 16 * i;
+        domain_attributes[i].shaderLocation = i;
+      }
+      domain_layout.stepMode = WGPUVertexStepMode_Vertex;
+      domain_layout.arrayStride = WebGPUTessellator::kPointStride;
+      domain_layout.attributeCount = 2;
+      domain_layout.attributes = domain_attributes;
+      desc.vertex.bufferCount = 1;
+      desc.vertex.buffers = &domain_layout;
+    }
     desc.primitive.topology = WGPUPrimitiveTopology(d.primitive_topology);
     desc.primitive.stripIndexFormat = WGPUIndexFormat(d.strip_index_format);
     desc.primitive.cullMode = WGPUCullMode(d.cull_mode);

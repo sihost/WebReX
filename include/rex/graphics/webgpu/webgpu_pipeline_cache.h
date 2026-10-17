@@ -83,6 +83,9 @@ struct WebGPUDrawPipelineState {
   xenos::PrimitiveType host_primitive_type = xenos::PrimitiveType::kNone;
   Shader::HostVertexShaderType host_vertex_shader_type = Shader::HostVertexShaderType::kVertex;
   bool host_vertex_shader_type_valid = false;
+  // Domain host vertex shader types: whether WebGPUTessellator provides the
+  // domain points (else the tessellated draw is refused).
+  bool tessellation_available = false;
   // Index format of an indexed draw (WebGPU strip pipelines must match it),
   // Undefined for non-indexed draws.
   WGPUIndexFormat index_format = WGPUIndexFormat_Undefined;
