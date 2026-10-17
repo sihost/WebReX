@@ -202,6 +202,65 @@ fn xe_encode_color(format : u32, c : vec4<f32>) -> vec2<u32> {
   }
 }
 
+// Xenos piecewise linear gamma (SpirvShaderTranslator::PWLGammaToLinear /
+// LinearToPWLGamma) on 8-bit gamma codes and 10-bit linear codes, in integers.
+// Used when 8_8_8_8_GAMMA render targets are stored linear in rgba16unorm
+// (kGammaRtLinear, prepended by WebGPUEdram::Initialize; the D3D12/Vulkan
+// gamma_render_target_as_unorm16 path): EDRAM bits stay gamma, the host render
+// target holds linear values so blending happens in linear space as on Xenos.
+// g2l(l2g) is exact for every 8-bit code.
+fn xe_pwl_g2l(g : f32) -> f32 {
+  let c = i32(round(saturate(g) * 255.0));
+  var l : i32;
+  if (c < 64) {
+    l = c;
+  } else if (c < 96) {
+    l = 2 * c - 64;
+  } else if (c < 192) {
+    let t = 4 * c - 256;
+    l = t + t / 256;
+  } else {
+    let t = 8 * c - 1024;
+    l = t + t / 128;
+  }
+  return f32(l) / 1023.0;
+}
+
+fn xe_pwl_l2g(v : f32) -> f32 {
+  // Truncating like LinearToPWLGamma; the 1/64 absorbs the unorm16 storage
+  // rounding of exact 10-bit codes (at most 0.5 / 65535 * 1023).
+  let l = i32(floor(saturate(v) * 1023.0 + 0.015625));
+  var c : i32;
+  if (l < 64) {
+    c = l;
+  } else if (l < 128) {
+    c = l / 2 + 32;
+  } else if (l < 512) {
+    c = l / 4 + 64;
+  } else {
+    c = l / 8 + 128;
+  }
+  return f32(c) / 255.0;
+}
+
+// Render target load / dump: like xe_decode_color / xe_encode_color, plus the
+// gamma <-> linear conversion of 8_8_8_8_GAMMA stored linear. Resolves keep
+// xe_decode_color (they copy the EDRAM gamma bits).
+fn xe_decode_color_rt(format : u32, d : vec2<u32>) -> vec4<f32> {
+  let c = xe_decode_color(format, d);
+  if (kGammaRtLinear && format == 1u) {
+    return vec4<f32>(xe_pwl_g2l(c.x), xe_pwl_g2l(c.y), xe_pwl_g2l(c.z), c.w);
+  }
+  return c;
+}
+
+fn xe_encode_color_rt(format : u32, c : vec4<f32>) -> vec2<u32> {
+  if (kGammaRtLinear && format == 1u) {
+    return xe_encode_color(format, vec4<f32>(xe_pwl_l2g(c.x), xe_pwl_l2g(c.y), xe_pwl_l2g(c.z), c.w));
+  }
+  return xe_encode_color(format, c);
+}
+
 // unorm24 <-> float32 without the f32 division (2.5 ULP in WGSL) and without
 // the rounding of d * (2^24 - 1): with 24-bit values both would be off by 1-2
 // units. u / (2^24 - 1) = u * 2^-24 + u * 2^-48 + ..., where both products are
@@ -327,7 +386,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     xe_edram[index] = xe_encode_depth(xe_dump.format, xe_load_depth(p, s), xe_load_stencil(p, s));
     return;
   }
-  let bits = xe_encode_color(xe_dump.format, xe_load_color(p, s));
+  let bits = xe_encode_color_rt(xe_dump.format, xe_load_color(p, s));
   if (wide) {
     xe_edram[index * 2u] = bits.x;
     xe_edram[index * 2u + 1u] = bits.y;
@@ -392,7 +451,7 @@ fn xe_fetch(pos : vec4<f32>, s : u32, is_depth : bool) -> vec2<u32> {
 @fragment
 fn fs_color(@builtin(position) pos : vec4<f32>, @builtin(sample_index) s : u32)
     -> @location(0) vec4<f32> {
-  return xe_decode_color(xe_load.format, xe_fetch(pos, s, false));
+  return xe_decode_color_rt(xe_load.format, xe_fetch(pos, s, false));
 }
 
 struct DepthOutput {

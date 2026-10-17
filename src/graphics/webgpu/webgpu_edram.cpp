@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 
+#include <rex/graphics/flags.h>
 #include <rex/graphics/webgpu/webgpu_device.h>
 #include <rex/graphics/webgpu/webgpu_log.h>
 
@@ -48,6 +49,8 @@ static_assert(sizeof(LoadParams) == 32);
 constexpr WGPUTextureFormat kColorHostFormats[] = {
     WGPUTextureFormat_RGBA8Unorm,  WGPUTextureFormat_RGB10A2Unorm, WGPUTextureFormat_RGBA16Float,
     WGPUTextureFormat_RG16Float,   WGPUTextureFormat_R32Float,     WGPUTextureFormat_RG32Float,
+    // Linear 8_8_8_8_GAMMA (texture-formats-tier1 only).
+    WGPUTextureFormat_RGBA16Unorm,
 };
 
 WGPUShaderModule CreateModule(WGPUDevice device, const char* label, const std::string& code) {
@@ -117,9 +120,10 @@ WGPUBindGroupEntry TextureBinding(uint32_t binding, WGPUTextureView view) {
 
 WGPUTextureFormat WebGPUEdram::GetColorHostFormat(uint32_t color_format) {
   switch (color_format) {
-    case 0:   // k_8_8_8_8
-    case 1:   // k_8_8_8_8_GAMMA (PWL gamma stays in the shaders)
+    case 0:  // k_8_8_8_8
       return WGPUTextureFormat_RGBA8Unorm;
+    case 1:  // k_8_8_8_8_GAMMA: linear, or PWL gamma in the shaders
+      return gamma_as_unorm16_ ? WGPUTextureFormat_RGBA16Unorm : WGPUTextureFormat_RGBA8Unorm;
     case 2:   // k_2_10_10_10
     case 10:  // k_2_10_10_10_AS_10_10_10_10
       return WGPUTextureFormat_RGB10A2Unorm;
@@ -222,6 +226,14 @@ WGPUComputePipeline WebGPUEdram::CreateComputePipeline(const char* label,
 bool WebGPUEdram::Initialize() {
   WGPUDevice device = device_.device();
   has_depth32float_stencil8_ = device_.HasFeature(WGPUFeatureName_Depth32FloatStencil8);
+  // As D3D12/Vulkan gamma_render_target_as_unorm16: linear storage, so blending
+  // into 8_8_8_8_GAMMA happens in linear space (the native D3D12 default).
+  gamma_as_unorm16_ = REXCVAR_GET(gamma_render_target_as_unorm16) &&
+                      device_.HasFeature(WGPUFeatureName_TextureFormatsTier1);
+  // After the prelude: its diagnostic() directive must come first.
+  const std::string prelude = std::string(edram_wgsl::kPrelude) +
+                              "const kGammaRtLinear : bool = " +
+                              (gamma_as_unorm16_ ? "true" : "false") + ";\n";
 
   WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
   buffer_desc.label = MakeStringView("EDRAM");
@@ -251,7 +263,7 @@ bool WebGPUEdram::Initialize() {
         multisampled);
     entries[3] = TextureEntry(3, WGPUTextureSampleType_Uint, multisampled);
     dump_layouts_[i] = CreateLayout(device, entries, is_depth ? 4 : 3);
-    const char* sources[] = {edram_wgsl::kPrelude, kDumpSources[i], edram_wgsl::kDumpMain};
+    const char* sources[] = {prelude.c_str(), kDumpSources[i], edram_wgsl::kDumpMain};
     dump_pipelines_[i] = CreateComputePipeline(kDumpLabels[i], sources, 3, dump_layouts_[i]);
   }
 
@@ -264,7 +276,7 @@ bool WebGPUEdram::Initialize() {
                              sizeof(LoadParams));
     load_layout_ = CreateLayout(device, entries, 2);
     load_module_ = CreateModule(device, "EDRAM load",
-                                std::string(edram_wgsl::kPrelude) + edram_wgsl::kLoadMain);
+                                prelude + edram_wgsl::kLoadMain);
     WGPUPipelineLayout pipeline_layout = CreatePipelineLayout(device, load_layout_);
 
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
@@ -275,6 +287,9 @@ bool WebGPUEdram::Initialize() {
     desc.multisample.mask = 0xFFFFFFFFu;
 
     for (uint32_t f = 0; f < kColorHostFormatCount; ++f) {
+      if (kColorHostFormats[f] == WGPUTextureFormat_RGBA16Unorm && !gamma_as_unorm16_) {
+        continue;
+      }
       WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
       target.format = kColorHostFormats[f];
       target.writeMask = WGPUColorWriteMask_All;
@@ -345,7 +360,7 @@ bool WebGPUEdram::Initialize() {
     entries[2] = BufferEntry(2, WGPUShaderStage_Compute, WGPUBufferBindingType_Uniform,
                              sizeof(WebGPUResolveConstants));
     resolve_layout_ = CreateLayout(device, entries, 3);
-    const char* sources[] = {edram_wgsl::kPrelude, edram_wgsl::kResolveMain};
+    const char* sources[] = {prelude.c_str(), edram_wgsl::kResolveMain};
     resolve_pipeline_ = CreateComputePipeline("EDRAM resolve", sources, 2, resolve_layout_);
   }
 
@@ -354,6 +369,9 @@ bool WebGPUEdram::Initialize() {
     ok = ok && dump_pipelines_[i];
   }
   for (uint32_t f = 0; f < kColorHostFormatCount; ++f) {
+    if (kColorHostFormats[f] == WGPUTextureFormat_RGBA16Unorm && !gamma_as_unorm16_) {
+      continue;
+    }
     ok = ok && color_load_pipelines_[f][0] && color_load_pipelines_[f][1];
   }
   for (uint32_t v = 0; v < kDepthPipelineVariants; ++v) {
@@ -363,9 +381,12 @@ bool WebGPUEdram::Initialize() {
     REXWGPU_ERROR("WebGPU EDRAM: failed to create the EDRAM pipelines");
     return false;
   }
-  REXWGPU_INFO("WebGPU EDRAM: {} MiB buffer, depth32float-stencil8 {}", kBufferSize >> 20,
+  REXWGPU_INFO("WebGPU EDRAM: {} MiB buffer, depth32float-stencil8 {}, 8_8_8_8_GAMMA {}",
+               kBufferSize >> 20,
                has_depth32float_stencil8_ ? "available (D24FS8 exact)"
-                                          : "unavailable (D24FS8 in depth24plus)");
+                                          : "unavailable (D24FS8 in depth24plus)",
+               gamma_as_unorm16_ ? "linear rgba16unorm (blending in linear space)"
+                                 : "rgba8unorm (PWL gamma in the shaders)");
   return true;
 }
 

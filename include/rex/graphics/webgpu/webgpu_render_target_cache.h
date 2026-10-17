@@ -185,8 +185,12 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat /*format*/) const override {
     return false;
   }
-  // 8_8_8_8_GAMMA shares rgba8unorm with 8_8_8_8 (PWL gamma in the shaders).
-  bool IsGammaFormatHostStorageSeparate() const override { return false; }
+  // 8_8_8_8_GAMMA is linear rgba16unorm (separate from 8_8_8_8, transfers convert
+  // through the EDRAM bits), or shares rgba8unorm with 8_8_8_8 with the PWL gamma
+  // in the shaders (WebGPUEdram::gamma_as_unorm16).
+  bool IsGammaFormatHostStorageSeparate() const override {
+    return WebGPUEdram::gamma_as_unorm16();
+  }
 
  private:
   class WebGPURenderTarget final : public RenderTarget {

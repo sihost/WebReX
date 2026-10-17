@@ -415,9 +415,10 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
   reg::RB_COLOR_INFO color_infos[xenos::kMaxColorRenderTargets];
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     color_infos[i] = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-    // 8_8_8_8_GAMMA is rgba8unorm with the PWL gamma in the shaders
-    // (WebGPURenderTargetCache).
-    if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+    // 8_8_8_8_GAMMA: linear rgba16unorm (no conversion in the shaders), or
+    // rgba8unorm with the PWL gamma in the shaders (WebGPUEdram::gamma_as_unorm16).
+    if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
+        !WebGPUEdram::gamma_as_unorm16()) {
       flags |= SpirvTr::kSysFlag_ConvertColor0ToGamma << i;
     }
   }

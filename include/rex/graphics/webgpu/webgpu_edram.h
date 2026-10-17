@@ -133,6 +133,10 @@ class WebGPUEdram {
   bool has_depth32float_stencil8() const { return has_depth32float_stencil8_; }
   // Host formats (docs/port/webgpu.md section 5). Undefined for invalid input.
   static WGPUTextureFormat GetColorHostFormat(uint32_t color_format);
+  // 8_8_8_8_GAMMA render targets are linear rgba16unorm (gamma_render_target_as_unorm16
+  // and texture-formats-tier1), set by Initialize before any render target exists;
+  // otherwise rgba8unorm with the PWL gamma applied in the pixel shaders.
+  static bool gamma_as_unorm16() { return gamma_as_unorm16_; }
   WGPUTextureFormat GetDepthHostFormat(uint32_t depth_format) const;
   // 1 or 4 (2x is emulated with 4x).
   static uint32_t GetHostSampleCount(uint32_t msaa_samples) { return msaa_samples ? 4 : 1; }
@@ -171,7 +175,7 @@ class WebGPUEdram {
   const Statistics& statistics() const { return statistics_; }
 
  private:
-  static constexpr uint32_t kColorHostFormatCount = 6;
+  static constexpr uint32_t kColorHostFormatCount = 7;
   static constexpr uint32_t kDepthPipelineVariants = 9;  // 0: depth + stencil ref, 1-8: bits.
 
   static int GetColorHostFormatIndex(WGPUTextureFormat format);
@@ -183,6 +187,7 @@ class WebGPUEdram {
 
   WebGPUDevice& device_;
   bool has_depth32float_stencil8_ = false;
+  static inline bool gamma_as_unorm16_ = false;
 
   // Device-thread objects (handles used for recording on any thread).
   WGPUBuffer buffer_ = nullptr;
