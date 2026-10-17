@@ -25,6 +25,11 @@
 #include <rex/ui/window_win.h>
 #include <Windows.h>
 #endif
+#if REX_PLATFORM_WEB
+// Browser DOM events reach this driver through a lock-free bridge, not through
+// ui::Window listeners (see rex/input/web/web_input.h).
+#include <rex/input/web/web_input.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
@@ -71,6 +76,11 @@ MnkInputDriver::~MnkInputDriver() {
 }
 
 X_STATUS MnkInputDriver::Setup() {
+#if REX_PLATFORM_WEB
+  if (!rex::input::web::InstallBrowserInput()) {
+    REXLOG_WARN("MnK: browser input bridge unavailable");
+  }
+#endif
   REXLOG_INFO("MnK input driver initialized");
   return X_STATUS_SUCCESS;
 }
@@ -141,6 +151,13 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   }
 
   UpdateMouseCapture();
+
+#if REX_PLATFORM_WEB
+  {
+    std::lock_guard lock(state_mutex_);
+    DrainWebInput();
+  }
+#endif
 
   if (!is_active() || !has_focus_) {
     if (out_state) {
@@ -299,14 +316,57 @@ void MnkInputDriver::UpdateMouseCapture() {
   }
 }
 
+#if REX_PLATFORM_WEB
+// Applies queued DOM events (caller holds state_mutex_). A key pressed and released
+// between two polls stays down for one poll so short taps are not lost: draining
+// stops at the release of a key that was pressed in this same drain.
+void MnkInputDriver::DrainWebInput() {
+  namespace w = rex::input::web;
+  if (w::TakeOverflow()) {
+    w::SnapshotKeyBitmap(key_down_);
+  }
+  bool pressed_now[256] = {};
+  w::DomEvent ev;
+  while (w::PeekDomEvent(&ev)) {
+    if (ev.type == w::DomEvent::kFocus) {
+      has_focus_ = ev.down != 0;
+      if (!has_focus_) {
+        std::memset(key_down_, 0, sizeof(key_down_));
+        mouse_dx_ = 0;
+        mouse_dy_ = 0;
+      }
+    } else if (ev.vk < 256) {
+      if (!ev.down && pressed_now[ev.vk]) {
+        break;
+      }
+      key_down_[ev.vk] = ev.down != 0;
+      if (ev.down) {
+        pressed_now[ev.vk] = true;
+      }
+    }
+    w::PopDomEvent();
+  }
+  int32_t dx = 0, dy = 0;
+  w::TakeMouseDelta(&dx, &dy);
+  if (has_focus_) {
+    mouse_dx_ += dx;
+    mouse_dy_ += dy;
+  }
+}
+#endif
+
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
     key_down_[vk] = down;
   }
 }
 
+// On web the window forwards the same DOM events the bridge queues (window_web.h);
+// the driver takes them from the bridge only, so window key/mouse events are ignored.
+constexpr bool kUseWindowInput = !REX_PLATFORM_WEB;
+
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!kUseWindowInput || !IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
@@ -314,7 +374,7 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
-  if (!IsEnabled())
+  if (!kUseWindowInput || !IsEnabled())
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
@@ -322,7 +382,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!kUseWindowInput || !IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -341,7 +401,7 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
+  if (!kUseWindowInput || !IsEnabled())
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -360,7 +420,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!kUseWindowInput || !IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
   int32_t x = e.x();

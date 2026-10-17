@@ -11,6 +11,7 @@
 #pragma once
 
 #include <rex/input/input_driver.h>
+#include <rex/platform.h>
 #include <rex/ui/window_listener.h>
 
 #include <cstdint>
@@ -57,6 +58,9 @@ class MnkInputDriver final : public InputDriver,
   void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
+#if REX_PLATFORM_WEB
+  void DrainWebInput();
+#endif
 
   rex::ui::Window* attached_window_ = nullptr;
 
