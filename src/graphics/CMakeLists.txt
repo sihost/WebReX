@@ -58,6 +58,18 @@ set(REXGRAPHICS_VULKAN_SOURCES
     vulkan/texture_cache.cpp
 )
 
+# WebGPU backend (Emscripten only: emdawnwebgpu's webgpu.h, OffscreenCanvas).
+# docs/port/webgpu.md in the project.
+if(EMSCRIPTEN)
+    option(REXGLUE_USE_WEBGPU "Enable WebGPU graphics backend (Emscripten)" ON)
+else()
+    set(REXGLUE_USE_WEBGPU OFF)
+endif()
+set(REXGRAPHICS_WEBGPU_SOURCES
+    webgpu/webgpu_device.cpp
+    webgpu/webgpu_present_pass.cpp
+)
+
 # D3D12 backend
 if(REXGLUE_USE_D3D12)
     # DXBC third-party dependency
@@ -99,6 +111,10 @@ if(REXGLUE_USE_VULKAN)
     list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_SPIRV_SOURCES} ${REXGRAPHICS_VULKAN_SOURCES})
 endif()
 
+if(REXGLUE_USE_WEBGPU)
+    list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_WEBGPU_SOURCES})
+endif()
+
 if(REXGLUE_USE_D3D12)
     list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_DXBC_THIRDPARTY_SOURCES} ${REXGRAPHICS_DXBC_SOURCES} ${REXGRAPHICS_D3D12_SOURCES})
 endif()
@@ -137,6 +153,13 @@ if(REXGLUE_USE_VULKAN)
         OGLCompiler
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_VULKAN=1)
+endif()
+
+if(REXGLUE_USE_WEBGPU)
+    # The port flag adds the emdawnwebgpu include dirs when compiling; the game
+    # link gets it from rexglue_configure_target.
+    target_compile_options(rexgraphics PUBLIC --use-port=emdawnwebgpu)
+    target_compile_definitions(rexgraphics PUBLIC REX_HAS_WEBGPU=1)
 endif()
 
 if(REXGLUE_USE_D3D12)

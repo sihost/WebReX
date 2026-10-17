@@ -50,6 +50,20 @@ function(rexglue_configure_target target_name)
             # main()/runtime setup runs on this stack (default is only 64 KiB).
             "SHELL:-s STACK_SIZE=8MB"
             "SHELL:-s DEFAULT_PTHREAD_STACK_SIZE=2MB"
+            # ~25 threads per session (15 guest XThreads, 8 SDK host threads,
+            # the PROXY_TO_PTHREAD main thread, the WasmFS OPFS worker).
+            # Pre-spawned Workers avoid instantiating the module lazily mid-game.
+            -sPTHREAD_POOL_SIZE=32
+            # WasmFS: OPFS backend for persistent xstorage: and the
+            # HttpRangeDevice block cache (rex::filesystem::web). Replaces the
+            # JS FS API, so loaders must not use FS.mount(IDBFS).
+            -sWASMFS
+            # web_storage.cpp references the OPFS backend weakly (links without
+            # WASMFS); weak refs never pull archive members, so force them in.
+            -Wl,--undefined=wasmfs_create_opfs_backend
+            -Wl,--undefined=wasmfs_create_directory
+            # Stack overflows otherwise corrupt the heap silently.
+            $<$<CONFIG:Debug>:-sSTACK_OVERFLOW_CHECK=2>
             --use-port=emdawnwebgpu
         )
     endif()
