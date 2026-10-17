@@ -111,6 +111,10 @@ class WebGPUCommandProcessor : public CommandProcessor {
     // Of drops_render_targets: the vertex shader memexports; rasterization is off.
     uint64_t drops_rt_memexport_vs = 0;
     uint64_t drops_rt_no_rasterization = 0;
+    // Vertex memexport as compute (webgpu_vertex_memexport): dispatches
+    // recorded, and memexporting draws whose compute variant isn't available.
+    uint64_t memexport_dispatches = 0;
+    uint64_t memexport_unsupported = 0;
     uint64_t drops_pipeline = 0;
     uint64_t drops_constants = 0;
     uint64_t drops_sampler = 0;
@@ -151,7 +155,13 @@ class WebGPUCommandProcessor : public CommandProcessor {
   bool UpdateSystemConstantValues(bool primitive_polygonal,
                                   const PrimitiveProcessor::ProcessingResult& primitive_result,
                                   const draw_util::ViewportInfo& viewport_info,
-                                  uint32_t used_texture_mask);
+                                  uint32_t used_texture_mask,
+                                  uint32_t compute_memexport_vertex_count = 0);
+  // Records the kMemExportCompute dispatch of a memexporting vertex shader
+  // (outside render passes) and marks the exported ranges as GPU-written.
+  // False only on a fatal error (the draw then fails).
+  bool IssueMemExportCompute(Shader& vertex_shader, bool primitive_polygonal,
+                             const PrimitiveProcessor::ProcessingResult& primitive_result);
   // Writes the constant buffers that changed (or weren't written into the
   // current stream yet) and returns their dynamic offsets (binding order).
   bool UpdateConstantBuffers(const Shader& vertex_shader, const Shader* pixel_shader,

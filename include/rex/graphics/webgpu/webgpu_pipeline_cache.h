@@ -179,6 +179,18 @@ class WebGPUPipelineCache {
   WGPUBindGroupLayout shared_memory_layout() const { return shared_memory_layout_; }
   WGPUBindGroupLayout constants_layout() const { return constants_layout_; }
   WGPUBindGroupLayout empty_layout() const { return empty_layout_; }
+  // Group 0 of the vertex memexport compute pipelines: the shared memory
+  // bindings read_write (compute only). Groups 1 and 2 are the constants and
+  // the VS texture layouts (visible to compute too).
+  WGPUBindGroupLayout compute_shared_memory_layout() const { return compute_shared_memory_layout_; }
+
+  // CP thread. The vertex shader as a HostVertexShaderType::kMemExportCompute
+  // compute pipeline (one invocation per guest vertex, eM# exports written to
+  // the shared memory; webgpu.md section 4), created asynchronously (the
+  // dispatch is skipped by the replay until it exists). bindings_out: the VS
+  // texture/sampler bindings (group 2). kInvalidPipelineId if it can't be made.
+  PipelineId GetMemExportComputePipeline(Shader& vertex_shader,
+                                         const WebGPUShaderBindings*& bindings_out);
   // Binding sizes of the group 1 uniform buffers (fixed, the dynamic offset
   // selects the data; the stream keeps 64 KiB of slack after its constants).
   static constexpr uint32_t kFloatConstantsBindingSize = 256 * 4 * sizeof(float);
@@ -272,6 +284,9 @@ class WebGPUPipelineCache {
   std::unordered_map<uint32_t, std::shared_ptr<const std::string>> depth_only_wgsl_;
   std::unordered_map<WebGPUPipelineDescription, PipelineId, DescriptionHasher, DescriptionEqual>
       pipelines_;
+  // Vertex memexport compute pipelines by (ucode hash, modification).
+  std::unordered_map<WgslKey, PipelineId, WgslKeyHasher> compute_pipelines_;
+  WGPUBindGroupLayout compute_shared_memory_layout_ = nullptr;
 
   WGPUBindGroupLayout shared_memory_layout_ = nullptr;
   WGPUBindGroupLayout constants_layout_ = nullptr;

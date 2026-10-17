@@ -36,6 +36,12 @@
 
 REXCVAR_DEFINE_BOOL(webgpu_log_frames, false, "GPU",
                     "WebGPU: log submission/upload statistics on every swap (else every 600)");
+REXCVAR_DEFINE_BOOL(webgpu_vertex_memexport, false, "GPU",
+                    "WebGPU (experimental): run memexporting vertex shaders as compute "
+                    "dispatches (HostVertexShaderType::kMemExportCompute) before their draw. "
+                    "Off: the exports are dropped (WGSL has no vertex-stage storage writes). Not "
+                    "validated against native yet; one of three riverworld boots stalled at the "
+                    "map change with it on (docs/port/gates/README.md, gate 4)");
 REXCVAR_DEFINE_BOOL(webgpu_swap_gamma_ramp, true, "GPU",
                     "WebGPU: apply the guest display gamma ramp (PWL for 2_10_10_10 front "
                     "buffers, else the 256-entry table) when copying the front buffer to the "
@@ -359,7 +365,8 @@ bool WebGPUCommandProcessor::RequestVertexBuffers(const Shader& vertex_shader) {
 
 bool WebGPUCommandProcessor::UpdateSystemConstantValues(
     bool primitive_polygonal, const PrimitiveProcessor::ProcessingResult& primitive_result,
-    const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask) {
+    const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
+    uint32_t compute_memexport_vertex_count) {
   // VulkanCommandProcessor::UpdateSystemConstantValues for host render targets
   // at 1x resolution (no FSI, no resolution-scaled textures).
   const RegisterFile& regs = *register_file_;
@@ -375,8 +382,8 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
   std::memcpy(&c, &stored, sizeof(c));
 
   uint32_t flags = 0;
-  WebGPUPrimitiveProcessor::ApplyIndexSystemConstants<SpirvTr>(regs, primitive_result, 0, flags,
-                                                               c);
+  WebGPUPrimitiveProcessor::ApplyIndexSystemConstants<SpirvTr>(
+      regs, primitive_result, compute_memexport_vertex_count, flags, c);
   if (pa_cl_vte_cntl.vtx_xy_fmt) {
     flags |= SpirvTr::kSysFlag_XYDividedByW;
   }
@@ -579,6 +586,126 @@ bool WebGPUCommandProcessor::UpdateConstantBuffers(const Shader& vertex_shader,
   return true;
 }
 
+bool WebGPUCommandProcessor::IssueMemExportCompute(
+    Shader& vertex_shader, bool primitive_polygonal,
+    const PrimitiveProcessor::ProcessingResult& primitive_result) {
+  const RegisterFile& regs = *register_file_;
+  uint32_t vertex_count = regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices;
+  uint32_t groups_x, groups_y;
+  if (!WebGPUPrimitiveProcessor::GetMemExportComputeDispatch(vertex_count, groups_x, groups_y)) {
+    return true;
+  }
+  std::vector<draw_util::MemExportRange> ranges;
+  draw_util::AddMemExportRanges(regs, vertex_shader, ranges);
+  if (ranges.empty()) {
+    // No valid stream constant: nothing can be written.
+    return true;
+  }
+  const WebGPUShaderBindings* bindings = nullptr;
+  PipelineId pipeline = pipeline_cache_->GetMemExportComputePipeline(vertex_shader, bindings);
+  if (pipeline == kInvalidPipelineId || !bindings) {
+    ++statistics_.memexport_unsupported;
+    return true;
+  }
+  // The destination must hold current data around the exported elements.
+  for (const draw_util::MemExportRange& range : ranges) {
+    if (!shared_memory_->RequestRange(range.base_address_dwords << 2, range.size_bytes)) {
+      REXGPU_ERROR("WebGPU: failed to request the memexport stream at 0x{:08X} ({} bytes)",
+                   range.base_address_dwords << 2, range.size_bytes);
+      return false;
+    }
+  }
+  texture_cache_->RequestTexturesForShaders(vertex_shader, nullptr);
+
+  uint32_t used_texture_mask = 0;
+  for (const Shader::TextureBinding& binding : vertex_shader.texture_bindings()) {
+    used_texture_mask |= UINT32_C(1) << (binding.fetch_constant & 31);
+  }
+  DrawState& draw_state = *draw_state_;
+  // The viewport is not used by the compute variant.
+  draw_util::ViewportInfo viewport_info = {};
+  if (UpdateSystemConstantValues(primitive_polygonal, primitive_result, viewport_info,
+                                 used_texture_mask, vertex_count)) {
+    draw_state.constants_valid &= ~(UINT32_C(1) << SpirvTr::kConstantBufferSystem);
+  }
+  uint32_t constant_offsets[SpirvTr::kConstantBufferCount];
+  if (!UpdateConstantBuffers(vertex_shader, nullptr, constant_offsets)) {
+    ++statistics_.memexport_unsupported;
+    return true;
+  }
+
+  // VS textures and samplers (group 2), as for draws.
+  std::vector<WGPUBindGroupEntry> texture_entries;
+  uint32_t binding_index = 0;
+  for (const WebGPUShaderBindings::Texture& texture : bindings->textures) {
+    WGPUBindGroupEntry& entry = texture_entries.emplace_back();
+    entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = binding_index++;
+    entry.textureView =
+        texture_cache_->IsActiveTextureFilterable(texture.fetch_constant, texture.is_signed)
+            ? texture_cache_->GetActiveBindingOrNullView(texture.fetch_constant, texture.dimension,
+                                                          texture.is_signed)
+            : texture_cache_->GetNullView(texture.dimension);
+  }
+  for (const WebGPUShaderBindings::Sampler& sampler : bindings->samplers) {
+    WGPUBindGroupEntry& entry = texture_entries.emplace_back();
+    entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = binding_index++;
+    entry.sampler = texture_cache_->UseSampler(texture_cache_->GetSamplerParameters(sampler));
+    if (!entry.sampler) {
+      ++statistics_.memexport_unsupported;
+      return true;
+    }
+  }
+
+  EndRenderPass();
+  WebGPUCommandStream& stream = command_stream();
+  stream.CmdBeginComputePass();
+  stream.CmdSetComputePipeline(pipeline);
+  WGPUBindGroupEntry shared_entries[8];
+  uint32_t shared_count = std::min<uint32_t>(shared_memory_->binding_count(), 8);
+  for (uint32_t i = 0; i < shared_count; ++i) {
+    shared_entries[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+    shared_entries[i].binding = i;
+    shared_entries[i].buffer = shared_memory_->buffer();
+    shared_entries[i].offset = shared_memory_->binding_size() * i;
+    shared_entries[i].size = shared_memory_->binding_size();
+  }
+  stream.CmdSetBindGroup(0, pipeline_cache_->compute_shared_memory_layout(), shared_entries,
+                         shared_count);
+  WGPUBindGroupEntry constant_entries[SpirvTr::kConstantBufferCount];
+  const uint32_t sizes[SpirvTr::kConstantBufferCount] = {
+      uint32_t(sizeof(SpirvTr::SystemConstants)),
+      WebGPUPipelineCache::kFloatConstantsBindingSize,
+      WebGPUPipelineCache::kFloatConstantsBindingSize,
+      WebGPUPipelineCache::kBoolLoopConstantsBindingSize,
+      WebGPUPipelineCache::kFetchConstantsBindingSize,
+  };
+  for (uint32_t i = 0; i < SpirvTr::kConstantBufferCount; ++i) {
+    constant_entries[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+    constant_entries[i].binding = i;
+    constant_entries[i].buffer = StreamConstantsBuffer();
+    constant_entries[i].offset = 0;
+    constant_entries[i].size = sizes[i];
+  }
+  stream.CmdSetBindGroup(1, pipeline_cache_->constants_layout(), constant_entries,
+                         SpirvTr::kConstantBufferCount, SpirvTr::kConstantBufferCount,
+                         constant_offsets);
+  stream.CmdSetBindGroup(2, bindings->layout, texture_entries.data(),
+                         uint32_t(texture_entries.size()));
+  stream.CmdDispatch(groups_x, groups_y, 1);
+  stream.CmdEndComputePass();
+  // The draw that follows (if any) opens a new render pass and rebinds.
+  ++statistics_.memexport_dispatches;
+
+  // Consumes the dirty map first on web, marks valid, fires the watches
+  // (textures over the exported data are reloaded).
+  for (const draw_util::MemExportRange& range : ranges) {
+    shared_memory_->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
+  }
+  return true;
+}
+
 bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t /*index_count*/,
                                        IndexBufferInfo* /*index_buffer_info*/,
                                        bool /*major_mode_explicit*/) {
@@ -649,6 +776,18 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
     return false;
+  }
+  if (memexport_used_vertex) {
+    // The exports run as a compute dispatch before the draw (if it rasterizes).
+    if (!REXCVAR_GET(webgpu_vertex_memexport)) {
+      ++statistics_.memexport_unsupported;
+    } else if (!IssueMemExportCompute(*vertex_shader, primitive_polygonal,
+                                      primitive_processing_result)) {
+      return false;
+    }
+    if (!is_rasterization_done) {
+      return true;
+    }
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
@@ -1127,7 +1266,7 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
         "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
-        "stale",
+        "stale | vs memexport compute: {} dispatches, {} without a compute variant or off",
         swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, refreshed,
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
@@ -1145,7 +1284,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
         replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
-        shared_memory_->stale_pages());
+        shared_memory_->stale_pages(), statistics_.memexport_dispatches,
+        statistics_.memexport_unsupported);
   }
 }
 

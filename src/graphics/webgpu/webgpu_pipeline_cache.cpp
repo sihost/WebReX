@@ -264,12 +264,20 @@ bool WebGPUPipelineCache::Initialize() {
     desc.entryCount = entries.size();
     desc.entries = entries.data();
     shared_memory_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
+    // The vertex memexport compute shaders write it.
+    for (WGPUBindGroupLayoutEntry& entry : entries) {
+      entry.visibility = WGPUShaderStage_Compute;
+      entry.buffer.type = WGPUBufferBindingType_Storage;
+    }
+    desc.label = MakeStringView("xe shared memory (memexport compute)");
+    compute_shared_memory_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
     entries.clear();
     for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
       WGPUBindGroupLayoutEntry& entry = entries.emplace_back();
       entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entry.binding = i;
-      entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+      entry.visibility =
+          WGPUShaderStage_Vertex | WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
       entry.buffer.type = WGPUBufferBindingType_Uniform;
       entry.buffer.hasDynamicOffset = WGPU_TRUE;
     }
@@ -282,7 +290,8 @@ bool WebGPUPipelineCache::Initialize() {
     desc.entries = nullptr;
     empty_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
   });
-  if (!shared_memory_layout_ || !constants_layout_ || !empty_layout_) {
+  if (!shared_memory_layout_ || !compute_shared_memory_layout_ || !constants_layout_ ||
+      !empty_layout_) {
     REXGPU_ERROR("WebGPU pipeline cache: creating the bind group layouts failed");
     return false;
   }
@@ -306,7 +315,8 @@ void WebGPUPipelineCache::Shutdown() {
     layouts.push_back(layout.second);
   }
   texture_layouts_.clear();
-  for (WGPUBindGroupLayout* layout : {&shared_memory_layout_, &constants_layout_, &empty_layout_}) {
+  for (WGPUBindGroupLayout* layout : {&shared_memory_layout_, &compute_shared_memory_layout_,
+                                      &constants_layout_, &empty_layout_}) {
     if (*layout) {
       layouts.push_back(*layout);
       *layout = nullptr;
@@ -391,7 +401,9 @@ WGPUBindGroupLayout WebGPUPipelineCache::GetTextureLayout(bool vertex,
   WGPUBindGroupLayout layout = nullptr;
   WebGPUDevice& device = command_processor_.device();
   device.RunSync([&]() {
-    WGPUShaderStage stage = vertex ? WGPUShaderStage_Vertex : WGPUShaderStage_Fragment;
+    // Vertex shader textures are also bound to the memexport compute variant.
+    WGPUShaderStage stage =
+        vertex ? (WGPUShaderStage_Vertex | WGPUShaderStage_Compute) : WGPUShaderStage_Fragment;
     std::vector<WGPUBindGroupLayoutEntry> entries;
     uint32_t binding = 0;
     for (const WebGPUShaderBindings::Texture& texture : bindings.textures) {
@@ -438,6 +450,7 @@ void WebGPUPipelineCache::ClearCache() {
   // Draws only hold Shader pointers for the duration of IssueDraw. Pipelines
   // stay in the command queue's table (released with it).
   pipelines_.clear();
+  compute_pipelines_.clear();
   wgsl_.clear();
   depth_only_wgsl_.clear();
   shader_bindings_.clear();
@@ -779,6 +792,103 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
     return false;
   }
   return true;
+}
+
+PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
+    Shader& vs, const WebGPUShaderBindings*& bindings_out) {
+  bindings_out = nullptr;
+  if (!kHasTint || !translator_ || !compute_shared_memory_layout_) {
+    return kInvalidPipelineId;
+  }
+  AnalyzeShaderUcode(vs);
+  if (!vs.memexport_eM_written()) {
+    return kInvalidPipelineId;
+  }
+  SpirvShaderTranslator::Modification mod(translator_->GetDefaultVertexShaderModification(
+      vs.GetDynamicAddressableRegisterCount(register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg),
+      HVST::kMemExportCompute));
+  WgslKey key{vs.ucode_data_hash(), mod.value};
+  auto it = compute_pipelines_.find(key);
+  if (it != compute_pipelines_.end()) {
+    if (it->second != kInvalidPipelineId) {
+      bindings_out = GetShaderBindings(vs, mod.value);
+    }
+    return bindings_out ? it->second : kInvalidPipelineId;
+  }
+  bindings_out = GetShaderBindings(vs, mod.value);
+  std::shared_ptr<const std::string> wgsl = bindings_out ? GetWgsl(vs, mod.value) : nullptr;
+  if (!wgsl) {
+    bindings_out = nullptr;
+    compute_pipelines_.emplace(key, kInvalidPipelineId);
+    REXGPU_ERROR("WebGPU: vertex shader {:016X} has no memexport compute variant",
+                 vs.ucode_data_hash());
+    return kInvalidPipelineId;
+  }
+  WebGPUPipelineTable& table = command_processor_.command_queue().pipeline_table();
+  PipelineId id = table.Allocate();
+  compute_pipelines_.emplace(key, id);
+  ++statistics_.pipelines_requested;
+  REXGPU_INFO("WebGPU: memexport compute pipeline {} for vertex shader {:016X}", id,
+              vs.ucode_data_hash());
+  std::array<WGPUBindGroupLayout, 3> layout_array = {compute_shared_memory_layout_,
+                                                     constants_layout_, bindings_out->layout};
+  WebGPUDevice& device = command_processor_.device();
+  std::shared_ptr<AsyncCounters> stats = async_counters_;
+  std::string label = fmt::format("xe vs {:016X}:{:016X} memexport compute", key.hash, mod.value);
+  device.RunAsync([&device, &table, stats, id, wgsl, label, layout_array]() {
+    if (device.is_lost()) {
+      return;
+    }
+    WGPUDevice wgpu_device = device.device();
+    WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    layout_desc.bindGroupLayoutCount = layout_array.size();
+    layout_desc.bindGroupLayouts = layout_array.data();
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(wgpu_device, &layout_desc);
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = MakeStringView(*wgsl);
+    WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    module_desc.nextInChain = &source.chain;
+    module_desc.label = MakeStringView(label);
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(wgpu_device, &module_desc);
+    WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    desc.label = MakeStringView(label);
+    desc.layout = pipeline_layout;
+    desc.compute.module = module;
+    desc.compute.entryPoint = MakeStringView("main");
+    struct Context {
+      WebGPUPipelineTable* table;
+      std::shared_ptr<AsyncCounters> stats;
+      PipelineId id;
+      std::string label;
+    };
+    WGPUCreateComputePipelineAsyncCallbackInfo callback =
+        WGPU_CREATE_COMPUTE_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
+    callback.mode = WGPUCallbackMode_AllowSpontaneous;
+    callback.callback = [](WGPUCreatePipelineAsyncStatus status, WGPUComputePipeline pipeline,
+                           WGPUStringView message, void* userdata1, void*) {
+      std::unique_ptr<Context> context(static_cast<Context*>(userdata1));
+      if (status == WGPUCreatePipelineAsyncStatus_Success && pipeline) {
+        context->table->SetCompute(context->id, pipeline);
+        context->stats->pipelines_created.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        if (pipeline) {
+          wgpuComputePipelineRelease(pipeline);
+        }
+        context->stats->pipelines_failed.fetch_add(1, std::memory_order_relaxed);
+        REXGPU_ERROR("WebGPU: compute pipeline {} ({}) failed: {}", context->id, context->label,
+                     ToStringView(message));
+      }
+    };
+    callback.userdata1 = new Context{&table, stats, id, label};
+    wgpuDeviceCreateComputePipelineAsync(wgpu_device, &desc, callback);
+    if (pipeline_layout) {
+      wgpuPipelineLayoutRelease(pipeline_layout);
+    }
+    if (module) {
+      wgpuShaderModuleRelease(module);
+    }
+  });
+  return id;
 }
 
 PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& description) {
