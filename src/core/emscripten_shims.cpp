@@ -9,10 +9,10 @@
  * 1. rex::arch::ExceptionHandler: there are no signals on wasm (a trap is
  *    fatal, D7), so a host fault handler can never run. Install/Uninstall only
  *    log. MMIO is dispatched in software by the PPC_* macros instead.
- * 2. GNU pthread extensions used by threading_posix.cpp (bridge until WS-C's
- *    threading_web.cpp replaces it): Emscripten's libc declares
- *    pthread_setname_np / pthread_{get,set}affinity_np but does not define them.
- *    Weak, so a real libc definition wins.
+ *
+ * The GNU pthread extension shims (pthread_setname_np, pthread_{get,set}affinity_np)
+ * were removed for gate 2: threading_web.cpp replaced threading_posix.cpp on web
+ * and nothing else in the web link uses them.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -21,11 +21,7 @@
 #include <rex/platform.h>
 #if REX_PLATFORM_WEB
 
-#include <cerrno>
 #include <cstdio>
-
-#include <pthread.h>
-#include <sched.h>
 
 #include <rex/exception_handler.h>
 
@@ -45,21 +41,5 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
 }
 
 }  // namespace rex::arch
-
-extern "C" {
-
-__attribute__((weak)) int pthread_setname_np(pthread_t, const char*) {
-  return 0;  // thread names are cosmetic (debugger/profiler only)
-}
-
-__attribute__((weak)) int pthread_getaffinity_np(pthread_t, size_t, cpu_set_t*) {
-  return ENOSYS;  // browsers expose no CPU affinity
-}
-
-__attribute__((weak)) int pthread_setaffinity_np(pthread_t, size_t, const cpu_set_t*) {
-  return ENOSYS;
-}
-
-}  // extern "C"
 
 #endif  // REX_PLATFORM_WEB
