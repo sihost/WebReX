@@ -127,6 +127,10 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
     return last_update_render_pass_;
   }
   uint64_t last_update_render_pass_key() const { return last_update_render_pass_key_; }
+  // Attachment size of the last update's pass (all attachments of an update
+  // share pitch and MSAA, so one size), for viewport and scissor bounds.
+  uint32_t last_update_render_pass_width() const { return last_update_render_pass_width_; }
+  uint32_t last_update_render_pass_height() const { return last_update_render_pass_height_; }
 
   bool Resolve(memory::Memory& memory, WebGPUSharedMemory& shared_memory,
                WebGPUTextureCache& texture_cache, uint32_t& written_address_out,
@@ -225,6 +229,8 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
 
   WebGPUCommandStream::RenderPassDesc last_update_render_pass_;
   uint64_t last_update_render_pass_key_ = 0;
+  uint32_t last_update_render_pass_width_ = 0;
+  uint32_t last_update_render_pass_height_ = 0;
   // Attachments of the last update, to give a changed set a new pass key.
   RenderTarget* last_update_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   uint32_t attachments_generation_ = 0;

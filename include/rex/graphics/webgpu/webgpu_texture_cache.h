@@ -86,6 +86,8 @@ class WebGPUTextureCache final : public TextureCache {
   // (2d-array for 1D/2D, 3d, cube), or a null (zero) view of that dimension.
   WGPUTextureView GetActiveBindingOrNullView(uint32_t fetch_constant_index,
                                              xenos::FetchOpDimension dimension, bool is_signed);
+  // The null (zero) view of a binding dimension.
+  WGPUTextureView GetNullView(xenos::FetchOpDimension dimension) const;
   // Whether the active binding's host format can be linearly filtered (false: bind it as
   // unfilterable-float with a non-filtering sampler).
   bool IsActiveTextureFilterable(uint32_t fetch_constant_index, bool is_signed) const;

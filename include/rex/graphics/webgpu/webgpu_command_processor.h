@@ -7,8 +7,13 @@
  * executes PM4 (registers, fences, interrupts, swaps); this class turns draws,
  * resolves and swaps into stream commands:
  *  - IssueDraw: shader analysis, vertex/index buffer residency in the shared
- *    memory (uploads consume the web dirty map), then render targets (WP4) and
- *    the pipeline (WP2). While those are stubs the draw is dropped and counted.
+ *    memory (uploads consume the web dirty map), textures (WP5), render
+ *    targets (WP4), the pipeline (WP2), then the bind groups of the explicit
+ *    pipeline layout (WebGPUPipelineCache): shared memory, the 5 constant
+ *    buffers (system constants, VS/PS floats, bool/loop, fetch; written into
+ *    the stream constant arena when they changed, bound with dynamic offsets),
+ *    VS and PS textures + samplers; viewport, scissor, blend constant and
+ *    stencil reference. State already set in the open pass is not repeated.
  *  - IssueCopy: render target cache Resolve (WP4); the color clear value is
  *    remembered for the stub swap fill.
  *  - IssueSwap: refreshes the presenter's guest output texture through the
@@ -32,6 +37,8 @@
 #include <webgpu/webgpu.h>
 
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/primitive_processor.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/webgpu/webgpu_command_stream.h>
 #include <rex/graphics/webgpu/webgpu_submission_tracker.h>
 
@@ -96,6 +103,11 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint64_t swaps = 0;
     uint64_t draws = 0;
     uint64_t draws_dropped = 0;
+    // Draws with an empty viewport or scissor (nothing to rasterize).
+    uint64_t draws_culled = 0;
+    // Draws recorded with a pipeline and bind groups.
+    uint64_t draws_recorded = 0;
+    uint64_t constant_bytes = 0;
     uint64_t copies = 0;
     uint64_t submissions = 0;
   };
@@ -121,6 +133,18 @@ class WebGPUCommandProcessor : public CommandProcessor {
   // Device thread, recorded with CmdEncoderCallback by IssueSwap.
   static void EncodeSwap(void* user, WebGPUReplayState& state, WGPUCommandEncoder encoder);
   bool RequestVertexBuffers(const Shader& vertex_shader);
+  // Per-draw state of the bind groups (defined in the .cpp: holds the
+  // translator's SystemConstants).
+  struct DrawState;
+  // Updates the system constants for the draw; returns whether they changed.
+  bool UpdateSystemConstantValues(bool primitive_polygonal,
+                                  const PrimitiveProcessor::ProcessingResult& primitive_result,
+                                  const draw_util::ViewportInfo& viewport_info,
+                                  uint32_t used_texture_mask);
+  // Writes the constant buffers that changed (or weren't written into the
+  // current stream yet) and returns their dynamic offsets (binding order).
+  bool UpdateConstantBuffers(const Shader& vertex_shader, const Shader* pixel_shader,
+                             uint32_t* offsets_out);
 
   WebGPUGraphicsSystem* webgpu_graphics_system_;
   WebGPUDevice& device_;
@@ -136,6 +160,9 @@ class WebGPUCommandProcessor : public CommandProcessor {
 
   // Key of the render pass open in the current stream (0 = none / unkeyed).
   uint64_t open_render_pass_key_ = 0;
+  // Incremented whenever BeginRenderPass opens a pass (pass-local state).
+  uint64_t render_pass_serial_ = 0;
+  std::unique_ptr<DrawState> draw_state_;
 
   // Vertex fetch constants whose buffers were requested since the last swap or
   // fetch constant write (bit per vfetch slot, 96 slots).

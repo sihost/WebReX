@@ -181,21 +181,23 @@ if(REXGLUE_USE_WEBGPU)
     if(NOT REXGLUE_USE_VULKAN)
         target_link_libraries(rexgraphics PUBLIC rexspvbuilder)
     endif()
-    # SpirvToWgsl (libtint_web.a: Tint + src/graphics/webgpu/webgpu_shader_tint.cpp),
-    # built outside the SDK by thirdparty/tint (project tools/tint/build_web.bat).
-    # Without it the pipeline cache cannot convert shaders and drops draws.
-    set(REXGLUE_TINT_WEB_LIBRARY "${REXGLUE_ROOT}/out/tint-web/libtint_web.a"
-        CACHE FILEPATH "libtint_web.a (SpirvToWgsl) for the WebGPU backend")
-    if(EXISTS "${REXGLUE_TINT_WEB_LIBRARY}")
-        message(STATUS "WebGPU: SpirvToWgsl from ${REXGLUE_TINT_WEB_LIBRARY}")
+    # SpirvToWgsl (libtint_web.a: Tint + src/graphics/webgpu/webgpu_shader_tint.cpp):
+    # built from thirdparty/tint by default, or a prebuilt REXGLUE_TINT_WEB_LIBRARY
+    # (cmake/rexglue_tint.cmake). Without it the pipeline cache cannot convert
+    # shaders and drops draws.
+    include("${REXGLUE_ROOT}/cmake/rexglue_tint.cmake")
+    if(REXGLUE_TINT_WEB_LIB)
         target_compile_definitions(rexgraphics PRIVATE REX_WEBGPU_HAS_TINT=1)
         # Installed next to the SDK libraries as librex_tint_web.a (rexglue_install.cmake).
         target_link_libraries(rexgraphics PUBLIC
-            $<BUILD_INTERFACE:${REXGLUE_TINT_WEB_LIBRARY}>
+            $<BUILD_INTERFACE:${REXGLUE_TINT_WEB_LIB}>
             $<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/librex_tint_web.a>)
+        if(TARGET rex_tint_web_build)
+            add_dependencies(rexgraphics rex_tint_web_build)
+        endif()
     else()
-        message(WARNING "WebGPU: no libtint_web.a at ${REXGLUE_TINT_WEB_LIBRARY} "
-            "(REXGLUE_TINT_WEB_LIBRARY); shaders are not converted, draws are dropped")
+        message(WARNING "WebGPU: no libtint_web.a (no thirdparty/dawn checkout and no "
+            "REXGLUE_TINT_WEB_LIBRARY); shaders are not converted, draws are dropped")
     endif()
 endif()
 

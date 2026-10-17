@@ -8,6 +8,7 @@
 
 #include <rex/graphics/webgpu/webgpu_pipeline_cache.h>
 
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -34,11 +35,9 @@
 #include <rex/filesystem/web_storage.h>
 #endif
 
-REXCVAR_DEFINE_BOOL(webgpu_draw_with_pipelines, false, "GPU",
-                    "WebGPU: record draws with the translated pipelines. Off until the command "
-                    "processor binds the shader resources (constants, shared memory, textures): "
-                    "pipelines are still translated, stored and created, but draws are dropped "
-                    "so streams stay valid");
+REXCVAR_DEFINE_BOOL(webgpu_draw_with_pipelines, true, "GPU",
+                    "WebGPU: record draws with the translated pipelines (diagnostics: false still "
+                    "translates, stores and creates the pipelines, but drops every draw)");
 
 namespace rex::graphics::webgpu {
 
@@ -246,6 +245,47 @@ bool WebGPUPipelineCache::Initialize() {
   translator_ = std::make_unique<SpirvShaderTranslator>(
       features, WebGPURenderTargetCache::IsMsaa2xSupported(),
       WebGPURenderTargetCache::IsMsaa2xSupported(), false);
+
+  // Shared bind group layouts (see the header).
+  uint32_t shared_memory_bindings =
+      command_processor_.shared_memory() ? command_processor_.shared_memory()->binding_count() : 1;
+  device.RunSync([&]() {
+    WGPUDevice d = device.device();
+    std::vector<WGPUBindGroupLayoutEntry> entries;
+    for (uint32_t i = 0; i < shared_memory_bindings; ++i) {
+      WGPUBindGroupLayoutEntry& entry = entries.emplace_back();
+      entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = i;
+      entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+      entry.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    }
+    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    desc.label = MakeStringView("xe shared memory");
+    desc.entryCount = entries.size();
+    desc.entries = entries.data();
+    shared_memory_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
+    entries.clear();
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+      WGPUBindGroupLayoutEntry& entry = entries.emplace_back();
+      entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = i;
+      entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+      entry.buffer.type = WGPUBufferBindingType_Uniform;
+      entry.buffer.hasDynamicOffset = WGPU_TRUE;
+    }
+    desc.label = MakeStringView("xe constants");
+    desc.entryCount = entries.size();
+    desc.entries = entries.data();
+    constants_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
+    desc.label = MakeStringView("xe no textures");
+    desc.entryCount = 0;
+    desc.entries = nullptr;
+    empty_layout_ = wgpuDeviceCreateBindGroupLayout(d, &desc);
+  });
+  if (!shared_memory_layout_ || !constants_layout_ || !empty_layout_) {
+    REXGPU_ERROR("WebGPU pipeline cache: creating the bind group layouts failed");
+    return false;
+  }
   if (!kHasTint) {
     REXGPU_WARN(
         "WebGPU pipeline cache: built without libtint_web.a, shaders are not converted and "
@@ -261,6 +301,137 @@ bool WebGPUPipelineCache::Initialize() {
 void WebGPUPipelineCache::Shutdown() {
   ClearCache();
   translator_.reset();
+  std::vector<WGPUBindGroupLayout> layouts;
+  for (auto& layout : texture_layouts_) {
+    layouts.push_back(layout.second);
+  }
+  texture_layouts_.clear();
+  for (WGPUBindGroupLayout* layout : {&shared_memory_layout_, &constants_layout_, &empty_layout_}) {
+    if (*layout) {
+      layouts.push_back(*layout);
+      *layout = nullptr;
+    }
+  }
+  if (!layouts.empty()) {
+    // Pipelines and bind groups keep their layouts alive on their own.
+    command_processor_.device().RunSync([&layouts]() {
+      for (WGPUBindGroupLayout layout : layouts) {
+        wgpuBindGroupLayoutRelease(layout);
+      }
+    });
+  }
+}
+
+uint32_t WebGPUPipelineCache::system_constants_binding_size() {
+  return uint32_t(sizeof(SpirvShaderTranslator::SystemConstants));
+}
+
+const WebGPUShaderBindings* WebGPUPipelineCache::GetShaderBindings(Shader& shader,
+                                                                   uint64_t modification) {
+  auto it = shader_bindings_.find(shader.ucode_data_hash());
+  if (it != shader_bindings_.end()) {
+    return it->second.get();
+  }
+  // SpirvShader gathers the bindings in the translation of any modification;
+  // with WGSL from the storage nothing may have been translated yet.
+  AnalyzeShaderUcode(shader);
+  Shader::Translation* translation = shader.GetOrCreateTranslation(modification);
+  if (!translation->is_translated()) {
+    translator_->TranslateAnalyzedShader(*translation);
+  }
+  bool vertex = shader.type() == xenos::ShaderType::kVertex;
+  std::unique_ptr<WebGPUShaderBindings> bindings;
+  if (translation->is_valid()) {
+    const auto& spirv_shader = static_cast<const SpirvShader&>(shader);
+    bindings = std::make_unique<WebGPUShaderBindings>();
+    for (const SpirvShader::TextureBinding& t : spirv_shader.GetTextureBindingsAfterTranslation()) {
+      bindings->textures.push_back({t.fetch_constant, t.dimension, t.is_signed != 0});
+    }
+    for (const SpirvShader::SamplerBinding& s : spirv_shader.GetSamplerBindingsAfterTranslation()) {
+      bindings->samplers.push_back(
+          {s.fetch_constant, s.mag_filter, s.min_filter, s.mip_filter, s.aniso_filter});
+    }
+    const WGPULimits& limits = command_processor_.device().limits();
+    if (bindings->textures.size() > limits.maxSampledTexturesPerShaderStage ||
+        bindings->samplers.size() > limits.maxSamplersPerShaderStage) {
+      // docs/port/webgpu.md section 9: fail the shader and log it.
+      REXGPU_ERROR(
+          "WebGPU: {} shader {:016X} uses {} textures and {} samplers, over the device limits "
+          "({} / {}); its draws are dropped",
+          vertex ? "vertex" : "pixel", shader.ucode_data_hash(), bindings->textures.size(),
+          bindings->samplers.size(), limits.maxSampledTexturesPerShaderStage,
+          limits.maxSamplersPerShaderStage);
+      bindings.reset();
+    } else {
+      bindings->layout = GetTextureLayout(vertex, *bindings);
+      if (!bindings->layout) {
+        bindings.reset();
+      }
+    }
+  }
+  const WebGPUShaderBindings* result = bindings.get();
+  shader_bindings_.emplace(shader.ucode_data_hash(), std::move(bindings));
+  return result;
+}
+
+WGPUBindGroupLayout WebGPUPipelineCache::GetTextureLayout(bool vertex,
+                                                          const WebGPUShaderBindings& bindings) {
+  if (bindings.textures.empty() && bindings.samplers.empty()) {
+    return empty_layout_;
+  }
+  std::string key(1, vertex ? 'v' : 'p');
+  for (const WebGPUShaderBindings::Texture& texture : bindings.textures) {
+    key.push_back(char('0' + uint32_t(texture.dimension)));
+  }
+  key += fmt::format(":{}", bindings.samplers.size());
+  auto it = texture_layouts_.find(key);
+  if (it != texture_layouts_.end()) {
+    return it->second;
+  }
+  WGPUBindGroupLayout layout = nullptr;
+  WebGPUDevice& device = command_processor_.device();
+  device.RunSync([&]() {
+    WGPUShaderStage stage = vertex ? WGPUShaderStage_Vertex : WGPUShaderStage_Fragment;
+    std::vector<WGPUBindGroupLayoutEntry> entries;
+    uint32_t binding = 0;
+    for (const WebGPUShaderBindings::Texture& texture : bindings.textures) {
+      WGPUBindGroupLayoutEntry& entry = entries.emplace_back();
+      entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = binding++;
+      entry.visibility = stage;
+      entry.texture.sampleType = WGPUTextureSampleType_Float;
+      switch (texture.dimension) {
+        case xenos::FetchOpDimension::k3DOrStacked:
+          entry.texture.viewDimension = WGPUTextureViewDimension_3D;
+          break;
+        case xenos::FetchOpDimension::kCube:
+          entry.texture.viewDimension = WGPUTextureViewDimension_Cube;
+          break;
+        default:
+          entry.texture.viewDimension = WGPUTextureViewDimension_2DArray;
+          break;
+      }
+    }
+    for (size_t i = 0; i < bindings.samplers.size(); ++i) {
+      WGPUBindGroupLayoutEntry& entry = entries.emplace_back();
+      entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = binding++;
+      entry.visibility = stage;
+      entry.sampler.type = WGPUSamplerBindingType_Filtering;
+    }
+    std::string label = "xe textures " + key;
+    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    desc.label = MakeStringView(label);
+    desc.entryCount = entries.size();
+    desc.entries = entries.data();
+    layout = wgpuDeviceCreateBindGroupLayout(device.device(), &desc);
+  });
+  if (!layout) {
+    REXGPU_ERROR("WebGPU: creating the texture bind group layout {} failed", key);
+    return nullptr;
+  }
+  texture_layouts_.emplace(std::move(key), layout);
+  return layout;
 }
 
 void WebGPUPipelineCache::ClearCache() {
@@ -269,6 +440,7 @@ void WebGPUPipelineCache::ClearCache() {
   pipelines_.clear();
   wgsl_.clear();
   depth_only_wgsl_.clear();
+  shader_bindings_.clear();
   shaders_.clear();
 }
 
@@ -424,8 +596,10 @@ std::shared_ptr<const std::string> WebGPUPipelineCache::GetDepthOnlyFragmentWgsl
 }
 
 bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state,
-                                            PipelineId& pipeline_out) {
+                                            PipelineId& pipeline_out,
+                                            WebGPUDrawBindings& bindings_out) {
   pipeline_out = kInvalidPipelineId;
+  bindings_out = {};
   if (!kHasTint || !state.vertex_shader || !translator_) {
     return false;
   }
@@ -481,6 +655,11 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
   vs_mod.vertex.vertex_kill_and = 0;
   desc.vertex_shader_hash = vs.ucode_data_hash();
   desc.vertex_shader_modification = vs_mod.value;
+  bindings_out.vertex = GetShaderBindings(vs, vs_mod.value);
+  if (!bindings_out.vertex) {
+    ++statistics_.draws_unsupported;
+    return false;
+  }
 
   // Pixel shader modification.
   RenderPassFormatKey pass_key = WebGPURenderTargetCache::GetRenderPassFormatKey(state.render_pass_key);
@@ -510,6 +689,18 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
             : DepthStencilMode::kNoModifiers;
     desc.pixel_shader_hash = ps.ucode_data_hash();
     desc.pixel_shader_modification = ps_mod.value;
+    if (ps.memexport_eM_written()) {
+      // The translated PS declares the shared memory read_write, which can't
+      // share group 0 with the read-only VS binding (and the shared memory is
+      // also the index buffer of the pass). TODO: a separate layout + pass.
+      ++statistics_.draws_unsupported;
+      return false;
+    }
+    bindings_out.pixel = GetShaderBindings(ps, ps_mod.value);
+    if (!bindings_out.pixel) {
+      ++statistics_.draws_unsupported;
+      return false;
+    }
   }
 
   // Render pass formats and output state.
@@ -572,7 +763,7 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
 
   pipeline_out = GetOrCreate(desc);
   if (!REXCVAR_GET(webgpu_draw_with_pipelines)) {
-    // The CP doesn't set bind groups yet; a draw would invalidate the stream.
+    // Diagnostics: pipelines are created, draws are dropped.
     pipeline_out = kInvalidPipelineId;
     return false;
   }
@@ -625,16 +816,37 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
         statistics_.wgsl_translated, statistics_.wgsl_failures, statistics_.wgsl_memory_hits);
   }
 
+  // Explicit layout (see the header); ConfigurePipeline has looked up the
+  // bindings of both shaders.
+  WGPUBindGroupLayout layouts[4] = {shared_memory_layout_, constants_layout_, empty_layout_,
+                                    empty_layout_};
+  auto vs_bindings_it = shader_bindings_.find(d.vertex_shader_hash);
+  if (vs_bindings_it != shader_bindings_.end() && vs_bindings_it->second) {
+    layouts[2] = vs_bindings_it->second->layout;
+  }
+  if (d.pixel_shader_hash || d.pixel_shader_modification) {
+    auto ps_bindings_it = shader_bindings_.find(d.pixel_shader_hash);
+    if (ps_bindings_it != shader_bindings_.end() && ps_bindings_it->second) {
+      layouts[3] = ps_bindings_it->second->layout;
+    }
+  }
+
   WebGPUDevice& device = command_processor_.device();
   std::shared_ptr<AsyncCounters> stats = async_counters_;
   std::string label =
       fmt::format("xe vs {:016X}:{:016X} ps {:016X}:{:016X}", d.vertex_shader_hash,
                   d.vertex_shader_modification, d.pixel_shader_hash, d.pixel_shader_modification);
-  device.RunAsync([&device, &table, stats, id, d, vs_wgsl, ps_wgsl, label]() {
+  std::array<WGPUBindGroupLayout, 4> layout_array = {layouts[0], layouts[1], layouts[2],
+                                                     layouts[3]};
+  device.RunAsync([&device, &table, stats, id, d, vs_wgsl, ps_wgsl, label, layout_array]() {
     if (device.is_lost()) {
       return;
     }
     WGPUDevice wgpu_device = device.device();
+    WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    layout_desc.bindGroupLayoutCount = layout_array.size();
+    layout_desc.bindGroupLayouts = layout_array.data();
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(wgpu_device, &layout_desc);
     auto create_module = [&](const std::string& code, const char* stage) {
       WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
       source.code = MakeStringView(code);
@@ -651,7 +863,7 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     key.key = d.render_pass_format_key;
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = MakeStringView(label);
-    desc.layout = nullptr;  // "auto"
+    desc.layout = pipeline_layout;
     desc.vertex.module = vs_module;
     desc.vertex.entryPoint = MakeStringView("main");
     desc.primitive.topology = WGPUPrimitiveTopology(d.primitive_topology);
@@ -659,7 +871,8 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     desc.primitive.cullMode = WGPUCullMode(d.cull_mode);
     desc.primitive.frontFace = d.front_face_cw ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
     desc.multisample.count = d.sample_count ? d.sample_count : 1;
-    desc.multisample.mask = 0xFFFFFFFFu;
+    // Guest 2x is host 4x with samples 0 and 3 (WebGPURenderTargetCache).
+    desc.multisample.mask = key.msaa_samples == xenos::MsaaSamples::k2X ? 0b1001u : 0xFFFFFFFFu;
     desc.multisample.alphaToCoverageEnabled = d.alpha_to_coverage != 0;
 
     WGPUDepthStencilState depth_stencil = WGPU_DEPTH_STENCIL_STATE_INIT;
@@ -755,6 +968,9 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     };
     callback.userdata1 = new Context{&table, stats, id, label};
     wgpuDeviceCreateRenderPipelineAsync(wgpu_device, &desc, callback);
+    if (pipeline_layout) {
+      wgpuPipelineLayoutRelease(pipeline_layout);
+    }
     wgpuShaderModuleRelease(vs_module);
     if (ps_module) {
       wgpuShaderModuleRelease(ps_module);

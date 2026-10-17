@@ -47,8 +47,9 @@ if(TARGET rexspvbuilder)
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
     )
 endif()
-if(REXGLUE_USE_WEBGPU AND REXGLUE_TINT_WEB_LIBRARY AND EXISTS "${REXGLUE_TINT_WEB_LIBRARY}")
-    install(FILES "${REXGLUE_TINT_WEB_LIBRARY}"
+if(REXGLUE_USE_WEBGPU AND REXGLUE_TINT_WEB_LIB)
+    # Prebuilt, or built by rex_tint_web_build (cmake/rexglue_tint.cmake).
+    install(FILES "${REXGLUE_TINT_WEB_LIB}"
         DESTINATION ${CMAKE_INSTALL_LIBDIR} RENAME librex_tint_web.a)
 endif()
 

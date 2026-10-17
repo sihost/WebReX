@@ -339,6 +339,15 @@ bool WebGPURenderTargetCache::Update(bool is_rasterization_done,
   RenderPassFormatKey format_key;
   format_key.msaa_samples = rb_surface_info.msaa_samples;
   WebGPUCommandStream::RenderPassDesc desc;
+  uint32_t pass_width = UINT32_MAX, pass_height = UINT32_MAX;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (render_targets[i]) {
+      const WebGPUEdramSurface& surface =
+          static_cast<WebGPURenderTarget*>(render_targets[i])->surface();
+      pass_width = std::min(pass_width, surface.width);
+      pass_height = std::min(pass_height, surface.height);
+    }
+  }
   if (render_targets[0]) {
     auto* depth = static_cast<WebGPURenderTarget*>(render_targets[0]);
     format_key.depth_and_color_used |= 1;
@@ -392,6 +401,8 @@ bool WebGPURenderTargetCache::Update(bool is_rasterization_done,
   }
   last_update_render_pass_ = desc;
   last_update_render_pass_key_ = (uint64_t(attachments_generation_) << 32) | format_key.key;
+  last_update_render_pass_width_ = pass_width;
+  last_update_render_pass_height_ = pass_height;
   return true;
 }
 

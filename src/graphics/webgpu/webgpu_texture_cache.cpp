@@ -300,9 +300,10 @@ WGPUTextureView WebGPUTextureCache::GetActiveBindingOrNullView(uint32_t fetch_co
     const WebGPUTextureBinding& webgpu_binding = webgpu_bindings_[fetch_constant_index];
     view = is_signed ? webgpu_binding.view_signed : webgpu_binding.view_unsigned;
   }
-  if (view) {
-    return view;
-  }
+  return view ? view : GetNullView(dimension);
+}
+
+WGPUTextureView WebGPUTextureCache::GetNullView(xenos::FetchOpDimension dimension) const {
   switch (dimension) {
     case xenos::FetchOpDimension::k3DOrStacked:
       return null_view_3d_;
