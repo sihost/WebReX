@@ -243,6 +243,7 @@ class CommandProcessor {
                       const IndexBufferInfo* index_buffer_info);
   uint32_t draw_dump_counter_ = UINT32_MAX;
   uint32_t draw_dump_index_ = 0;
+  uint32_t draw_dump_swap_index_ = 0;
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

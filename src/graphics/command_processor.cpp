@@ -27,6 +27,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -1097,6 +1098,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
+  ++draw_dump_swap_index_;
   return true;
 }
 
@@ -1551,14 +1553,16 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
 void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       const IndexBufferInfo* index_buffer_info) {
+  // Swaps (XE_SWAP packets) seen, not counter_ (that also counts vblanks).
+  const uint32_t swap = draw_dump_swap_index_;
   int32_t first_swap = REXCVAR_GET(gpu_draw_dump_swap);
-  if (first_swap < 0 || counter_ < uint32_t(first_swap) ||
-      counter_ - uint32_t(first_swap) >=
+  if (first_swap < 0 || swap < uint32_t(first_swap) ||
+      swap - uint32_t(first_swap) >=
           uint32_t(std::max(REXCVAR_GET(gpu_draw_dump_swaps), int32_t(1)))) {
     return;
   }
-  if (draw_dump_counter_ != counter_) {
-    draw_dump_counter_ = counter_;
+  if (draw_dump_counter_ != swap) {
+    draw_dump_counter_ = swap;
     draw_dump_index_ = 0;
   }
   uint32_t draw_index = draw_dump_index_++;
@@ -1572,7 +1576,7 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
   const Shader* ps = active_pixel_shader_;
   std::string line;
   auto out = std::back_inserter(line);
-  fmt::format_to(out, "DRAWDUMP s={} d={} vs={:016X} ps={:016X} prim={} n={}", counter_,
+  fmt::format_to(out, "DRAWDUMP s={} d={} vs={:016X} ps={:016X} prim={} n={}", swap,
                  draw_index, vs ? vs->ucode_data_hash() : 0, ps ? ps->ucode_data_hash() : 0,
                  uint32_t(prim_type), index_count);
   if (index_buffer_info) {
@@ -1625,6 +1629,139 @@ void CommandProcessor::DumpDrawInputs(xenos::PrimitiveType prim_type, uint32_t i
                  hash_floats(ps, XE_GPU_REG_SHADER_CONSTANT_256_X),
                  XXH3_64bits(&regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                              (8 + 32) * sizeof(uint32_t)));
+  // The values of the first used constants (cN:x,y,z,w;...), VS then PS.
+  auto print_floats = [&](const char* name, const Shader* shader, uint32_t first_register,
+                          uint32_t max_constants) {
+    if (!shader || !shader->is_ucode_analyzed()) {
+      return;
+    }
+    fmt::format_to(out, " {}=", name);
+    const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+    uint32_t printed = 0;
+    for (uint32_t i = 0; i < 4 && printed < max_constants; ++i) {
+      uint64_t bits = map.float_bitmap[i];
+      uint32_t index;
+      while (printed < max_constants && rex::bit_scan_forward(bits, &index)) {
+        bits &= ~(UINT64_C(1) << index);
+        uint32_t reg = first_register + (i << 8) + (index << 2);
+        fmt::format_to(out, "{}c{}:{:.5g},{:.5g},{:.5g},{:.5g}", printed ? ";" : "",
+                       (i << 6) + index, regs.Get<float>(reg), regs.Get<float>(reg + 1),
+                       regs.Get<float>(reg + 2), regs.Get<float>(reg + 3));
+        ++printed;
+      }
+    }
+  };
+  print_floats("cvf", vs, XE_GPU_REG_SHADER_CONSTANT_000_X, 12);
+  print_floats("cpf", ps, XE_GPU_REG_SHADER_CONSTANT_256_X, 6);
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+    // Resolve: an 8x6 grid of destination texels in guest memory order (only
+    // meaningful with resolve readback: --readback_resolve=full natively,
+    // --webgpu_readback_resolve on web).
+    auto dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+    auto dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+    uint32_t dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF;
+    const FormatInfo* format_info = FormatInfo::Get(
+        uint32_t(ColorFormatToTextureFormat(dest_info.copy_dest_format)));
+    uint32_t bytes = format_info ? std::max(format_info->bytes_per_block(), UINT32_C(1)) : 4;
+    uint32_t bytes_log2 = bytes >= 16 ? 4 : bytes >= 8 ? 3 : bytes >= 4 ? 2 : bytes >= 2 ? 1 : 0;
+    uint32_t pitch = dest_pitch.copy_dest_pitch, height = dest_pitch.copy_dest_height;
+    fmt::format_to(out, " | rs ctl={:08X} info={:08X} pitch={}x{} base={:08X} lum=",
+                   regs[XE_GPU_REG_RB_COPY_CONTROL], dest_info.value, pitch, height, dest_base);
+    if (pitch && height && !dest_info.copy_dest_array) {
+      // 16x9 cells, each the mean brightness (0..255, HDR values x/(1+x)) of
+      // 4x4 texels spread over the cell, decoded from the destination format
+      // and endianness (two hex digits per cell, row-major).
+      uint32_t pitch_aligned = (pitch + 31) & ~UINT32_C(31);
+      xenos::Endian128 endian = dest_info.copy_dest_endian;
+      auto load32 = [&](const uint8_t* p) -> uint32_t {
+        uint32_t v = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+                     (uint32_t(p[3]) << 24);
+        switch (endian) {
+          case xenos::Endian128::k8in16:
+            return ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
+          case xenos::Endian128::k8in32:
+            return rex::byte_swap(v);
+          case xenos::Endian128::k16in32:
+            return (v << 16) | (v >> 16);
+          default:
+            return v;
+        }
+      };
+      auto half = [](uint32_t h) -> float {
+        uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF;
+        float f = e ? std::ldexp(1.0f + float(m) / 1024.0f, int(e) - 15)
+                    : std::ldexp(float(m), -24);
+        return (h & 0x8000) ? -f : f;
+      };
+      auto tone = [](float x) -> float {
+        x = std::isfinite(x) ? std::max(x, 0.0f) : 0.0f;
+        return 255.0f * x / (1.0f + x);
+      };
+      auto brightness = [&](const uint8_t* p) -> float {
+        switch (dest_info.copy_dest_format) {
+          case xenos::ColorFormat::k_8_8_8_8:
+          case xenos::ColorFormat::k_8_8_8_8_A:
+          case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16: {
+            uint32_t v = load32(p);
+            return float((v & 0xFF) + ((v >> 8) & 0xFF) + ((v >> 16) & 0xFF)) / 3.0f;
+          }
+          case xenos::ColorFormat::k_2_10_10_10:
+          case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16: {
+            uint32_t v = load32(p);
+            return float((v & 0x3FF) + ((v >> 10) & 0x3FF) + ((v >> 20) & 0x3FF)) / 12.0f;
+          }
+          case xenos::ColorFormat::k_16_16_FLOAT: {
+            uint32_t v = load32(p);
+            return tone((half(v & 0xFFFF) + half(v >> 16)) * 0.5f);
+          }
+          case xenos::ColorFormat::k_16_16_16_16_FLOAT: {
+            // 64bpp: the swap is per 32 bits here (k8in64 would also swap the words).
+            uint32_t v0 = load32(p), v1 = load32(p + 4);
+            if (endian == xenos::Endian128::k8in64) {
+              std::swap(v0, v1);
+              v0 = rex::byte_swap(uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+                                  (uint32_t(p[3]) << 24));
+              v1 = rex::byte_swap(uint32_t(p[4]) | (uint32_t(p[5]) << 8) | (uint32_t(p[6]) << 16) |
+                                  (uint32_t(p[7]) << 24));
+              std::swap(v0, v1);
+            }
+            return tone((half(v0 & 0xFFFF) + half(v0 >> 16) + half(v1 & 0xFFFF)) / 3.0f);
+          }
+          case xenos::ColorFormat::k_32_FLOAT: {
+            uint32_t v = load32(p);
+            float f;
+            std::memcpy(&f, &v, sizeof(f));
+            return tone(f);
+          }
+          case xenos::ColorFormat::k_8:
+            return float(p[0]);
+          case xenos::ColorFormat::k_8_8:
+            return float(p[0] + p[1]) * 0.5f;
+          default: {
+            uint32_t v = load32(p);
+            return float((v & 0xFF) + ((v >> 8) & 0xFF) + ((v >> 16) & 0xFF)) / 3.0f;
+          }
+        }
+      };
+      for (uint32_t gy = 0; gy < 9; ++gy) {
+        for (uint32_t gx = 0; gx < 16; ++gx) {
+          float sum = 0.0f;
+          for (uint32_t sy = 0; sy < 4; ++sy) {
+            for (uint32_t sx = 0; sx < 4; ++sx) {
+              uint32_t x = (gx * 4 + sx) * pitch / 64 + pitch / 128;
+              uint32_t y = (gy * 4 + sy) * height / 36 + height / 72;
+              int32_t offset = texture_util::GetTiledOffset2D(int32_t(x), int32_t(y),
+                                                              pitch_aligned, bytes_log2);
+              sum += brightness(memory_->TranslatePhysical<const uint8_t*>(
+                  (dest_base + uint32_t(offset)) & 0x1FFFFFFF));
+            }
+          }
+          fmt::format_to(out, "{:02X}",
+                         uint32_t(std::min(std::max(sum / 16.0f, 0.0f), 255.0f)));
+        }
+      }
+    }
+  }
   if (vs && vs->is_ucode_analyzed()) {
     for (const Shader::VertexBinding& binding : vs->vertex_bindings()) {
       xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(binding.fetch_constant);
