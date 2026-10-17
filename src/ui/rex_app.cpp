@@ -27,6 +27,9 @@
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
+#if REX_PLATFORM_WEB
+#include <rex/graphics/null/graphics_system.h>
+#endif
 #include <rex/audio/audio_system.h>
 #if REX_PLATFORM_WEB
 #include <rex/audio/nop/nop_audio_system.h>
@@ -134,6 +137,11 @@ bool ReXApp::OnInitialize() {
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
 #elif REX_HAS_VULKAN
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
+#elif REX_PLATFORM_WEB
+  // STUB: no rendering WebGPU backend yet (WS-D). The kernel's Vd* exports and
+  // the guest's GPU synchronization need a GraphicsSystem, so the null backend
+  // executes the command stream without drawing; see docs/port/STUBS.md.
+  config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::null::NullGraphicsSystem);
 #endif
 #if REX_PLATFORM_WEB
   // STUB: no browser audio driver yet (WS-E); see docs/port/STUBS.md.

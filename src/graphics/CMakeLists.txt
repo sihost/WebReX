@@ -32,6 +32,9 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
+    # Null backend: PM4 executes, nothing is rendered (Xenia gpu=null).
+    null/graphics_system.cpp
+    null/command_processor.cpp
 )
 
 # SPIR-V shader translation
