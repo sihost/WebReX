@@ -418,6 +418,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // Whether OpSwitch case fallthrough may be emitted for guest control flow
+    // labels (always on Vulkan). False for consumers without it, like Tint's
+    // SPIR-V reader for WebGPU (WGSL switch cases never fall through): a label
+    // is then reached through the next iteration of the main loop.
+    bool switch_fallthrough;
+
+    // Whether storage buffers may be declared as descriptor arrays (always on
+    // Vulkan). False for WGSL, which has no arrays of storage buffers: when the
+    // shared memory needs multiple bindings (max_storage_buffer_range below
+    // 512 MB), they become separate variables at bindings 0...count-1.
+    bool storage_buffer_arrays;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -677,6 +689,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Perform endian swap of a uint4 vector.
   spv::Id EndianSwap128Uint4(spv::Id value, spv::Id endian);
 
+  // OpSelect with a scalar bool condition. A scalar condition for a vector
+  // result needs SPIR-V 1.4; before that the condition is smeared to a vector.
+  spv::Id SelectWithScalarCondition(spv::Id type, spv::Id condition, spv::Id true_value,
+                                    spv::Id false_value);
+
   spv::Id LoadUint32FromSharedMemory(spv::Id address_dwords_int);
   // If `replace_mask` is provided, the bits specified in the mask will be
   // replaced with those from the value via OpAtomicAnd/Or.
@@ -905,6 +922,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id uniform_fetch_constants_;
 
   spv::Id buffers_shared_memory_;
+  // Without features_.storage_buffer_arrays and with multiple shared memory
+  // bindings: one variable per binding (buffers_shared_memory_ is NoResult).
+  spv::Id buffers_shared_memory_bindings_[4];
   spv::Id buffer_edram_;
 
   // Not using combined images and samplers because

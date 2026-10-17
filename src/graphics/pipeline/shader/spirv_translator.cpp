@@ -42,7 +42,9 @@ SpirvShaderTranslator::Features::Features(bool all)
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
-      sample_rate_shading(all) {}
+      sample_rate_shading(all),
+      switch_fallthrough(all),
+      storage_buffer_arrays(all) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -59,7 +61,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
-      sample_rate_shading(vulkan_device->properties().sampleRateShading) {
+      sample_rate_shading(vulkan_device->properties().sampleRateShading),
+      switch_fallthrough(true),
+      storage_buffer_arrays(true) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -439,20 +443,41 @@ void SpirvShaderTranslator::StartTranslation() {
                                                     ? spv::DecorationBlock
                                                     : spv::DecorationBufferBlock);
     unsigned int shared_memory_binding_count = 1 << GetSharedMemoryStorageBufferCountLog2();
-    if (shared_memory_binding_count > 1) {
-      type_shared_memory = builder_->makeArrayType(
-          type_shared_memory, builder_->makeUintConstant(shared_memory_binding_count), 0);
-    }
-    buffers_shared_memory_ = builder_->createVariable(spv::NoPrecision,
-                                                      features_.spirv_version >= spv::Spv_1_3
-                                                          ? spv::StorageClassStorageBuffer
-                                                          : spv::StorageClassUniform,
-                                                      type_shared_memory, "xe_shared_memory");
-    builder_->addDecoration(buffers_shared_memory_, spv::DecorationDescriptorSet,
-                            int(kDescriptorSetSharedMemoryAndEdram));
-    builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
-    if (features_.spirv_version >= spv::Spv_1_4) {
-      main_interface_.push_back(buffers_shared_memory_);
+    spv::StorageClass shared_memory_storage_class = features_.spirv_version >= spv::Spv_1_3
+                                                        ? spv::StorageClassStorageBuffer
+                                                        : spv::StorageClassUniform;
+    std::fill(std::begin(buffers_shared_memory_bindings_),
+              std::end(buffers_shared_memory_bindings_), spv::NoResult);
+    if (shared_memory_binding_count > 1 && !features_.storage_buffer_arrays) {
+      // No descriptor arrays (WGSL): one variable per binding, bindings
+      // 0...count-1.
+      buffers_shared_memory_ = spv::NoResult;
+      for (unsigned int i = 0; i < shared_memory_binding_count; ++i) {
+        spv::Id binding_variable = builder_->createVariable(
+            spv::NoPrecision, shared_memory_storage_class, type_shared_memory,
+            fmt::format("xe_shared_memory_{}", i).c_str());
+        builder_->addDecoration(binding_variable, spv::DecorationDescriptorSet,
+                                int(kDescriptorSetSharedMemoryAndEdram));
+        builder_->addDecoration(binding_variable, spv::DecorationBinding, int(i));
+        if (features_.spirv_version >= spv::Spv_1_4) {
+          main_interface_.push_back(binding_variable);
+        }
+        buffers_shared_memory_bindings_[i] = binding_variable;
+      }
+    } else {
+      if (shared_memory_binding_count > 1) {
+        type_shared_memory = builder_->makeArrayType(
+            type_shared_memory, builder_->makeUintConstant(shared_memory_binding_count), 0);
+      }
+      buffers_shared_memory_ =
+          builder_->createVariable(spv::NoPrecision, shared_memory_storage_class,
+                                   type_shared_memory, "xe_shared_memory");
+      builder_->addDecoration(buffers_shared_memory_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(buffers_shared_memory_);
+      }
     }
   }
 
@@ -518,8 +543,17 @@ void SpirvShaderTranslator::StartTranslation() {
       var_main_rectangle_guest_vertex_index_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
+      // A copy of the gl_PerVertex members without the BuiltIn decorations,
+      // which are only allowed on Input / Output variables.
+      std::vector<spv::Id> rectangle_per_vertex_members;
+      for (uint32_t i = 0; i < output_per_vertex_member_count_; ++i) {
+        rectangle_per_vertex_members.push_back(
+            builder_->getContainedTypeId(type_output_per_vertex_, int(i)));
+      }
+      spv::Id type_rectangle_per_vertex =
+          builder_->makeStructType(rectangle_per_vertex_members, "XeRectanglePerVertex");
       spv::Id type_rectangle_per_vertex_array =
-          builder_->makeArrayType(type_output_per_vertex_, builder_->makeUintConstant(3), 0);
+          builder_->makeArrayType(type_rectangle_per_vertex, builder_->makeUintConstant(3), 0);
       var_main_rectangle_per_vertex_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                    type_rectangle_per_vertex_array, "xe_var_rectangle_per_vertex");
@@ -660,20 +694,28 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // not hitting any switch case and reaching the final break in the body).
     function_main_->addBlock(main_loop_continue_);
     builder_->setBuildPoint(main_loop_continue_);
+    // The rectangle vertex loop below adds one more continue edge (with its
+    // OpPhi operands) after this point; they are appended to the OpPhi then.
+    spv::Instruction* main_loop_pc_next_phi = nullptr;
+    size_t main_loop_pc_next_phi_operand_count = 0;
     if (has_main_switch) {
       // OpPhi, if added, must be the first in the block.
       // If labels were added, but not jumps (for example, due to the call
       // instruction not being implemented as of October 18, 2020), send an
       // impossible program counter value (-1) to the OpPhi at the next
       // iteration.
-      if (main_switch_next_pc_phi_operands_.empty()) {
+      if (main_switch_next_pc_phi_operands_.empty() && !rectangle_vertex_loop) {
         main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(-1));
       }
+      bool use_phi = rectangle_vertex_loop || main_switch_next_pc_phi_operands_.size() >= 2;
       std::unique_ptr<spv::Instruction> main_loop_pc_next_op = std::make_unique<spv::Instruction>(
-          main_loop_pc_next_, type_int_,
-          main_switch_next_pc_phi_operands_.size() >= 2 ? spv::OpPhi : spv::OpCopyObject);
+          main_loop_pc_next_, type_int_, use_phi ? spv::OpPhi : spv::OpCopyObject);
       for (spv::Id operand : main_switch_next_pc_phi_operands_) {
         main_loop_pc_next_op->addIdOperand(operand);
+      }
+      if (use_phi) {
+        main_loop_pc_next_phi = main_loop_pc_next_op.get();
+        main_loop_pc_next_phi_operand_count = main_switch_next_pc_phi_operands_.size();
       }
       builder_->getBuildPoint()->addInstruction(std::move(main_loop_pc_next_op));
     }
@@ -697,13 +739,22 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       spv::Id rectangle_guest_vertex_index_int =
           builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
 
-      // Store current iteration outputs.
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
-      builder_->createStore(
-          builder_->createLoad(output_per_vertex_, spv::NoPrecision),
-          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
-                                      id_vector_temp_));
+      // Store current iteration outputs (member by member, the types differ in
+      // decorations).
+      for (uint32_t i = 0; i < output_per_vertex_member_count_; ++i) {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+        spv::Id member_value = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+        id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+        builder_->createStore(member_value, builder_->createAccessChain(
+                                                spv::StorageClassFunction,
+                                                var_main_rectangle_per_vertex_, id_vector_temp_));
+      }
       uint32_t interpolators_remaining = GetModificationInterpolatorMask();
       uint32_t interpolator_index;
       while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
@@ -888,7 +939,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         }
         builder_->createBranch(main_loop_continue_);
       }
-      if_not_last_guest_vertex.makeBeginElse();
+      // The "then" block already continues the loop, it must not get a second
+      // terminator.
+      if_not_last_guest_vertex.makeBeginElse(false);
       {
         spv::Id rectangle_host_vertex_in_primitive = builder_->createBinOp(
             spv::OpBitwiseAnd, type_uint_,
@@ -965,10 +1018,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         auto select_rectangle_vertex_component =
             [this, rectangle_host_vertex_is_0, rectangle_host_vertex_is_1](
                 spv::Id value_0, spv::Id value_1, spv::Id value_2, spv::Id type) {
-              return builder_->createTriOp(
-                  spv::OpSelect, type, rectangle_host_vertex_is_0, value_0,
-                  builder_->createTriOp(spv::OpSelect, type, rectangle_host_vertex_is_1, value_1,
-                                        value_2));
+              return SelectWithScalarCondition(
+                  type, rectangle_host_vertex_is_0, value_0,
+                  SelectWithScalarCondition(type, rectangle_host_vertex_is_1, value_1, value_2));
             };
 
         interpolators_remaining = GetModificationInterpolatorMask();
@@ -1001,8 +1053,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
                                                  interpolator_0),
               interpolator_2);
           builder_->createStore(
-              builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
-                                    interpolator_synthetic, interpolator_original),
+              SelectWithScalarCondition(type_float4_, rectangle_host_vertex_is_synthetic,
+                                        interpolator_synthetic, interpolator_original),
               input_output_interpolators_[interpolator_index]);
         }
 
@@ -1037,8 +1089,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
             builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, position_1, position_0),
             position_2);
         builder_->createStore(
-            builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
-                                  position_synthetic, position_original),
+            SelectWithScalarCondition(type_float4_, rectangle_host_vertex_is_synthetic,
+                                      position_synthetic, position_original),
             rectangle_position_ptr);
 
         auto write_rectangle_distance_member =
@@ -1081,6 +1133,12 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         }
       }
       if_not_last_guest_vertex.makeEndIf();
+    }
+    if (main_loop_pc_next_phi) {
+      for (size_t i = main_loop_pc_next_phi_operand_count;
+           i < main_switch_next_pc_phi_operands_.size(); ++i) {
+        main_loop_pc_next_phi->addIdOperand(main_switch_next_pc_phi_operands_[i]);
+      }
     }
     if (main_loop_exit_ != main_loop_merge_) {
       if (!builder_->getBuildPoint()->isTerminated()) {
@@ -1264,7 +1322,15 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
   new_case->addPredecessor(main_switch_header_);
   // The previous block may have already been terminated if was exece.
   if (!builder_->getBuildPoint()->isTerminated()) {
-    builder_->createBranch(new_case);
+    if (features_.switch_fallthrough) {
+      builder_->createBranch(new_case);
+    } else {
+      // No case fallthrough (WGSL has none, Tint's SPIR-V reader rejects it):
+      // reach the label through the next main loop iteration, like a jump.
+      main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(int(cf_index)));
+      main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+      builder_->createBranch(main_loop_continue_);
+    }
   }
   function.addBlock(new_case);
   builder_->setBuildPoint(new_case);
@@ -3979,6 +4045,17 @@ spv::Id SpirvShaderTranslator::EndianSwap32Uint(spv::Id value, spv::Id endian) {
   return value;
 }
 
+spv::Id SpirvShaderTranslator::SelectWithScalarCondition(spv::Id type, spv::Id condition,
+                                                         spv::Id true_value,
+                                                         spv::Id false_value) {
+  int component_count = builder_->getNumTypeComponents(type);
+  if (component_count > 1 && features_.spirv_version < spv::Spv_1_4) {
+    condition = builder_->smearScalar(spv::NoPrecision, condition,
+                                      type_bool_vectors_[component_count - 1]);
+  }
+  return builder_->createTriOp(spv::OpSelect, type, condition, true_value, false_value);
+}
+
 spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian) {
   // Change 8-in-64 and 8-in-128 to 8-in-32, and then swap within 32 bits.
 
@@ -3990,8 +4067,8 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(0);
   uint_vector_temp_.push_back(3);
   uint_vector_temp_.push_back(2);
-  value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in64,
+  value = SelectWithScalarCondition(
+      type_uint4_, is_8in64,
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 
@@ -4003,8 +4080,8 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(2);
   uint_vector_temp_.push_back(1);
   uint_vector_temp_.push_back(0);
-  value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in128,
+  value = SelectWithScalarCondition(
+      type_uint4_, is_8in128,
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 
@@ -4066,10 +4143,16 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
 
   for (uint32_t i = 0; i < binding_count; ++i) {
     binding_switch.makeBeginCase(i);
-    id_vector_temp_[0] = builder_->makeIntConstant(int(i));
-    value_phi_op->addIdOperand(builder_->createLoad(
-        builder_->createAccessChain(storage_class, buffers_shared_memory_, id_vector_temp_),
-        spv::NoPrecision));
+    spv::Id pointer;
+    if (buffers_shared_memory_bindings_[i] != spv::NoResult) {
+      std::vector<spv::Id> binding_indices = {const_int_0_, binding_address};
+      pointer = builder_->createAccessChain(storage_class, buffers_shared_memory_bindings_[i],
+                                            binding_indices);
+    } else {
+      id_vector_temp_[0] = builder_->makeIntConstant(int(i));
+      pointer = builder_->createAccessChain(storage_class, buffers_shared_memory_, id_vector_temp_);
+    }
+    value_phi_op->addIdOperand(builder_->createLoad(pointer, spv::NoPrecision));
     value_phi_op->addIdOperand(builder_->getBuildPoint()->getId());
   }
 
@@ -4146,8 +4229,14 @@ void SpirvShaderTranslator::StoreUint32ToSharedMemory(spv::Id value, spv::Id add
 
   for (uint32_t i = 0; i < binding_count; ++i) {
     binding_switch.makeBeginCase(i);
-    id_vector_temp_[0] = builder_->makeIntConstant(int(i));
-    store(builder_->createAccessChain(storage_class, buffers_shared_memory_, id_vector_temp_));
+    if (buffers_shared_memory_bindings_[i] != spv::NoResult) {
+      std::vector<spv::Id> binding_indices = {const_int_0_, binding_address};
+      store(builder_->createAccessChain(storage_class, buffers_shared_memory_bindings_[i],
+                                        binding_indices));
+    } else {
+      id_vector_temp_[0] = builder_->makeIntConstant(int(i));
+      store(builder_->createAccessChain(storage_class, buffers_shared_memory_, id_vector_temp_));
+    }
   }
 
   binding_switch.makeEndSwitch();

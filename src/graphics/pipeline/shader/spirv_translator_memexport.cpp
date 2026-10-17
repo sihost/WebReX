@@ -114,8 +114,8 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
   uint_vector_temp_.push_back(0);
   uint_vector_temp_.push_back(3);
   for_each_eM([&](uint32_t eM_index) {
-    eM_swapped[eM_index] = builder_->createTriOp(
-        spv::OpSelect, type_float4_, swap_red_blue,
+    eM_swapped[eM_index] = SelectWithScalarCondition(
+        type_float4_, swap_red_blue,
         builder_->createRvalueSwizzle(spv::NoPrecision, type_float4_, eM_original[eM_index],
                                       uint_vector_temp_),
         eM_original[eM_index]);
