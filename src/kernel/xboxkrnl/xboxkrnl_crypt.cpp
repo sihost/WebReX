@@ -13,7 +13,9 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <vector>
 
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -22,11 +24,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 
-#if REX_PLATFORM_WIN32
-#include <windows.h>
+#include "xecrypt_rsa.h"
 
-#include <bcrypt.h>
-#endif
+REXCVAR_DEFINE_BOOL(xecrypt_rsa_crosscheck, false, "Kernel",
+                    "Win32 only: also run XeCryptBnQwNeRsaPubCrypt through BCrypt and log "
+                    "whether it matches the portable result");
 
 #include "crypto/TinySHA1.hpp"
 #include "crypto/des/des.cpp"
@@ -224,104 +226,43 @@ typedef struct {
 static_assert_size(XECRYPT_RSA, 0x10);
 
 ppc_u32_result_t XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t> qw_b,
-                                                ppc_ptr_t<XECRYPT_RSA> rsa) {
-  // 0 indicates failure (but not a BOOL return value)
-#if !REX_PLATFORM_WIN32
-  REXKRNL_ERROR(
-      "XeCryptBnQwNeRsaPubCrypt called but no implementation available for "
-      "this platform!");
-  assert_always();
-  return 1;
-#else
-  uint32_t modulus_size = rsa->size * 8;
-
-  // Convert XECRYPT blob into BCrypt format
-  ULONG key_size = sizeof(BCRYPT_RSAKEY_BLOB) + sizeof(uint32_t) + modulus_size;
-  auto key_buf = std::make_unique<uint8_t[]>(key_size);
-  auto* key_header = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(key_buf.get());
-
-  key_header->Magic = BCRYPT_RSAPUBLIC_MAGIC;
-  key_header->BitLength = modulus_size * 8;
-  key_header->cbPublicExp = sizeof(uint32_t);
-  key_header->cbModulus = modulus_size;
-  key_header->cbPrime1 = key_header->cbPrime2 = 0;
-
-  // Copy in exponent/modulus, luckily these are BE inside BCrypt blob
-  uint32_t* key_exponent = reinterpret_cast<uint32_t*>(&key_header[1]);
-  *key_exponent = rsa->public_exponent.value;
-
-  // ...except modulus needs to be reversed in 64-bit chunks for BCrypt to make
-  // use of it properly for some reason
-  uint64_t* key_modulus = reinterpret_cast<uint64_t*>(&key_exponent[1]);
-  uint64_t* xecrypt_modulus = reinterpret_cast<uint64_t*>(&rsa[1]);
-  std::reverse_copy(xecrypt_modulus, xecrypt_modulus + rsa->size, key_modulus);
-
-  BCRYPT_ALG_HANDLE hAlgorithm = NULL;
-  NTSTATUS status =
-      BCryptOpenAlgorithmProvider(&hAlgorithm, BCRYPT_RSA_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0);
-
-  if (!BCRYPT_SUCCESS(status)) {
-    REXKRNL_ERROR(
-        "XeCryptBnQwNeRsaPubCrypt: BCryptOpenAlgorithmProvider failed with "
-        "status {:#X}!",
-        status);
-    return 0;
-  }
-
-  BCRYPT_KEY_HANDLE hKey = NULL;
-  status = BCryptImportKeyPair(hAlgorithm, NULL, BCRYPT_RSAPUBLIC_BLOB, &hKey, key_buf.get(),
-                               key_size, 0);
-
-  if (!BCRYPT_SUCCESS(status)) {
-    REXKRNL_ERROR(
-        "XeCryptBnQwNeRsaPubCrypt: BCryptImportKeyPair failed with status "
-        "{:#X}!",
-        status);
-
-    if (hAlgorithm) {
-      BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-    }
-
-    return 0;
-  }
-
-  // Byteswap & reverse the input into output, as BCrypt wants MSB first
-  uint64_t* output = qw_b;
-  uint8_t* output_bytes = reinterpret_cast<uint8_t*>(output);
-  memory::copy_and_swap<uint64_t>(output, qw_a, rsa->size);
-  std::reverse(output_bytes, output_bytes + modulus_size);
-
-  // BCryptDecrypt only works with private keys, fortunately BCryptEncrypt
-  // performs the right actions needed for us to decrypt the input
-  ULONG result_size = 0;
-  status = BCryptEncrypt(hKey, output_bytes, modulus_size, nullptr, nullptr, 0, output_bytes,
-                         modulus_size, &result_size, BCRYPT_PAD_NONE);
-
-  assert(result_size == modulus_size);
-
-  if (!BCRYPT_SUCCESS(status)) {
-    REXKRNL_ERROR("XeCryptBnQwNeRsaPubCrypt: BCryptEncrypt failed with status {:#X}!", status);
-  } else {
-    // Reverse data & byteswap again so data is as game expects
-    std::reverse(output_bytes, output_bytes + modulus_size);
-    memory::copy_and_swap(output, output, rsa->size);
-  }
-
-  if (hKey) {
-    BCryptDestroyKey(hKey);
-  }
-  if (hAlgorithm) {
-    BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-  }
-
-  return BCRYPT_SUCCESS(status) ? 1 : 0;
-#endif
-}
+                                                 ppc_ptr_t<XECRYPT_RSA> rsa) {
+  // qw_b = qw_a ^ e mod n. Returns 1 on success, 0 on failure (not a BOOL).
+  // Portable bignum code on every platform. It is bit-identical to the former
+  // Win32 BCrypt path for every key BCrypt handles correctly (>= 256-bit modulus
+  // without a zero top qword; tests/unit/kernel/xecrypt_rsa_test.cpp), so native
+  // runs exercise the same code as web.
+  const uint32_t size_qw = rsa->size;
+  const uint32_t exponent = rsa->public_exponent;
+  const auto* modulus = reinterpret_cast<const uint8_t*>(&rsa[1]);
+  const auto* in = reinterpret_cast<const uint8_t*>(static_cast<uint64_t*>(qw_a));
+  auto* out = reinterpret_cast<uint8_t*>(static_cast<uint64_t*>(qw_b));
 #if REX_PLATFORM_WIN32
-
-#else
-
+  std::vector<uint8_t> bcrypt_out;
+  bool bcrypt_ok = false;
+  if (REXCVAR_GET(xecrypt_rsa_crosscheck) && size_qw <= xecrypt::kRsaMaxQwords) {
+    std::vector<uint8_t> bcrypt_in(in, in + size_t(size_qw) * 8);
+    bcrypt_out.resize(bcrypt_in.size());
+    bcrypt_ok = xecrypt::RsaPubCryptBCrypt(bcrypt_in.data(), bcrypt_out.data(), exponent, modulus,
+                                           size_qw);
+  }
 #endif
+  const bool ok = xecrypt::RsaPubCryptPortable(in, out, exponent, modulus, size_qw);
+#if REX_PLATFORM_WIN32
+  if (REXCVAR_GET(xecrypt_rsa_crosscheck)) {
+    const bool same =
+        ok == bcrypt_ok && (!ok || std::equal(bcrypt_out.begin(), bcrypt_out.end(), out));
+    REXKRNL_INFO("XeCryptBnQwNeRsaPubCrypt crosscheck: {} qwords, e={:#x}, portable={} bcrypt={}: {}",
+                 size_qw, exponent, ok, bcrypt_ok, same ? "identical" : "MISMATCH");
+  }
+#endif
+  if (!ok) {
+    REXKRNL_WARN("XeCryptBnQwNeRsaPubCrypt: rejected (size {} qwords, exponent {:#x})", size_qw,
+                 exponent);
+    return 0;
+  }
+  return 1;
+}
 
 ppc_u32_result_t XeCryptBnDwLePkcs1Verify_entry(ppc_pvoid_t hash, ppc_pvoid_t sig, ppc_u32_t size) {
   // BOOL return value

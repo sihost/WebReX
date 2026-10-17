@@ -4,6 +4,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     memory/fold_web_test.cpp
     kernel/object_table_test.cpp
+    kernel/xecrypt_rsa_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/sha256_test.cpp
@@ -15,7 +16,11 @@ add_executable(unit_tests
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src  # private headers under test (kernel/xboxkrnl/xecrypt_rsa.h)
 )
+if(WIN32)
+    target_link_libraries(unit_tests PRIVATE bcrypt)
+endif()
 
 target_link_libraries(unit_tests PRIVATE
     rexcore

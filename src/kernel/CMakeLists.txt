@@ -36,6 +36,7 @@ set(REXKERNEL_SOURCES
     # xboxkrnl/cert_monitor.cpp    # TODO: Translate JIT methods for AOT
     # xboxkrnl/debug_monitor.cpp   # TODO: Translate JIT methods for AOT
     xboxkrnl/xboxkrnl_crypt.cpp
+    xboxkrnl/xecrypt_rsa.cpp
     xboxkrnl/xboxkrnl_debug.cpp
     xboxkrnl/xboxkrnl_error.cpp
     xboxkrnl/xboxkrnl_hal.cpp
@@ -82,4 +83,8 @@ target_link_libraries(rexkernel
         rexaudio
         o1heap
 )
+if(WIN32)
+    # xecrypt_rsa.cpp: BCrypt reference implementation (tests compare against it).
+    target_link_libraries(rexkernel PRIVATE bcrypt)
+endif()
 
