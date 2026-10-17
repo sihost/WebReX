@@ -460,8 +460,10 @@ inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
   if (shift == 0)
     return a;
   // Split into high and low 64-bit parts
-  simde__m128i low_shifted = simde_mm_slli_epi64(a, shift);
-  simde__m128i high_carry = simde_mm_srli_epi64(a, 64 - shift);
+  // Runtime shift count: use the count-vector forms (the *_slli/srli immediate
+  // forms reject non-constant counts under portable/wasm SIMDe).
+  simde__m128i low_shifted = simde_mm_sll_epi64(a, simde_mm_cvtsi32_si128(shift));
+  simde__m128i high_carry = simde_mm_srl_epi64(a, simde_mm_cvtsi32_si128(64 - shift));
   // Shift the carry from low qword to high qword position
   high_carry = simde_mm_slli_si128(high_carry, 8);
   return simde_mm_or_si128(low_shifted, high_carry);
@@ -516,6 +518,12 @@ inline uint64_t __rdtsc() {
 #if defined(__GNUC__) && !defined(__clang__)
 #include <x86intrin.h>
 #endif
+#elif defined(__wasm__)
+// No cycle counter on wasm: monotonic nanoseconds stand in for TSC ticks.
+// emscripten_get_now() is performance.now() in ms. Declared here to avoid an
+// #include inside namespace rex; C linkage => same entity as emscripten.h's.
+extern "C" double emscripten_get_now(void);
+inline uint64_t __rdtsc() { return uint64_t(emscripten_get_now() * 1.0e6); }
 #else
 #error "Missing implementation for __rdtsc()"
 #endif
