@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 
 #include <rex/filesystem.h>
@@ -44,6 +45,14 @@ class HostPathEntry : public Entry {
   bool SetAccessTimestamp(uint64_t timestamp) override;
   bool SetWriteTimestamp(uint64_t timestamp) override;
 
+  // Open HostPathFile count (HostPathFile ctor / Destroy). ReleaseOpenFile returns true when the
+  // last one closed.
+  void AddOpenFile() { open_files_.fetch_add(1, std::memory_order_relaxed); }
+  bool ReleaseOpenFile() { return open_files_.fetch_sub(1, std::memory_order_acq_rel) == 1; }
+  // Web: carries out a delete-on-close (NtSetInformationFile FileDispositionInformation) once the
+  // last handle closed. May destroy this entry; do not touch it afterwards.
+  void DeleteOnLastClose();
+
  private:
   friend class HostPathDevice;
 
@@ -53,6 +62,7 @@ class HostPathEntry : public Entry {
   void RenameEntryInternal(const std::vector<std::string_view>& path_parts) override;
 
   std::filesystem::path host_path_;
+  std::atomic<int> open_files_{0};
 };
 
 }  // namespace rex::filesystem

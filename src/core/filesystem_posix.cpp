@@ -10,6 +10,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -151,13 +152,13 @@ class PosixFileHandle : public FileHandle {
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
     ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_read = out;
+    *out_bytes_read = out >= 0 ? static_cast<size_t>(out) : 0;
     return out >= 0 ? true : false;
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_written = out;
+    *out_bytes_written = out >= 0 ? static_cast<size_t>(out) : 0;
     return out >= 0 ? true : false;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
@@ -169,29 +170,31 @@ class PosixFileHandle : public FileHandle {
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
                                                      uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kFileAppendData) {
+  // O_RDONLY is 0 and O_RDONLY | O_WRONLY == O_WRONLY, so the access mode must be chosen, not
+  // OR-ed together: read + write access has to be O_RDWR (as GENERIC_READ | GENERIC_WRITE on
+  // Windows). OR-ing made every read/write open write-only, so reads through such a handle
+  // failed (Halo 3 keeps cache:\preferences.dat open read/write and re-read defaults on every
+  // boot after the first, which then wiped the font cache; docs/port/vfs.md 5).
+  const bool wants_read =
+      desired_access & (FileAccess::kGenericRead | FileAccess::kGenericExecute |
+                        FileAccess::kGenericAll | FileAccess::kFileReadData);
+  const bool wants_write = desired_access & (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                                             FileAccess::kFileWriteData |
+                                             FileAccess::kFileAppendData);
+  int open_access = wants_write ? (wants_read ? O_RDWR : O_WRONLY) : O_RDONLY;
+  // Append-only access (FILE_APPEND_DATA without FILE_WRITE_DATA) is the only case in which
+  // Windows forces writes to the end; O_APPEND would also make positional pwrite() append.
+  if ((desired_access & FileAccess::kFileAppendData) &&
+      !(desired_access &
+        (FileAccess::kGenericWrite | FileAccess::kGenericAll | FileAccess::kFileWriteData))) {
     open_access |= O_APPEND;
   }
   int handle = open(path.c_str(), open_access);
+  if (handle == -1 && open_access != O_RDONLY && errno == EISDIR) {
+    // Directories can only be opened read-only on POSIX; Windows opens them with any access
+    // (FILE_FLAG_BACKUP_SEMANTICS) and writes through such a handle fail anyway.
+    handle = open(path.c_str(), O_RDONLY);
+  }
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;

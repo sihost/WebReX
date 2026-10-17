@@ -118,6 +118,22 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
   }
 }
 
+void HostPathEntry::DeleteOnLastClose() {
+  SetForDeletion(false);
+  if ((attributes_ & kFileAttributeDirectory) && child_count()) {
+    // NT refuses to delete a non-empty directory (STATUS_DIRECTORY_NOT_EMPTY).
+    REXFS_WARN("HostPathEntry: delete-on-close of non-empty directory {} skipped", path_);
+    return;
+  }
+  if (!parent_) {
+    return;
+  }
+  const std::string path = path_;
+  if (!Delete()) {  // destroys this entry on success
+    REXFS_WARN("HostPathEntry: delete-on-close of {} failed", path);
+  }
+}
+
 void HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& path_parts) {
   auto new_host_path = static_cast<HostPathDevice*>(device_)->host_path();
   for (const auto& path_part : path_parts) {
