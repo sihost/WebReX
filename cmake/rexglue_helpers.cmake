@@ -70,6 +70,9 @@ function(rexglue_configure_target target_name)
             -Wl,--undefined=wasmfs_create_directory
             # Stack overflows otherwise corrupt the heap silently.
             $<$<CONFIG:Debug>:-sSTACK_OVERFLOW_CHECK=2>
+            # Keep function names (name section only, no DWARF) in optimized
+            # builds so browser stack traces of traps are symbolized.
+            $<$<NOT:$<CONFIG:Debug>>:--profiling-funcs>
             --use-port=emdawnwebgpu
         )
     endif()
