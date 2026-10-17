@@ -108,6 +108,9 @@ class WebGPUCommandProcessor : public CommandProcessor {
     // attachment at all), ConfigurePipeline refused (WebGPUPipelineCache
     // draws_refused_*), the constant arena was full, a sampler couldn't be made.
     uint64_t drops_render_targets = 0;
+    // Of drops_render_targets: the vertex shader memexports; rasterization is off.
+    uint64_t drops_rt_memexport_vs = 0;
+    uint64_t drops_rt_no_rasterization = 0;
     uint64_t drops_pipeline = 0;
     uint64_t drops_constants = 0;
     uint64_t drops_sampler = 0;
@@ -198,6 +201,7 @@ class WebGPUCommandProcessor : public CommandProcessor {
   std::array<uint64_t, kMaxFramesInFlight> swap_submissions_ = {};
   Statistics statistics_;
   bool memexport_logged_ = false;
+  uint32_t drop_details_logged_ = 0;
 };
 
 }  // namespace rex::graphics::webgpu

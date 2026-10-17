@@ -659,6 +659,31 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                     normalized_color_mask, *vertex_shader)) {
     ++statistics_.draws_dropped;
     ++statistics_.drops_render_targets;
+    if (memexport_used_vertex) {
+      ++statistics_.drops_rt_memexport_vs;
+    }
+    if (!is_rasterization_done) {
+      ++statistics_.drops_rt_no_rasterization;
+    }
+    if (drop_details_logged_ < 8) {
+      ++drop_details_logged_;
+      REXGPU_WARN(
+          "WebGPU: draw without render targets dropped: vs {:016X} (memexport {:X}) ps {:016X} "
+          "(memexport {:X}) prim {} rasterization {} edram mode {} color mask {:04X} depth {} "
+          "stencil {} surface pitch {} color formats {} {} {} {} PA_CL_CLIP_CNTL {:08X} "
+          "PA_SU_SC_MODE_CNTL {:08X}",
+          vertex_shader->ucode_data_hash(), vertex_shader->memexport_eM_written(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+          pixel_shader ? pixel_shader->memexport_eM_written() : 0, uint32_t(prim_type),
+          is_rasterization_done, uint32_t(edram_mode), normalized_color_mask,
+          uint32_t(normalized_depth_control.z_enable), uint32_t(normalized_depth_control.stencil_enable),
+          regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+          uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format),
+          uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]).color_format),
+          uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]).color_format),
+          uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[3]).color_format),
+          regs[XE_GPU_REG_PA_CL_CLIP_CNTL], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
+    }
     return true;
   }
   WebGPUDrawPipelineState pipeline_state;
@@ -1051,7 +1076,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_INFO(
         "WebGPU: swap #{} front buffer {:08X} {}x{} presented={} swap texture {}x{} fmt {} ({}) | "
         "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | drops: render "
-        "targets {} (no attachments {}), pipeline {} (ps memexport {}, bindings {}, tessellation "
+        "targets {} (no attachments {}, vs memexport {}, no rasterization {}), pipeline {} (ps "
+        "memexport {}, bindings {}, tessellation "
         "{}, cull both {}, no pipeline {}), constants {}, sampler {} | pipelines {} "
         "requested {} created {} failed | textures {} loads {} failures {} | constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
@@ -1062,6 +1088,7 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
         statistics_.draws_culled, pipelines.draws_unsupported, statistics_.copies,
         statistics_.drops_render_targets, render_target_cache_->statistics().updates_without_attachments,
+        statistics_.drops_rt_memexport_vs, statistics_.drops_rt_no_rasterization,
         statistics_.drops_pipeline, pipelines.draws_refused_ps_memexport,
         pipelines.draws_refused_bindings, pipelines.draws_refused_tessellation,
         pipelines.draws_refused_cull_both, pipelines.draws_refused_no_pipeline,
