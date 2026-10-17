@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/math.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -32,6 +33,12 @@
 #if defined(__EMSCRIPTEN__)
 #include <rex/filesystem/web_storage.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(webgpu_draw_with_pipelines, false, "GPU",
+                    "WebGPU: record draws with the translated pipelines. Off until the command "
+                    "processor binds the shader resources (constants, shared memory, textures): "
+                    "pipelines are still translated, stored and created, but draws are dropped "
+                    "so streams stay valid");
 
 namespace rex::graphics::webgpu {
 
@@ -267,6 +274,8 @@ void WebGPUPipelineCache::ClearCache() {
 
 void WebGPUPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool /*blocking*/) {
+  storage_initialized_ = true;
+  storage_dir_.clear();
   std::filesystem::path root;
 #if defined(__EMSCRIPTEN__)
   // OPFS through WasmFS (synchronous file I/O from this pthread).
@@ -326,6 +335,14 @@ std::shared_ptr<const std::string> WebGPUPipelineCache::GetWgsl(Shader& shader,
     ++statistics_.wgsl_memory_hits;
     return it->second;
   }
+#if defined(__EMSCRIPTEN__)
+  if (!storage_initialized_) {
+    // GraphicsSystem::InitializeShaderStorage is not called on the web
+    // (kStoreShaders); the WGSL storage is on OPFS regardless. Keys are ucode
+    // hashes, so one directory for all titles is safe.
+    InitializeShaderStorage({}, 0, false);
+  }
+#endif
   bool vertex = shader.type() == xenos::ShaderType::kVertex;
   std::shared_ptr<const std::string> result;
   std::filesystem::path path;
@@ -529,7 +546,12 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
       }
     }
   }
-  desc.primitive_topology = uint8_t(ToTopology(host_primitive));
+  WGPUPrimitiveTopology topology = ToTopology(host_primitive);
+  desc.primitive_topology = uint8_t(topology);
+  if (topology == WGPUPrimitiveTopology_TriangleStrip ||
+      topology == WGPUPrimitiveTopology_LineStrip) {
+    desc.strip_index_format = uint8_t(state.index_format);
+  }
   if (draw_util::IsPrimitivePolygonal(regs)) {
     auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     desc.front_face_cw = uint8_t(mode.face);
@@ -549,6 +571,11 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
                                    regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable);
 
   pipeline_out = GetOrCreate(desc);
+  if (!REXCVAR_GET(webgpu_draw_with_pipelines)) {
+    // The CP doesn't set bind groups yet; a draw would invalidate the stream.
+    pipeline_out = kInvalidPipelineId;
+    return false;
+  }
   return pipeline_out != kInvalidPipelineId;
 }
 
@@ -589,6 +616,14 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
   PipelineId id = table.Allocate();
   pipelines_.emplace(description, id);
   ++statistics_.pipelines_requested;
+  if (statistics_.pipelines_requested <= 2 || !(statistics_.pipelines_requested % 32)) {
+    REXGPU_INFO(
+        "WebGPU pipeline cache: {} pipelines requested ({} created, {} failed); WGSL: {} "
+        "storage hits, {} translated, {} failures, {} memory hits",
+        statistics_.pipelines_requested, async_counters_->pipelines_created.load(),
+        async_counters_->pipelines_failed.load(), statistics_.wgsl_storage_hits,
+        statistics_.wgsl_translated, statistics_.wgsl_failures, statistics_.wgsl_memory_hits);
+  }
 
   WebGPUDevice& device = command_processor_.device();
   std::shared_ptr<AsyncCounters> stats = async_counters_;
@@ -620,6 +655,7 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     desc.vertex.module = vs_module;
     desc.vertex.entryPoint = MakeStringView("main");
     desc.primitive.topology = WGPUPrimitiveTopology(d.primitive_topology);
+    desc.primitive.stripIndexFormat = WGPUIndexFormat(d.strip_index_format);
     desc.primitive.cullMode = WGPUCullMode(d.cull_mode);
     desc.primitive.frontFace = d.front_face_cw ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
     desc.multisample.count = d.sample_count ? d.sample_count : 1;

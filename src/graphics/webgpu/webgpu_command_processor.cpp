@@ -376,6 +376,13 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   pipeline_state.host_primitive_type = primitive_processing_result.host_primitive_type;
   pipeline_state.host_vertex_shader_type = primitive_processing_result.host_vertex_shader_type;
   pipeline_state.host_vertex_shader_type_valid = true;
+  if (primitive_processing_result.index_buffer_type !=
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    pipeline_state.index_format =
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
+            ? WGPUIndexFormat_Uint16
+            : WGPUIndexFormat_Uint32;
+  }
   pipeline_state.render_pass_key = render_target_cache_->last_update_render_pass_key();
   pipeline_state.depth_texture_format = render_target_cache_->GetDepthTextureFormat(
       WebGPURenderTargetCache::GetRenderPassFormatKey(pipeline_state.render_pass_key)

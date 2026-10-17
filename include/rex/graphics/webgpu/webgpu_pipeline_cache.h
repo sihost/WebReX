@@ -61,6 +61,9 @@ struct WebGPUDrawPipelineState {
   xenos::PrimitiveType host_primitive_type = xenos::PrimitiveType::kNone;
   Shader::HostVertexShaderType host_vertex_shader_type = Shader::HostVertexShaderType::kVertex;
   bool host_vertex_shader_type_valid = false;
+  // Index format of an indexed draw (WebGPU strip pipelines must match it),
+  // Undefined for non-indexed draws.
+  WGPUIndexFormat index_format = WGPUIndexFormat_Undefined;
   reg::RB_DEPTHCONTROL normalized_depth_control = {};
   uint32_t normalized_color_mask = 0;
   // Interpolators written by the VS and read by the PS.
@@ -96,7 +99,8 @@ struct WebGPUPipelineDescription {
   uint8_t front_face_cw;
   uint8_t alpha_to_coverage;
   uint8_t sample_count;
-  uint8_t pad[7];
+  uint8_t strip_index_format;  // WGPUIndexFormat, strips only
+  uint8_t pad[6];
 };
 static_assert(sizeof(WebGPUPipelineDescription) == 80);
 
@@ -185,6 +189,7 @@ class WebGPUPipelineCache {
   uint32_t max_storage_buffer_range_ = 128 * 1024 * 1024;
   bool clip_distances_ = false;
 
+  bool storage_initialized_ = false;
   std::filesystem::path storage_dir_;
   std::unordered_map<WgslKey, std::shared_ptr<const std::string>, WgslKeyHasher> wgsl_;
   std::unordered_map<uint32_t, std::shared_ptr<const std::string>> depth_only_wgsl_;
