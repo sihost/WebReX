@@ -57,7 +57,9 @@ elseif(EMSCRIPTEN)
             target_sources(rexcore PRIVATE ${_unit}_posix.cpp)
         endif()
     endforeach()
-    target_sources(rexcore PRIVATE fiber_web.cpp math_gcc.cpp)
+    # emscripten_shims.cpp: WS-B link stubs (ExceptionHandler, GNU pthread
+    # extensions), see docs/port/STUBS.md.
+    target_sources(rexcore PRIVATE fiber_web.cpp math_gcc.cpp emscripten_shims.cpp)
     # Pick up web-only helpers that have no POSIX counterpart.
     file(GLOB _rex_core_web_extra CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/*_web.cpp")

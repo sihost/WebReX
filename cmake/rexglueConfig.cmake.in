@@ -32,4 +32,19 @@ endif()
 # Include the generated targets
 include("${CMAKE_CURRENT_LIST_DIR}/rexglueTargets.cmake")
 
+# The recompiler CLI is a host tool and is not built for Emscripten. Projects'
+# generated rexglue.cmake still reference rex::rexglue for their codegen
+# target, so point it at the native CLI (sibling native install by default).
+if(EMSCRIPTEN AND NOT TARGET rex::rexglue)
+    if(CMAKE_HOST_WIN32)
+        set(_rexglue_host_cli "${PACKAGE_PREFIX_DIR}/../win-amd64/bin/rexglue.exe")
+    else()
+        set(_rexglue_host_cli "${PACKAGE_PREFIX_DIR}/../linux-amd64/bin/rexglue")
+    endif()
+    set(REXGLUE_HOST_REXGLUE "${_rexglue_host_cli}"
+        CACHE FILEPATH "Native rexglue CLI used by codegen targets in web builds")
+    add_executable(rex::rexglue IMPORTED)
+    set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION "${REXGLUE_HOST_REXGLUE}")
+endif()
+
 check_required_components(rexglue)
