@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include <webgpu/webgpu.h>
@@ -198,6 +199,10 @@ class WebGPUEdram {
   WGPUShaderModule load_module_ = nullptr;
   // [host format index][0 = 1 sample, 1 = 4 samples].
   WGPURenderPipeline color_load_pipelines_[kColorHostFormatCount][2] = {};
+  // Set (device thread, error scope callback) when the 4-sample load pipeline of a format
+  // WebGPU does not guarantee multisampling for (rg32float) failed validation: Chrome
+  // accepts it, Firefox does not. Such loads are skipped instead of using the error object.
+  std::atomic<bool> color_load_msaa_failed_[kColorHostFormatCount] = {};
   // [0 = depth24plus-stencil8, 1 = depth32float-stencil8][samples][variant].
   WGPURenderPipeline depth_load_pipelines_[2][2][kDepthPipelineVariants] = {};
   WGPUBindGroupLayout resolve_layout_ = nullptr;
