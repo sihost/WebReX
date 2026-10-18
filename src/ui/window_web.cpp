@@ -20,6 +20,17 @@
  *   WindowedAppContext::CallInUIThreadDeferred. Blocking waits on Emscripten
  *   pthreads still process their mailbox, but the posted functions only run in
  *   the pending-function pump.
+ * - Fullscreen (Window::SetFullscreen, --fullscreen, F11 in the DOM input bridge):
+ *   ApplyNewFullscreen proxies to the browser main thread, which calls
+ *   requestFullscreen on Module.rexFullscreenTarget (an element or a selector; default
+ *   the canvas). Without user activation (e.g. --fullscreen at startup) the request is
+ *   armed for the next pointerdown / keydown on the page. In fullscreen, Keyboard Lock
+ *   (--web_keyboard_lock, codes from --web_keyboard_lock_codes, default Escape) makes Esc
+ *   reach the game instead of leaving fullscreen and Pointer Lock (holding Esc still
+ *   exits). fullscreenchange is reported back to the UI thread (desired fullscreen state)
+ *   and to Module.rexOnFullscreenChange(active, keyboardLocked) if the page sets it.
+ *   State for pages/tests: Module.rexFullscreen.{want, armed, active, keyboardLocked,
+ *   changes, lastError}.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -40,11 +51,21 @@
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/ui/menu_item.h>
 #include <rex/ui/surface_web.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_web.h>
 #include <rex/ui/windowed_app_context.h>
+
+REXCVAR_DEFINE_BOOL(web_keyboard_lock, true, "UI/Web",
+                    "In fullscreen, capture the keys of web_keyboard_lock_codes with the Keyboard "
+                    "Lock API (Chromium) so Esc reaches the game instead of leaving fullscreen "
+                    "and Pointer Lock (hold Esc to leave)");
+REXCVAR_DEFINE_STRING(web_keyboard_lock_codes, "Escape", "UI/Web",
+                      "Comma-separated KeyboardEvent.code values locked in fullscreen (e.g. "
+                      "Escape,Tab,MetaLeft,MetaRight); empty = every key the browser allows");
 
 namespace rex {
 namespace ui {
@@ -139,6 +160,152 @@ EM_JS(int, rexweb_install_canvas_observer, (), {
   return w | (h << 16);
 });
 
+// Browser main thread. on: 1 = enter, 0 = leave, 2 = toggle (inside a user gesture, F11).
+// keyboard_lock / codes (comma-separated, as a double pointer: no wasm64 BigInt question):
+// Keyboard Lock while in fullscreen. Installs the page-side state on first use.
+EM_JS(void, rexweb_set_fullscreen, (int on, int keyboard_lock, double codes_ptr), {
+  if (typeof document == 'undefined') return;
+  var fs = Module['rexFullscreen'];
+  if (!fs) {
+    fs = Module['rexFullscreen'] = {want : false, armed : false, active : false,
+                                    keyboardLock : true, codes : ['Escape'],
+                                    keyboardLocked : false, changes : 0, lastError : ""};
+    var notify = Module['_rex_web_fullscreen_changed'] || wasmExports['rex_web_fullscreen_changed'];
+    fs.target = function() {
+      var t = Module['rexFullscreenTarget'];
+      if (typeof t == 'string') t = document.querySelector(t);
+      return t || Module['canvas'] || document.querySelector('#canvas');
+    };
+    fs.arm = function(why) {
+      if (!fs.want || fs.armed) return;
+      fs.armed = true;
+      console.log('[rex] fullscreen: ' + why + '; entering on the next click or key press');
+    };
+    fs.request = function() {
+      var el = fs.target();
+      if (!el || !el.requestFullscreen) {
+        fs.lastError = 'requestFullscreen unavailable';
+        return;
+      }
+      if (document.fullscreenElement === el) return;
+      var p;
+      try {
+        p = el.requestFullscreen({navigationUI : 'hide'});
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      Promise.resolve(p).then(function() { fs.armed = false; }, function(e) {
+        fs.lastError = String(e);
+        fs.arm('request refused (' + (e && e.name) + ')');
+      });
+    };
+    var gesture = function(ev) {
+      // Esc is not an activation-triggering key.
+      if (!fs.armed || !fs.want || (ev.type == 'keydown' && ev.code == 'Escape')) return;
+      fs.armed = false;
+      fs.request();
+    };
+    addEventListener('pointerdown', gesture, true);
+    addEventListener('keydown', gesture, true);
+    document.addEventListener('fullscreenchange', function() {
+      var active = !!document.fullscreenElement;
+      fs.active = active;
+      fs.changes++;
+      var report = function() {
+        if (notify) notify(active ? 1 : 0);
+        var cb = Module['rexOnFullscreenChange'];
+        if (typeof cb == 'function') {
+          try {
+            cb(active, fs.keyboardLocked);
+          } catch (e) {
+            console.error(e);
+          }
+        }
+      };
+      if (!active) {
+        // Left by the user (held Esc, browser UI) or by us: stop wanting it.
+        fs.want = false;
+        fs.armed = false;
+        fs.keyboardLocked = false;
+        try {
+          if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+        } catch (e) {
+        }
+        report();
+        return;
+      }
+      fs.want = true;
+      if (fs.keyboardLock && navigator.keyboard && navigator.keyboard.lock) {
+        navigator.keyboard.lock(fs.codes.length ? fs.codes : undefined).then(function() {
+          fs.keyboardLocked = true;
+          console.log('[rex] fullscreen: keyboard locked [' + (fs.codes.join(',') || 'all') +
+                      ']; hold Esc to leave');
+          report();
+        }, function(e) {
+          fs.keyboardLocked = false;
+          fs.lastError = String(e);
+          console.warn('[rex] fullscreen: Keyboard Lock refused (' + e + '); Esc leaves fullscreen');
+          report();
+        });
+      } else {
+        report();
+      }
+    });
+    document.addEventListener('fullscreenerror', function() {
+      fs.lastError = 'fullscreenerror';
+      fs.arm('request failed');
+    });
+  }
+  fs.keyboardLock = !!keyboard_lock;
+  var codes = codes_ptr ? UTF8ToString(codes_ptr) : "";
+  fs.codes = codes.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  if (on == 2) on = document.fullscreenElement ? 0 : 1;
+  fs.want = !!on;
+  if (on) {
+    var ua = navigator.userActivation;
+    if (ua && !ua.isActive) {
+      fs.arm('no user activation');
+    } else {
+      fs.request();
+    }
+  } else {
+    fs.armed = false;
+    if (document.fullscreenElement && document.exitFullscreen) {
+      document.exitFullscreen().catch(function() {});
+    }
+  }
+});
+EM_JS_DEPS(rex_window_web, "$UTF8ToString");
+
+struct FullscreenRequest {
+  int on;
+  int keyboard_lock;
+  std::string codes;
+};
+
+// Any thread (the DOM input bridge calls it on the browser main thread inside the F11
+// gesture, which must not be lost to an asynchronous hop).
+void SetBrowserFullscreen(int on) {
+  if (emscripten_is_main_runtime_thread()) {
+    // No allocation here (the codes are a short string, small-string optimized).
+    const std::string codes(REXCVAR_GET(web_keyboard_lock_codes));
+    rexweb_set_fullscreen(on, REXCVAR_GET(web_keyboard_lock) ? 1 : 0,
+                          double(uintptr_t(codes.c_str())));
+    return;
+  }
+  auto* request = new FullscreenRequest{on, REXCVAR_GET(web_keyboard_lock) ? 1 : 0,
+                                        std::string(REXCVAR_GET(web_keyboard_lock_codes))};
+  auto run = [](void* arg) {
+    auto* r = static_cast<FullscreenRequest*>(arg);
+    rexweb_set_fullscreen(r->on, r->keyboard_lock, double(uintptr_t(r->codes.c_str())));
+    delete r;
+  };
+  if (!emscripten_proxy_async(emscripten_proxy_get_system_queue(),
+                              emscripten_main_runtime_thread_id(), run, request)) {
+    delete request;
+  }
+}
+
 EM_JS(void, rexweb_remove_canvas_observer, (), {
   var state = Module['rexCanvasResize'];
   if (state && state.observer) {
@@ -190,6 +357,15 @@ class WebWindow final : public Window {
     OnActualSizeUpdate(uint32_t(packed), uint32_t(packed >> 32), destruction_receiver);
   }
 
+  // UI thread: the browser entered or left fullscreen (also by the user: held Esc, browser
+  // UI), so the desired state follows the page.
+  void HandleFullscreenChange(bool active) {
+    if (IsFullscreen() != active) {
+      REXLOG_INFO("web window: fullscreen {}", active ? "entered" : "left");
+    }
+    OnDesiredFullscreenUpdate(active);
+  }
+
   // UI thread.
   void HandlePaint(bool force_paint) {
     paint_posted_.store(false, std::memory_order_relaxed);
@@ -238,6 +414,8 @@ class WebWindow final : public Window {
   }
 
  protected:
+  void ApplyNewFullscreen() override { SetBrowserFullscreen(IsFullscreen() ? 1 : 0); }
+
   uint32_t GetLatestDpiImpl() const override {
     uint32_t milli = Globals().device_pixel_ratio_milli.load(std::memory_order_relaxed);
     return std::max(uint32_t(1), (GetMediumDpi() * milli + 500) / 1000);
@@ -283,6 +461,11 @@ class WebWindow final : public Window {
     OnFocusUpdate(true, destruction_receiver);
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
       return true;
+    }
+    if (IsFullscreen()) {
+      // --fullscreen: no user activation yet at startup, so this arms the request for the
+      // first click or key press.
+      SetBrowserFullscreen(1);
     }
     web::WindowLifecycleCallback lifecycle;
     {
@@ -466,6 +649,8 @@ void SetUIWantsPointer(bool wants) {
 
 bool UIWantsPointer() { return g_ui_wants_pointer.load(std::memory_order_acquire); }
 
+void ToggleFullscreenFromGesture() { SetBrowserFullscreen(2); }
+
 }  // namespace web
 
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
@@ -504,4 +689,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_canvas_resized(int width, int heigh
   Globals().canvas_size.store(PackSize(uint32_t(width), uint32_t(height)),
                               std::memory_order_release);
   PostToOpenWindow([](WebWindow& window) { window.HandleCanvasResize(); });
+}
+
+// Browser main thread (fullscreenchange): tells the UI thread.
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_fullscreen_changed(int active) {
+  using namespace rex::ui;
+  PostToOpenWindow([active](WebWindow& window) { window.HandleFullscreenChange(active != 0); });
 }

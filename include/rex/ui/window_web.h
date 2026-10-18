@@ -105,6 +105,13 @@ void GetCanvasPhysicalSize(uint32_t& width_out, uint32_t& height_out);
 void SetUIWantsPointer(bool wants);
 bool UIWantsPointer();
 
+// Browser main thread, inside a user gesture (the DOM input bridge's F11 with
+// --web_fullscreen_key): enters fullscreen (Module.rexFullscreenTarget, default the canvas)
+// or leaves it. The window's desired fullscreen state follows through fullscreenchange.
+// Window::SetFullscreen works from the UI thread too (armed for the next gesture when
+// the page has no user activation).
+void ToggleFullscreenFromGesture();
+
 }  // namespace web
 }  // namespace ui
 }  // namespace rex
