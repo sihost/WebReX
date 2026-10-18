@@ -12,9 +12,11 @@
  *   (the AudioDriver releases the guest's frame semaphore there, as the SDL callback does).
  *
  * While the worklet is not rendering (no AudioContext yet, context suspended by the
- * autoplay gate, page backgrounded, or Web Audio unavailable) the pacing thread consumes
- * the ring itself at 48 kHz ("free-run"), so the guest audio thread is paced exactly like
- * real playback and never stalls. Frames are 256 samples (5.33 ms); the guest keeps at most
+ * autoplay gate, or Web Audio unavailable) the pacing thread consumes the ring itself at
+ * 48 kHz ("free-run"), so the guest audio thread is paced exactly like real playback and
+ * never stalls. A running context's worklet (also in hidden tabs, where Chrome gives it less
+ * CPU) is waited for up to 1.5 s before free-run: discarding its queued frames made
+ * background-tab audio choppy and "fast". Frames are 256 samples (5.33 ms); the guest keeps at most
  * audio_maxqframes (default 8 = 42.7 ms) in flight, which bounds the ring latency.
  *
  * Self-contained (std + Emscripten only) so tools/audio_tests can drive it without a guest.
@@ -80,6 +82,7 @@ class WebAudioOutput {
     kCtlSubmitted = 15,
     kCtlStop = 16,
     kCtlMaxBatch = 17,
+    kCtlPrime = 18,  // worklet: frames it waits for after an underrun (adaptive, 2..6)
     kCtlCount = 32,
   };
 

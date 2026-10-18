@@ -134,14 +134,27 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t next_frame_time = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          if (current_time - last_frame_time >= interval_ticks) {
+          if (current_time >= next_frame_time) {
             MarkVblank();
-            last_frame_time = current_time;
+            // Keep the phase (next = previous deadline + interval, not now + interval):
+              // when the 1 ms sleep below is coarser than that, the guest still gets its
+              // refresh rate on average. A hidden browser tab's threads run with the 15.6 ms
+              // Windows timer resolution: Sleep(1 ms) returns every 15.6 ms, and "now +
+            // interval" fired only every second wake, 32 Hz instead of 60 (the game ran at
+            // half speed while its tab was in the background). After a stall, resync
+            // instead of firing a burst.
+            next_frame_time += interval_ticks;
+            if (current_time >= next_frame_time + 2 * interval_ticks) {
+              next_frame_time = current_time + interval_ticks;
+            }
+          } else if (next_frame_time - current_time > vsync_interval_ticks) {
+            // The interval got shorter (vsync turned off) or the clock moved: resync.
+            next_frame_time = current_time + interval_ticks;
           }
           rex::thread::Sleep(std::chrono::milliseconds(1));
         }
