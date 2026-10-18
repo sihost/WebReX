@@ -74,7 +74,12 @@ function(rexglue_configure_target target_name)
             # builds so browser stack traces of traps are symbolized.
             $<$<NOT:$<CONFIG:Debug>>:--profiling-funcs>
             --use-port=emdawnwebgpu
+            # Crash reports to the page (Module.rexOnFatal) and the page lifecycle
+            # (rex/crash_report.h, rex/web_page.h); runs in the page and every Worker.
+            "SHELL:--pre-js ${REXGLUE_SHARE_DIR}/rex_web_pre.js"
         )
+        set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS
+            ${REXGLUE_SHARE_DIR}/rex_web_pre.js)
     endif()
 
     # Linux platform settings

@@ -5,11 +5,21 @@
  *
  *   SubmitGuestFrame (driver thread)            AudioWorklet (audio rendering thread)
  *     6ch x 256 BE float, channel-sequential      reads slots, writes 128-frame quanta,
- *     -> downmix to interleaved LE float     ->   advances READ (CAS) + Atomics.notify
- *     -> ring slot, WRITE++                       (in the wasm SharedArrayBuffer)
+ *     -> stereo downmix or 5.1, interleaved  ->   advances READ (CAS) + Atomics.notify
+ *        LE float -> ring slot, WRITE++           (in the wasm SharedArrayBuffer)
  *
  *   pacing thread: waits on READ (futex), hands consumed frames back through on_consumed
  *   (the AudioDriver releases the guest's frame semaphore there, as the SDL callback does).
+ *
+ * Latency: the guest keeps audio_maxqframes frames (default 8 = 42.7 ms) in flight, so
+ * handing every played frame straight back kept the ring full: 42.7 ms of queue on top of
+ * the AudioContext's own latency (~50 ms measured on Chrome/Windows). The pacing thread
+ * instead withholds frames it was handed back so that ring + frames the guest holds stay at
+ * an adaptive target: Options::min_frames at first (3 = 16 ms), one more after each real
+ * underrun of the worklet (closer ones and those of the first second count once), one less
+ * after 10 s without one; an underrun soon after such a step doubles that wait (up to 320 s).
+ * Never below the worklet's post-underrun prime level, never above the guest's budget
+ * (where it behaves as before: the ring stays full). Free-run hands every frame back.
  *
  * While the worklet is not rendering (no AudioContext yet, context suspended by the
  * autoplay gate, or Web Audio unavailable) the pacing thread consumes the ring itself at
@@ -46,6 +56,10 @@ struct WebAudioStats {
   uint32_t ring_frames = 0;        // frames currently queued (WRITE - READ)
   float peak = 0.0f;               // peak |sample| of the last frame the worklet played
   uint32_t max_batch = 0;          // most frames handed back to the guest in one wake
+  uint32_t target_frames = 0;      // current latency target (ring + frames held by the guest)
+  uint32_t withheld = 0;           // played frames not handed back yet (budget - target)
+  uint32_t underruns = 0;          // worklet underruns while playing (each raises the target)
+  uint32_t output_channels = 0;    // 2 (stereo downmix) or 6 (5.1); 0 = not decided yet
 };
 
 class WebAudioOutput {
@@ -61,6 +75,8 @@ class WebAudioOutput {
   static constexpr uint32_t kChannelSamples = 256;  // samples per channel per guest frame
   static constexpr uint32_t kSourceChannels = 6;    // XAudio render format (5.1)
   static constexpr uint32_t kSlots = 64;            // >= the audio_maxqframes maximum
+  // Ring slots are sized for 5.1; each slot records the layout it was written with.
+  static constexpr uint32_t kMaxOutputChannels = 6;
 
   // Control block layout shared with rex_audio_worklet.js (Int32 indices).
   enum Control : uint32_t {
@@ -83,16 +99,27 @@ class WebAudioOutput {
     kCtlStop = 16,
     kCtlMaxBatch = 17,
     kCtlPrime = 18,  // worklet: frames it waits for after an underrun (adaptive, 2..6)
+    kCtlTarget = 19,          // pacing thread: current latency target, frames
+    kCtlUnderrunEvents = 20,  // worklet: ring ran empty while playing
+    kCtlOutChannels = 21,     // JS: channels of the AudioWorkletNode (2 or 6), 0 = none yet
+    kCtlWithheld = 22,        // pacing thread: frames played but not handed back
     kCtlCount = 32,
   };
 
   using ConsumedFn = std::function<void(uint32_t frames)>;
 
-  // Output is always the stereo downmix (conversion::sequential_6_BE_to_interleaved_2_LE,
-  // the SDL driver's 2-channel path): the default Web Audio destination is stereo.
-  static constexpr uint32_t kOutputChannels = 2;
+  struct Options {
+    // Latency target floor in frames (ring + frames the guest holds); 0 = no latency control
+    // (every played frame is handed back at once, the ring stays at the guest's budget).
+    uint32_t min_frames = 3;
+    // 0 = 5.1 when the AudioContext destination has >= 6 channels, else the stereo downmix;
+    // 2 = always the stereo downmix (conversion::sequential_6_BE_to_interleaved_2_LE, the SDL
+    // driver's 2-channel path); 6 = always 5.1 (the browser downmixes it for a stereo device).
+    uint32_t channels = 0;
+  };
 
   explicit WebAudioOutput(ConsumedFn on_consumed);
+  WebAudioOutput(ConsumedFn on_consumed, const Options& options);
   ~WebAudioOutput();
 
   WebAudioOutput(const WebAudioOutput&) = delete;
@@ -115,8 +142,10 @@ class WebAudioOutput {
   void Consumed(uint32_t frames);
 
   ConsumedFn on_consumed_;
-  std::atomic<int32_t>* ctl_ = nullptr;  // kCtlCount entries
-  float* ring_ = nullptr;                // kSlots * kChannelSamples * kOutputChannels
+  Options options_;
+  std::atomic<int32_t>* ctl_ = nullptr;            // kCtlCount entries
+  std::atomic<int32_t>* slot_channels_ = nullptr;  // kSlots entries: 2 or 6
+  float* ring_ = nullptr;  // kSlots * kChannelSamples * kMaxOutputChannels
   std::atomic<bool> running_{false};
   std::thread pacing_thread_;
   std::mutex submit_mutex_;

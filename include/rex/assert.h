@@ -20,6 +20,19 @@
 
 #include <rex/platform.h>
 
+#if REX_PLATFORM_WEB
+// rex/crash_report.h (rexcore, web): records why the process is about to abort for the crash
+// report the page gets. Weak so code that does not link rexcore still builds.
+extern "C" __attribute__((weak)) void rex_web_note_fatal(const char* kind, const char* message);
+#define REX_WEB_NOTE_FATAL(kind, message) \
+  do {                                    \
+    if (&rex_web_note_fatal)              \
+      rex_web_note_fatal(kind, message);  \
+  } while (0)
+#else
+#define REX_WEB_NOTE_FATAL(kind, message) ((void)0)
+#endif
+
 namespace rex {
 
 #define static_assert_size(type, size) \
@@ -46,6 +59,11 @@ namespace rex {
   fprintf(stderr, "Assertion failed: %s\n  Expression: %s\n  Location: %s:%d\n", message, expr,
           file, line);
   fflush(stderr);
+#if REX_PLATFORM_WEB
+  char note[1024];
+  snprintf(note, sizeof(note), "%s (%s) at %s:%d", message, expr, file, line);
+  REX_WEB_NOTE_FATAL("assert", note);
+#endif
   std::abort();
 }
 
@@ -116,6 +134,7 @@ namespace rex {
   // Print to stderr and terminate
   fprintf(stderr, "FATAL ERROR: %s\n", message);
   fflush(stderr);
+  REX_WEB_NOTE_FATAL("fatal", message);
   std::abort();
 }
 

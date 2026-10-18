@@ -34,6 +34,44 @@ EM_JS(int, rexwgpu_canvas_owned_by_this_thread, (const char* selector), {
   return (info && info.offscreenCanvas) ? 1 : 0;
 });
 
+// emdawnwebgpu passes setBindGroup dynamic offsets as (HEAPU32, offset / 4, count): a view
+// of the whole wasm memory. Firefox's WebIDL bindings reject every ArrayBufferView over 2 GiB
+// ("setBindGroup: Argument 3 can't be an ArrayBuffer or an ArrayBufferView larger than 2 GB";
+// the wasm64 memory is 8 GiB), so the call throws and kills the device thread. The port's JS
+// library is appended after user --js-library files (it would override a replacement), so
+// wrap setBindGroup on this worker's encoder prototypes instead: the offsets are copied into
+// a small reusable Uint32Array per count (setBindGroup copies them synchronously). Every
+// WebGPU call runs on the device thread, so installing here covers all of them. The other
+// heap arguments emdawnwebgpu passes are exact-size views (writeBuffer and writeTexture use
+// HEAPU8.subarray(data, data + size); mapped ranges are copied with HEAPU8.set/subarray), and
+// the SDK's own EM_JS code passes no heap views to WebGPU. Returns the number of prototypes
+// wrapped (0 when already done).
+EM_JS(int, rexwgpu_install_dynamic_offset_copy, (), {
+  var names = ['GPURenderPassEncoder', 'GPUComputePassEncoder', 'GPURenderBundleEncoder'];
+  var wrapped = 0;
+  var scratch = [];
+  for (var k = 0; k < names.length; k++) {
+    var cls = globalThis[names[k]];
+    if (!cls || !cls.prototype || cls.prototype.__rexDynamicOffsetCopy) continue;
+    var original = cls.prototype.setBindGroup;
+    if (typeof original != 'function') continue;
+    cls.prototype.setBindGroup = (function(original) {
+      return function(index, group, data, start, length) {
+        if (arguments.length >= 5 && ArrayBuffer.isView(data)) {
+          var n = length >>> 0;
+          var s = scratch[n] || (scratch[n] = new Uint32Array(n));
+          for (var i = 0; i < n; i++) s[i] = data[start + i];
+          return original.call(this, index, group, s, 0, n);
+        }
+        return original.apply(this, arguments);
+      };
+    })(original);
+    Object.defineProperty(cls.prototype, '__rexDynamicOffsetCopy', {value: true});
+    wrapped++;
+  }
+  return wrapped;
+});
+
 const char* FeatureName(WGPUFeatureName feature) {
   switch (feature) {
     case WGPUFeatureName_CoreFeaturesAndLimits:
@@ -390,6 +428,11 @@ bool WebGPUDevice::UpdateSurfaceConfiguration(uint32_t& width_out, uint32_t& hei
 
 void WebGPUDevice::InitializeOnDeviceThread(em_proxying_ctx* ctx, void* arg) {
   auto* self = static_cast<WebGPUDevice*>(arg);
+
+  int wrapped = rexwgpu_install_dynamic_offset_copy();
+  REXWGPU_INFO("WebGPU: setBindGroup dynamic offsets copied out of the wasm heap ({} encoder "
+               "types wrapped)",
+               wrapped);
 
   self->instance_ = wgpuCreateInstance(nullptr);
   if (!self->instance_) {

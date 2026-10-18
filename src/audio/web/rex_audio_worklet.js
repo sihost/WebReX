@@ -1,13 +1,15 @@
 // ReXGlue web audio worklet processor (Workstream E).
 //
 // Embedded into web_audio_output.cpp with #embed and loaded through a Blob URL, so it
-// needs no extra file next to halo3.js. Reads stereo frames from the ring the SDK audio
-// driver writes in the wasm SharedArrayBuffer; layout in include/rex/audio/web/web_audio_output.h.
-// Each ring slot is one guest frame (256 interleaved stereo samples = two render quanta).
+// needs no extra file next to halo3.js. Reads frames from the ring the SDK audio driver
+// writes in the wasm SharedArrayBuffer; layout in include/rex/audio/web/web_audio_output.h.
+// Each ring slot is one guest frame (256 interleaved samples = two render quanta), stereo or
+// 5.1 as recorded in the slot's channel count; slots are sized for 6 channels.
 'use strict';
 
 const CTL_WRITE = 0, CTL_READ = 1, CTL_QUANTA = 5, CTL_UNDERRUN = 6, CTL_PLAYED = 7,
-  CTL_PEAK = 10, CTL_MUTED = 12, CTL_STOP = 16, CTL_PRIME = 18, CTL_COUNT = 32;
+  CTL_PEAK = 10, CTL_MUTED = 12, CTL_STOP = 16, CTL_PRIME = 18, CTL_UNDERRUN_EVENTS = 20,
+  CTL_COUNT = 32;
 // After an underrun, wait for this many queued frames (10.7 ms) before playing again, so
 // a producer that is just keeping up does not alternate frame / silence quantum.
 const PRIME_FRAMES = 2;
@@ -28,8 +30,9 @@ class RexAudioProcessor extends AudioWorkletProcessor {
     this.ctlF = new Float32Array(o.buffer, o.ctl, CTL_COUNT);
     this.slots = o.slots;
     this.slotSamples = o.slotSamples;
-    this.channels = o.channels;
-    this.ring = new Float32Array(o.buffer, o.ring, o.slots * o.slotSamples * o.channels);
+    this.maxChannels = o.maxChannels;
+    this.slotChannels = new Int32Array(o.buffer, o.slotChannels, o.slots);
+    this.ring = new Float32Array(o.buffer, o.ring, o.slots * o.slotSamples * o.maxChannels);
     this.cur = -1;  // frame counter of the slot being played, -1 = none
     this.pos = 0;   // sample position inside that slot
     this.primed = false;
@@ -45,8 +48,8 @@ class RexAudioProcessor extends AudioWorkletProcessor {
     if (Atomics.load(ctl, CTL_STOP)) return false;
     Atomics.add(ctl, CTL_QUANTA, 1);
     const out = outputs[0];
-    const left = out[0], right = out[1] || out[0];
-    const n = left.length;
+    const outChannels = out.length;
+    const n = out[0].length;
     const muted = Atomics.load(ctl, CTL_MUTED) !== 0;
     const ss = this.slotSamples;
     const q = ++this.quantum;
@@ -64,6 +67,8 @@ class RexAudioProcessor extends AudioWorkletProcessor {
           // Underrun: the rest of this quantum stays silent (outputs start zeroed).
           if (avail <= 0 && this.primed) {
             this.primed = false;
+            // The SDK's pacing thread raises its latency target on these.
+            Atomics.add(ctl, CTL_UNDERRUN_EVENTS, 1);
             if (q - this.lastUnderrun < PRIME_RAISE_QUANTA && this.prime < PRIME_FRAMES_MAX) {
               ++this.prime;
               Atomics.store(ctl, CTL_PRIME, this.prime);
@@ -78,20 +83,29 @@ class RexAudioProcessor extends AudioWorkletProcessor {
         this.pos = 0;
         this.peak = 0;
       }
-      const base = ((this.cur >>> 0) % this.slots) * ss * 2;
+      const slot = (this.cur >>> 0) % this.slots;
+      const base = slot * ss * this.maxChannels;
+      // 2 (stereo downmix) or 6 (5.1: FL FR FC LFE BL BR, the Web Audio 5.1 order).
+      const sc = Atomics.load(this.slotChannels, slot) === 6 ? 6 : 2;
       const take = Math.min(n - i, ss - this.pos);
-      const ring = this.ring;
-      let peak = this.peak;
-      for (let k = 0; k < take; ++k) {
-        const s = base + (this.pos + k) * 2;
-        const l = ring[s], rr = ring[s + 1];
-        const al = l < 0 ? -l : l, ar = rr < 0 ? -rr : rr;
-        if (al > peak) peak = al;
-        if (ar > peak) peak = ar;
-        if (!muted) {
-          left[i + k] = l;
-          if (right !== left) right[i + k] = rr;
+        const ring = this.ring;
+        let peak = this.peak;
+        const copy = Math.min(sc, outChannels);
+        for (let c = 0; c < sc; ++c) {
+        const dst = c < copy && !muted ? out[c] : null;
+        let s = base + this.pos * sc + c;
+          for (let k = 0; k < take; ++k, s += sc) {
+          const v = ring[s];
+            const a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+            if (dst) dst[i + k] = v;
         }
+      }
+      if (sc === 2 && outChannels === 1 && !muted) {
+        // Mono destination: (L + R) / 2.
+        const m = out[0];
+        let s = base + this.pos * 2;
+        for (let k = 0; k < take; ++k, s += 2) m[i + k] = (ring[s] + ring[s + 1]) * 0.5;
       }
       this.peak = peak;
       i += take;

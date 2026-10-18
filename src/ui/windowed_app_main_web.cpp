@@ -20,11 +20,13 @@
 
 #include <spdlog/common.h>
 
+#include <rex/crash_report.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_web.h>
+#include <rex/web_page.h>
 
 extern "C" int main(int argc, char** argv) {
   auto remaining = rex::cvar::Init(argc, argv);
@@ -51,6 +53,10 @@ extern "C" int main(int argc, char** argv) {
     // RexApp::OnInitialize mounts OPFS (OnConfigurePaths) and then re-runs
     // InitLogging with the cvar, which adds the file sink (core/logging.cpp).
     rex::InitLogging(nullptr);
+    // Crash reports to the page (Module.rexOnFatal, src/ui/rex_web_pre.js) and the page
+    // lifecycle state (hidden / frozen) for any thread.
+    rex::crash::InstallCrashReporting();
+    rex::web::InstallPageLifecycle();
 
     if (app->OnInitialize()) {
       app_context.RunMainLoop();

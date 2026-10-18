@@ -14,6 +14,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/crash_report.h>
 #include <rex/platform.h>
 #include <rex/ppc/detail/seh.h>
 
@@ -37,9 +38,12 @@ int seh_filter(uint32_t /*code*/, void* /*exception_pointers*/) {
 
 [[noreturn]] void seh_rethrow() {
   // Native POSIX re-raises the fault signal and dies; there is no fault to re-raise here.
-  std::fprintf(stderr, "[rex::seh/web] unhandled guest exception code=0x%08X info=%llx,%llx\n",
-               tls_seh_state.code, static_cast<unsigned long long>(tls_seh_state.info[0]),
-               static_cast<unsigned long long>(tls_seh_state.info[1]));
+  char note[160];
+  std::snprintf(note, sizeof(note), "unhandled guest exception code=0x%08X info=%llx,%llx",
+                tls_seh_state.code, static_cast<unsigned long long>(tls_seh_state.info[0]),
+                static_cast<unsigned long long>(tls_seh_state.info[1]));
+  std::fprintf(stderr, "[rex::seh/web] %s\n", note);
+  rex_web_note_fatal("guest-exception", note);
   std::abort();
 }
 

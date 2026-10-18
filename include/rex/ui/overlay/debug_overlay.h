@@ -13,6 +13,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace rex::ui {
 
@@ -31,6 +32,10 @@ class DebugOverlayDialog : public ImGuiDialog {
 
   void ToggleVisible() { visible_ = !visible_; }
   bool IsVisible() const { return visible_; }
+
+  // Text the graphics backend shows under the frame times (adapter, degraded optional
+  // features). Any thread.
+  static void SetGpuNote(std::string note);
 
  protected:
   void OnDraw(ImGuiIO& io) override;

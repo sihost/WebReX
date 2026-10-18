@@ -13,7 +13,20 @@
 #include <rex/ui/keybinds.h>
 #include <imgui.h>
 
+#include <mutex>
+#include <string>
+
 namespace rex::ui {
+
+namespace {
+std::mutex g_gpu_note_mutex;
+std::string g_gpu_note;
+}  // namespace
+
+void DebugOverlayDialog::SetGpuNote(std::string note) {
+  std::lock_guard lock(g_gpu_note_mutex);
+  g_gpu_note = std::move(note);
+}
 
 DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
     : ImGuiDialog(imgui_drawer), stats_provider_(std::move(stats_provider)) {
@@ -38,6 +51,16 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       if (stats.frame_count > 0) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
       }
+    }
+      std::string note;
+    {
+      std::lock_guard lock(g_gpu_note_mutex);
+      note = g_gpu_note;
+    }
+    if (!note.empty()) {
+      ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+      ImGui::TextUnformatted(note.c_str());
+      ImGui::PopTextWrapPos();
     }
   }
   ImGui::End();

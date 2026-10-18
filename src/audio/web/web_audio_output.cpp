@@ -45,6 +45,15 @@ constexpr auto kStallTimeout = std::chrono::milliseconds(60);
 // waited for: playback is late, never skipped, and the guest is paced by real playback.
 // Free-run only if it renders nothing for this long (audio device gone).
 constexpr auto kRunningStallTimeout = std::chrono::milliseconds(1500);
+// Latency target: lowered by a frame after this long without an underrun. An underrun soon
+// after such a step (the lower target was too low) doubles the wait before the next one, up to
+// kTargetDecayMax, so probing a lower latency costs a click at most every few minutes.
+constexpr auto kTargetDecay = std::chrono::seconds(10);
+constexpr auto kTargetDecayMax = std::chrono::seconds(320);
+// Underruns closer together than this raise the target once.
+constexpr auto kRaiseCooldown = std::chrono::milliseconds(250);
+// Underruns in the first second of playback (375 quanta) do not raise it.
+constexpr int32_t kWarmupQuanta = 375;
 
 static_assert(sizeof(std::atomic<int32_t>) == 4 && std::atomic<int32_t>::is_always_lock_free,
               "the control block is shared with JS Int32Array Atomics");
@@ -54,11 +63,12 @@ static_assert(sizeof(std::atomic<int32_t>) == 4 && std::atomic<int32_t>::is_alwa
 // Runs on the browser main thread (AudioContext and AudioWorklet are only exposed there).
 // Pointers are passed as doubles: exact below 2^53 and free of the wasm64 BigInt question.
 // One AudioContext is shared by all outputs; each output gets its own AudioWorkletNode.
+// channels: 0 = 5.1 if the destination has >= 6 channels, else stereo; 2 or 6 = forced.
 EM_JS(void, rex_audio_js_start,
-      (double ctl_ptr, double ring_ptr, int slots, int slot_samples, int channels,
-       double src_ptr, int src_len),
+      (double ctl_ptr, double ring_ptr, double slot_ch_ptr, int slots, int slot_samples,
+       int max_channels, int channels, double src_ptr, int src_len),
       {
-        const STATE = 9, RATE = 13, LAT = 14, COUNT = 32;
+        const STATE = 9, RATE = 13, LAT = 14, OUT_CH = 21, COUNT = 32;
         const log = Module['printErr'] || console.error;
         const st = Module['rexAudio'] || (Module['rexAudio'] = {outputs : []});
         const buffer = HEAPU8.buffer;
@@ -117,6 +127,12 @@ EM_JS(void, rex_audio_js_start,
                                             submitted : Atomics.load(o.ctl, 15),
                                             maxBatch : Atomics.load(o.ctl, 17),
                                             prime : Atomics.load(o.ctl, 18),
+                                            target : Atomics.load(o.ctl, 19),
+                                            underruns : Atomics.load(o.ctl, 20),
+                                            outputChannels : Atomics.load(o.ctl, 21),
+                                            withheld : Atomics.load(o.ctl, 22),
+                                            destinationMaxChannels :
+                                                ctx.destination.maxChannelCount,
                                             contextState : ctx.state
                                           }));
           const url = URL.createObjectURL(new Blob([src], {type : 'text/javascript'}));
@@ -127,21 +143,42 @@ EM_JS(void, rex_audio_js_start,
         }
         st.ready
             .then(() => {
+              const dest = st.ctx.destination;
+              const destMax = dest.maxChannelCount | 0;
+              const surround = channels == 6 || (channels == 0 && destMax >= 6);
+              const outChannels = surround ? 6 : 2;
+              if (surround && destMax >= 6 && dest.channelCount != 6) {
+                // 5.1 to the device; the default destination is stereo.
+                try {
+                  dest.channelCount = 6;
+                  dest.channelCountMode = 'explicit';
+                  dest.channelInterpretation = 'speakers';
+                } catch (e) {
+                  log('[audio] could not set the destination to 6 channels: ' + e);
+                }
+              }
               const node = new AudioWorkletNode(st.ctx, 'rex-audio', {
                 numberOfInputs : 0,
                 numberOfOutputs : 1,
-                outputChannelCount : [channels],
+                outputChannelCount : [outChannels],
+                channelInterpretation : 'speakers',
                 processorOptions : {
                   buffer,
                   ctl : ctl_ptr,
                   ring : ring_ptr,
+                  slotChannels : slot_ch_ptr,
                   slots,
                   slotSamples : slot_samples,
-                  channels
+                  maxChannels : max_channels
                 }
               });
-              node.connect(st.ctx.destination);
+              node.connect(dest);
               out.node = node;
+              // From now on the driver writes frames in this layout.
+              Atomics.store(out.ctl, OUT_CH, outChannels);
+              log('[audio] output ' + (surround ? '5.1' : 'stereo downmix') + ' (destination ' +
+                  destMax + ' channels max, ' + dest.channelCount + ' in use, requested ' +
+                  (channels || 'auto') + ')');
               st.update();
             })
             .catch((e) => {
@@ -165,12 +202,15 @@ namespace {
 struct JsStartArgs {
   double ctl;
   double ring;
+  double slot_channels;
+  int channels;
 };
 
 void JsStartOnMainThread(void* p) {
   auto* args = static_cast<JsStartArgs*>(p);
-  rex_audio_js_start(args->ctl, args->ring, WebAudioOutput::kSlots,
-                     WebAudioOutput::kChannelSamples, WebAudioOutput::kOutputChannels,
+  rex_audio_js_start(args->ctl, args->ring, args->slot_channels, WebAudioOutput::kSlots,
+                     WebAudioOutput::kChannelSamples, WebAudioOutput::kMaxOutputChannels,
+                     args->channels,
                      static_cast<double>(reinterpret_cast<uintptr_t>(kWorkletSource)),
                      static_cast<int>(sizeof(kWorkletSource) - 1));
   delete args;
@@ -192,7 +232,15 @@ void RunOnMainThread(void (*fn)(void*), void* arg) {
 
 }  // namespace
 
-WebAudioOutput::WebAudioOutput(ConsumedFn on_consumed) : on_consumed_(std::move(on_consumed)) {}
+WebAudioOutput::WebAudioOutput(ConsumedFn on_consumed)
+    : WebAudioOutput(std::move(on_consumed), Options{}) {}
+
+WebAudioOutput::WebAudioOutput(ConsumedFn on_consumed, const Options& options)
+    : on_consumed_(std::move(on_consumed)), options_(options) {
+  if (options_.channels != 2 && options_.channels != 6) {
+    options_.channels = 0;
+  }
+}
 
 WebAudioOutput::~WebAudioOutput() {
   Stop();
@@ -202,12 +250,15 @@ bool WebAudioOutput::Start() {
   if (running_) {
     return true;
   }
-  // One 16-byte aligned block: control words, then the ring. Intentionally never freed: the
-  // AudioWorklet keeps typed-array views on it until its node is torn down asynchronously
-  // on the main thread (about 130 KiB per driver; the guest creates drivers once).
+  // One 16-byte aligned block: control words, per-slot channel counts, then the ring.
+  // Intentionally never freed: the AudioWorklet keeps typed-array views on it until its node
+  // is torn down asynchronously on the main thread (about 390 KiB per driver; the guest
+  // creates drivers once).
   constexpr size_t kCtlBytes = kCtlCount * sizeof(std::atomic<int32_t>);
-  constexpr size_t kRingBytes = size_t(kSlots) * kChannelSamples * kOutputChannels * sizeof(float);
-  void* block = std::aligned_alloc(16, kCtlBytes + kRingBytes);
+  constexpr size_t kSlotChannelsBytes = kSlots * sizeof(std::atomic<int32_t>);
+  constexpr size_t kRingBytes =
+      size_t(kSlots) * kChannelSamples * kMaxOutputChannels * sizeof(float);
+  void* block = std::aligned_alloc(16, kCtlBytes + kSlotChannelsBytes + kRingBytes);
   if (!block) {
     return false;
   }
@@ -215,18 +266,26 @@ bool WebAudioOutput::Start() {
   for (uint32_t i = 0; i < kCtlCount; ++i) {
     new (&ctl_[i]) std::atomic<int32_t>(0);
   }
-  ring_ = reinterpret_cast<float*>(static_cast<uint8_t*>(block) + kCtlBytes);
+  slot_channels_ =
+      reinterpret_cast<std::atomic<int32_t>*>(static_cast<uint8_t*>(block) + kCtlBytes);
+  for (uint32_t i = 0; i < kSlots; ++i) {
+    new (&slot_channels_[i]) std::atomic<int32_t>(2);
+  }
+  ring_ = reinterpret_cast<float*>(static_cast<uint8_t*>(block) + kCtlBytes + kSlotChannelsBytes);
   std::fill_n(ring_, kRingBytes / sizeof(float), 0.0f);
   ctl_[kCtlSlots].store(kSlots);
   ctl_[kCtlSlotSamples].store(kChannelSamples);
-  ctl_[kCtlChannels].store(kOutputChannels);
+  ctl_[kCtlChannels].store(kMaxOutputChannels);
+  ctl_[kCtlTarget].store(static_cast<int32_t>(options_.min_frames));
 
   running_ = true;
   pacing_thread_ = std::thread([this]() { PacingThread(); });
 
   RunOnMainThread(JsStartOnMainThread,
                   new JsStartArgs{static_cast<double>(reinterpret_cast<uintptr_t>(ctl_)),
-                                  static_cast<double>(reinterpret_cast<uintptr_t>(ring_))});
+                                  static_cast<double>(reinterpret_cast<uintptr_t>(ring_)),
+                                  static_cast<double>(reinterpret_cast<uintptr_t>(slot_channels_)),
+                                  static_cast<int>(options_.channels)});
   return true;
 }
 
@@ -265,8 +324,17 @@ void WebAudioOutput::SubmitGuestFrame(const float* frame) {
     Consumed(1);
     return;
   }
-  float* slot = ring_ + (static_cast<uint32_t>(write) % kSlots) * kChannelSamples * kOutputChannels;
-  conversion::sequential_6_BE_to_interleaved_2_LE(slot, frame, kChannelSamples);
+  const uint32_t index = static_cast<uint32_t>(write) % kSlots;
+  float* slot = ring_ + index * kChannelSamples * kMaxOutputChannels;
+  // The layout of the AudioWorkletNode once it exists (stereo until then); recorded per slot,
+  // so frames queued before the node switched to 5.1 still play right.
+  if (ctl_[kCtlOutChannels].load(std::memory_order_relaxed) == 6) {
+    conversion::sequential_6_BE_to_interleaved_6_LE(slot, frame, kChannelSamples);
+    slot_channels_[index].store(6, std::memory_order_relaxed);
+  } else {
+    conversion::sequential_6_BE_to_interleaved_2_LE(slot, frame, kChannelSamples);
+    slot_channels_[index].store(2, std::memory_order_relaxed);
+  }
   ctl_[kCtlWrite].store(write + 1, std::memory_order_release);
   // Wakes the pacing thread if it idles in free-run with an empty ring.
   emscripten_futex_wake(&ctl_[kCtlRead], 1);
@@ -289,6 +357,10 @@ WebAudioStats WebAudioOutput::stats() const {
   s.ring_frames = static_cast<uint32_t>(ctl_[kCtlWrite].load() - ctl_[kCtlRead].load());
   s.peak = std::bit_cast<float>(ctl_[kCtlPeak].load());
   s.max_batch = static_cast<uint32_t>(ctl_[kCtlMaxBatch].load());
+  s.target_frames = static_cast<uint32_t>(ctl_[kCtlTarget].load());
+  s.withheld = static_cast<uint32_t>(ctl_[kCtlWithheld].load());
+  s.underruns = static_cast<uint32_t>(ctl_[kCtlUnderrunEvents].load());
+  s.output_channels = static_cast<uint32_t>(ctl_[kCtlOutChannels].load());
   return s;
 }
 
@@ -304,18 +376,77 @@ void WebAudioOutput::PacingThread() {
   auto last_quanta_change = Clock::now();
   bool free_run = true;  // until the worklet renders its first quantum
   auto free_run_base = Clock::now();
+  // Latency control (see the header). Frames are conserved: the guest's budget B (its
+  // audio_maxqframes) = credits it holds + ring depth + withheld. budget is the largest
+  // depth + withheld seen, which reaches B as soon as the guest has spent its credits (at
+  // start and whenever it waits for us), so withholding budget - target leaves the guest and
+  // the ring together `target` frames.
+  const bool control = options_.min_frames > 0;
+  const int32_t min_target = static_cast<int32_t>(std::max(options_.min_frames, 1u));
+  int32_t target = min_target;
+  int32_t withheld = 0;
+  int32_t budget = 0;
+  int32_t seen_underruns = ctl_[kCtlUnderrunEvents].load();
+  auto target_changed = Clock::now();
+  Clock::duration decay = kTargetDecay;
+  auto last_decay = Clock::now() - 2 * kTargetDecayMax;  // "long ago" without overflow
   while (running_) {
     int32_t read = ctl_[kCtlRead].load(std::memory_order_acquire);
+    uint32_t n = 0;
     if (read != released) {
-      const auto n = static_cast<uint32_t>(read - released);
-      // Diagnostic: largest batch handed back at once (worklet burst size + wake latency).
-      if (static_cast<int32_t>(n) > ctl_[kCtlMaxBatch].load(std::memory_order_relaxed)) {
-        ctl_[kCtlMaxBatch].store(static_cast<int32_t>(n), std::memory_order_relaxed);
-      }
-      Consumed(n);
+      n = static_cast<uint32_t>(read - released);
       released = read;
     }
     const auto now = Clock::now();
+    if (!control) {
+      if (n) {
+        Consumed(n);
+      }
+    } else {
+      withheld += static_cast<int32_t>(n);
+      const int32_t depth = ctl_[kCtlWrite].load(std::memory_order_acquire) - read;
+      budget = std::max(budget, depth + withheld);
+      const int32_t underruns = ctl_[kCtlUnderrunEvents].load(std::memory_order_relaxed);
+      if (underruns != seen_underruns) {
+        // The guest did not refill in time: give it (and the worklet) more room. Underruns
+        // in the first second of playback (threads warming up) and within kRaiseCooldown of
+        // the last raise (one scheduling hiccup) count once.
+        seen_underruns = underruns;
+        if (ctl_[kCtlQuanta].load(std::memory_order_relaxed) > kWarmupQuanta &&
+            now - target_changed > kRaiseCooldown) {
+          if (now - last_decay < decay) {
+            decay = std::min<Clock::duration>(decay * 2, kTargetDecayMax);
+          }
+          target = std::min(target + 1, std::max(budget, min_target));
+          target_changed = now;
+        }
+      } else if (target > min_target && now - target_changed > decay) {
+        --target;
+        target_changed = now;
+        last_decay = now;
+      }
+      // After an underrun the worklet waits for `prime` queued frames before it plays again;
+      // a smaller target would never let the ring get there.
+      const int32_t effective =
+          std::max(target, ctl_[kCtlPrime].load(std::memory_order_relaxed));
+      // Free-run (nothing audible) paces like real playback only with a full ring: an empty
+      // ring at a deadline restarts the clock (measured: 153 instead of 187.5 frames/s with
+      // the guest refilling a 3-frame target), so hand everything back there.
+      const int32_t keep = free_run ? 0 : std::max(budget - effective, 0);
+      if (withheld > keep) {
+        n = static_cast<uint32_t>(withheld - keep);
+        withheld = keep;
+        Consumed(n);
+      } else {
+        n = 0;
+      }
+      ctl_[kCtlTarget].store(effective, std::memory_order_relaxed);
+      ctl_[kCtlWithheld].store(withheld, std::memory_order_relaxed);
+    }
+    // Diagnostic: largest batch handed back at once (worklet burst size + wake latency).
+    if (static_cast<int32_t>(n) > ctl_[kCtlMaxBatch].load(std::memory_order_relaxed)) {
+      ctl_[kCtlMaxBatch].store(static_cast<int32_t>(n), std::memory_order_relaxed);
+    }
     const int32_t quanta = ctl_[kCtlQuanta].load(std::memory_order_relaxed);
     if (quanta != last_quanta) {
       last_quanta = quanta;
@@ -350,6 +481,10 @@ void WebAudioOutput::PacingThread() {
     // Woken by the worklet (Atomics.notify after each frame), by SubmitGuestFrame, or by
     // the timeout (heartbeat check / free-run deadline).
     emscripten_futex_wait(&ctl_[kCtlRead], static_cast<uint32_t>(read), std::max(wait_ms, 0.5));
+  }
+  // Keep the guest's accounting balanced (the driver is going away).
+  if (withheld > 0) {
+    Consumed(static_cast<uint32_t>(withheld));
   }
 }
 

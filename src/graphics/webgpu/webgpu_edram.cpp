@@ -303,7 +303,36 @@ bool WebGPUEdram::Initialize() {
       for (uint32_t ms = 0; ms < 2; ++ms) {
         desc.label = MakeStringView("EDRAM load color");
         desc.multisample.count = ms ? 4 : 1;
+        // The spec guarantees 4x for every format here except rg32float (k_32_32_FLOAT);
+        // Chrome supports it, Firefox reports a validation error. Catch it in a scope
+        // instead of an uncaptured error and skip such loads (RecordLoad).
+        const bool msaa_optional = ms && kColorHostFormats[f] == WGPUTextureFormat_RG32Float;
+        if (msaa_optional) {
+          wgpuDevicePushErrorScope(device, WGPUErrorFilter_Validation);
+        }
         color_load_pipelines_[f][ms] = wgpuDeviceCreateRenderPipeline(device, &desc);
+        if (msaa_optional) {
+          WGPUPopErrorScopeCallbackInfo pop = WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
+          pop.mode = WGPUCallbackMode_AllowSpontaneous;
+          pop.callback = [](WGPUPopErrorScopeStatus status, WGPUErrorType type,
+                            WGPUStringView message, void* userdata1, void*) {
+            if (status != WGPUPopErrorScopeStatus_Success || type == WGPUErrorType_NoError) {
+              return;
+            }
+            static_cast<std::atomic<bool>*>(userdata1)->store(true, std::memory_order_release);
+            REXWGPU_INFO(
+                "WebGPU EDRAM: no 4x MSAA for rg32float (k_32_32_FLOAT) on this browser, its "
+                "EDRAM loads are skipped: {}",
+                std::string_view(message.data ? message.data : "",
+                                 message.data ? (message.length == WGPU_STRLEN
+                                                     ? std::strlen(message.data)
+                                                     : message.length)
+                                              : 0)
+                    .substr(0, 200));
+          };
+          pop.userdata1 = &color_load_msaa_failed_[f];
+          wgpuDevicePopErrorScope(device, pop);
+        }
       }
     }
 
@@ -514,7 +543,9 @@ void WebGPUEdram::DrawRectangles(WebGPUCommandStream& stream, const WebGPUEdramS
     if (index < 0) {
       return;
     }
-    pipelines[0] = color_load_pipelines_[index][ms];
+    pipelines[0] = ms && color_load_msaa_failed_[index].load(std::memory_order_acquire)
+                       ? nullptr
+                       : color_load_pipelines_[index][ms];
     pipeline_count = 1;
   }
 
