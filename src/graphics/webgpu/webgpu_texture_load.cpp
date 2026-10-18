@@ -541,6 +541,44 @@ void WebGPUTextureFormatTable::Initialize(const WebGPUTextureFeatures& features)
     formats_[uint32_t(format)].format_signed.filterable = features.float32_filterable;
   }
   set(F::k_32_32_32_FLOAT, Pair(none, none, kRGBB));
+
+  // A float-sample-type layout entry rejects an unfilterable texture at CreateBindGroup, and
+  // the invalid bind group then invalidates the whole command encoder (all draws of the
+  // submission). Derive filterability from the host format so it can't be forgotten.
+  auto sanitize = [&features](WebGPUTextureHostFormatPair& pair) {
+    for (WebGPUTextureHostFormat* f : {&pair.format_unsigned, &pair.format_signed}) {
+      if (f->format != WGPUTextureFormat_Undefined) {
+        f->filterable =
+            f->filterable && IsTextureFormatFilterable(f->format, features.float32_filterable);
+      }
+    }
+  };
+  for (WebGPUTextureHostFormatPair& pair : formats_) {
+    sanitize(pair);
+  }
+  for (WebGPUTextureHostFormatPair* pair : {&dxt1_decompress_, &dxt2_3_decompress_,
+                                            &dxt4_5_decompress_, &dxn_decompress_,
+                                            &dxt5a_decompress_}) {
+    sanitize(*pair);
+  }
+}
+
+bool IsTextureFormatFilterable(WGPUTextureFormat format, bool float32_filterable) {
+  switch (format) {
+    case WGPUTextureFormat_R16Unorm:
+    case WGPUTextureFormat_R16Snorm:
+    case WGPUTextureFormat_RG16Unorm:
+    case WGPUTextureFormat_RG16Snorm:
+    case WGPUTextureFormat_RGBA16Unorm:
+    case WGPUTextureFormat_RGBA16Snorm:
+      return false;
+    case WGPUTextureFormat_R32Float:
+    case WGPUTextureFormat_RG32Float:
+    case WGPUTextureFormat_RGBA32Float:
+      return float32_filterable;
+    default:
+      return true;
+  }
 }
 
 const WebGPUTextureHostFormatPair& WebGPUTextureFormatTable::Get(xenos::TextureFormat format,

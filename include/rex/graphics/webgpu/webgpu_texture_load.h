@@ -53,7 +53,12 @@ struct WebGPUTextureFeatures {
   bool bc_sliced_3d = false;
   // texture-formats-tier1: r/rg/rgba16 unorm/snorm host formats; without it 16-bit
   // normalized data (including the 10_11_11 / 11_11_10 / signed 2_10_10_10 expansions) is
-  // stored as float16.
+  // stored as float16. The tier1 16-bit normalized formats only support the
+  // unfilterable-float sample type (WebGPU spec; Chrome: "None of the supported sample types
+  // (UnfilterableFloat) of [... RG16Unorm] match the expected sample types (Float)"), and
+  // every guest texture binding is a float (filterable) layout entry with a filtering
+  // sampler, so with this the table marks them unfilterable and they are bound as the null
+  // texture. Off by default (webgpu_texture_formats_tier1).
   bool formats_tier1 = false;
   // float32-filterable: 32_FLOAT textures can be filtered (else samplers use nearest).
   bool float32_filterable = false;
@@ -214,6 +219,10 @@ bool GetHostTextureInfo(const WebGPUTextureFormatTable& table, xenos::TextureFor
                         uint32_t depth_or_array_size, uint32_t mip_max_level,
                         bool signed_separate, WebGPUHostTextureInfo& info_out);
 uint32_t GetTextureFormatBytesPerBlock(WGPUTextureFormat format, uint32_t* block_size_out);
+// Whether a sampled color format supports the float (filterable) sample type, per the WebGPU
+// spec texture format capabilities: the texture-formats-tier1 r/rg/rgba16 unorm/snorm formats
+// are unfilterable-float only, 32-bit float formats need float32-filterable.
+bool IsTextureFormatFilterable(WGPUTextureFormat format, bool float32_filterable);
 
 class WebGPUTextureLoader {
  public:
