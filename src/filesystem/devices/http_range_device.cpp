@@ -4,10 +4,13 @@
  *
  * See rex/filesystem/devices/http_range_device.h and docs/port/vfs.md (project repo).
  *
- * Transport: synchronous XMLHttpRequest from the calling pthread. Every guest file read runs
- * on a pthread (a Worker; PROXY_TO_PTHREAD keeps even main() off the browser main thread), and
- * sync XHR with responseType "arraybuffer" is allowed in Workers. Under node (tests) the same
- * entry points read from the local directory named by $REX_WEB_TEST_DATA_ROOT instead.
+ * Transport: synchronous XMLHttpRequest from a pthread. Every guest file read runs on a pthread
+ * (a Worker; PROXY_TO_PTHREAD keeps even main() off the browser main thread), and sync XHR with
+ * responseType "arraybuffer" is allowed in Workers. Parallelism comes from more pthreads: the
+ * missing blocks of a read are split into pieces, the reader fetches one and a pool of fetch
+ * threads (--vfs_http_fetch_threads) the others, and sequential readers get blocks read ahead
+ * (--vfs_http_read_ahead_blocks) on the same pool. Under node (tests) the same entry points
+ * read from the local directory named by $REX_WEB_TEST_DATA_ROOT instead.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -30,15 +33,28 @@ static_assert(REX_PLATFORM_WEB, "HttpRangeDevice is web-only (Emscripten)");
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <span>
 #include <string_view>
+#include <thread>
 
+#include <rex/cvar.h>
 #include <rex/filesystem/entry.h>
 #include <rex/filesystem/file.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string.h>
 #include <rex/string/utf8.h>
+
+REXCVAR_DEFINE_INT32(vfs_http_fetch_threads, 4, "Filesystem",
+                     "Web HttpRangeDevice: fetch threads (Workers, one sync Range request each) "
+                     "that download the missing blocks of a read in parallel with the reader "
+                     "and run read-ahead. 0 = one request at a time on the reader, no read-ahead")
+    .range(0, 16);
+REXCVAR_DEFINE_INT32(vfs_http_read_ahead_blocks, 8, "Filesystem",
+                     "Web HttpRangeDevice: blocks fetched ahead of a file read sequentially "
+                     "(needs vfs_http_fetch_threads > 0; capped at half the memory cache). 0 = off")
+    .range(0, 64);
 
 // -------------------------------------------------------------------------------------------
 // JS transport. All pointers and 64-bit integers are passed as doubles (exact below 2^53), which
@@ -310,6 +326,40 @@ struct HttpRangeDevice::PersistentFile {
   }
 };
 
+// -------------------------------------------------------------------------------------------
+// Fetch pool: threads that run FetchClaimed for pieces of demand reads (first) and read-ahead.
+// -------------------------------------------------------------------------------------------
+
+struct HttpRangeDevice::FetchJob {
+  enum class State { kQueued, kRunning, kDone };
+  uint32_t file = 0;
+  uint32_t first = 0;
+  uint32_t last = 0;
+  std::vector<uint8_t> data;
+  bool ok = false;
+  State state = State::kQueued;  // guarded by FetchPool::mutex
+};
+
+struct HttpRangeDevice::FetchPool {
+  std::mutex mutex;
+  std::condition_variable work_cv;  // workers: a job was queued or stop
+  std::condition_variable done_cv;  // readers: a job finished
+  std::deque<std::shared_ptr<FetchJob>> demand;
+  std::deque<std::shared_ptr<FetchJob>> ahead;
+  std::vector<std::thread> threads;
+  uint32_t thread_count = 0;
+  bool stop = false;
+
+  // Removes `job` from the demand queue if no worker took it yet (the reader runs it itself).
+  bool TakeBackLocked(const std::shared_ptr<FetchJob>& job) {
+    auto it = std::find(demand.begin(), demand.end(), job);
+    if (it == demand.end()) return false;
+    demand.erase(it);
+    job->state = FetchJob::State::kRunning;
+    return true;
+  }
+};
+
 HttpRangeDevice::HttpRangeDevice(const std::string_view mount_path,
                                  HttpRangeDeviceOptions options)
     : Device(mount_path), options_(std::move(options)) {
@@ -317,7 +367,63 @@ HttpRangeDevice::HttpRangeDevice(const std::string_view mount_path,
   options_.max_request_bytes = std::max(options_.max_request_bytes, options_.block_size);
 }
 
-HttpRangeDevice::~HttpRangeDevice() = default;
+HttpRangeDevice::~HttpRangeDevice() {
+  StopPool();
+}
+
+void HttpRangeDevice::StartPool() {
+  int32_t threads = options_.fetch_threads >= 0 ? options_.fetch_threads
+                                                : REXCVAR_GET(vfs_http_fetch_threads);
+  int32_t ahead = options_.read_ahead_blocks >= 0 ? options_.read_ahead_blocks
+                                                  : REXCVAR_GET(vfs_http_read_ahead_blocks);
+  threads = std::clamp(threads, 0, 16);
+  read_ahead_ = threads > 0 ? uint32_t(std::clamp(ahead, 0, 64)) : 0;
+  read_ahead_ = std::min(read_ahead_, options_.memory_cache_blocks / 2);
+  if (threads <= 0 || pool_) return;
+  pool_ = std::make_unique<FetchPool>();
+  pool_->thread_count = uint32_t(threads);
+  for (int32_t i = 0; i < threads; ++i) {
+    pool_->threads.emplace_back([this] {
+      FetchPool& pool = *pool_;
+      std::unique_lock<std::mutex> lock(pool.mutex);
+      for (;;) {
+        pool.work_cv.wait(lock, [&] { return pool.stop || !pool.demand.empty() || !pool.ahead.empty(); });
+        if (pool.stop) return;
+        auto& queue = !pool.demand.empty() ? pool.demand : pool.ahead;
+        std::shared_ptr<FetchJob> job = std::move(queue.front());
+        queue.pop_front();
+        job->state = FetchJob::State::kRunning;
+        lock.unlock();
+        stat_pool_requests_.fetch_add(1, std::memory_order_relaxed);
+        job->ok = FetchClaimed(job->file, job->first, job->last, job->data);
+        lock.lock();
+        job->state = FetchJob::State::kDone;
+        pool.done_cv.notify_all();
+      }
+    });
+  }
+}
+
+void HttpRangeDevice::StopPool() {
+  if (!pool_) return;
+  std::vector<std::shared_ptr<FetchJob>> dropped;
+  {
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    pool_->stop = true;
+    dropped.assign(pool_->ahead.begin(), pool_->ahead.end());
+    pool_->ahead.clear();
+  }
+  pool_->work_cv.notify_all();
+  for (auto& t : pool_->threads) {
+    if (t.joinable()) t.join();
+  }
+  // Release the claims of read-ahead that never ran (no reader can be left at this point).
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  for (auto& job : dropped) {
+    for (uint32_t b = job->first; b <= job->last; ++b) inflight_.erase(BlockKey{job->file, b});
+  }
+  pool_.reset();
+}
 
 bool HttpRangeDevice::Initialize() {
   std::string json;
@@ -376,9 +482,13 @@ bool HttpRangeDevice::InitializeFromManifest(const std::string& manifest_json) {
   if (!BuildTree()) {
     return false;
   }
-  REXFS_INFO("HttpRangeDevice: {} files from {} (base {}, block {} KiB, cache {})", files_.size(),
-             options_.manifest_url, options_.base_url, options_.block_size / 1024,
-             persistent_enabled_ ? options_.persistent_cache_dir : std::string("memory only"));
+  StartPool();
+  REXFS_INFO(
+      "HttpRangeDevice: {} files from {} (base {}, block {} KiB, cache {}, fetch threads {}, "
+      "read-ahead {} blocks)",
+      files_.size(), options_.manifest_url, options_.base_url, options_.block_size / 1024,
+      persistent_enabled_ ? options_.persistent_cache_dir : std::string("memory only"),
+      pool_ ? pool_->thread_count : 0, read_ahead_);
   return true;
 }
 
@@ -603,6 +713,79 @@ bool HttpRangeDevice::FetchBlocks(uint32_t file, uint32_t first, uint32_t last,
   return false;
 }
 
+bool HttpRangeDevice::IsCachedLocked(uint32_t file, uint32_t block) {
+  if (lru_index_.count(BlockKey{file, block})) return true;
+  PersistentFile* pf = GetPersistentFile(file);
+  return pf && pf->Has(block);
+}
+
+bool HttpRangeDevice::FetchClaimed(uint32_t file, uint32_t first, uint32_t last,
+                                   std::vector<uint8_t>& out) {
+  const bool ok = FetchBlocks(file, first, last, out);
+  const auto& info = files_[file];
+  const uint32_t bs = options_.block_size;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (ok) {
+      for (uint32_t b = first; b <= last; ++b) {
+        InsertMemoryBlock(file, b, out.data() + uint64_t(b - first) * bs, BlockBytes(info, b));
+      }
+      WritePersistentBlocks(file, first, out.data(), out.size());
+    }
+    for (uint32_t b = first; b <= last; ++b) {
+      inflight_.erase(BlockKey{file, b});
+    }
+  }
+  inflight_cv_.notify_all();
+  return ok;
+}
+
+void HttpRangeDevice::MaybeReadAhead(uint32_t file, uint32_t first, uint32_t last) {
+  if (!pool_ || read_ahead_ == 0) return;
+  {
+    // Enough read-ahead queued already (the pool is the bottleneck): skip.
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    if (pool_->ahead.size() >= size_t(pool_->thread_count) * 2) return;
+  }
+  const uint32_t count = BlockCount(files_[file]);
+  const uint32_t piece_blocks =
+      std::clamp<uint32_t>((read_ahead_ + pool_->thread_count - 1) / pool_->thread_count, 1,
+                           std::max<uint32_t>(1, options_.max_request_bytes / options_.block_size));
+  std::vector<std::shared_ptr<FetchJob>> jobs;
+  uint64_t blocks = 0;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = last_read_block_.find(file);
+    const bool sequential =
+        it != last_read_block_.end() && first >= it->second && first <= it->second + 1;
+    last_read_block_[file] = last;
+    if (!sequential) return;
+    const uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(last) + read_ahead_, count - 1));
+    for (uint64_t b = uint64_t(last) + 1; b <= end; ++b) {
+      BlockKey key{file, uint32_t(b)};
+      if (inflight_.count(key) || IsCachedLocked(file, uint32_t(b))) continue;
+      inflight_.insert(key);
+      ++blocks;
+      if (!jobs.empty() && jobs.back()->last + 1 == b &&
+          jobs.back()->last - jobs.back()->first + 1 < piece_blocks) {
+        jobs.back()->last = uint32_t(b);
+      } else {
+        auto job = std::make_shared<FetchJob>();
+        job->file = file;
+        job->first = job->last = uint32_t(b);
+        jobs.push_back(std::move(job));
+      }
+    }
+  }
+  if (jobs.empty()) return;
+  stat_read_ahead_blocks_.fetch_add(blocks, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    for (auto& job : jobs) pool_->ahead.push_back(std::move(job));
+  }
+  pool_->work_cv.notify_all();
+}
+
 bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, size_t length,
                            size_t* out_bytes_read) {
   *out_bytes_read = 0;
@@ -624,46 +807,152 @@ bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, 
     uint64_t to = std::min<uint64_t>(read_end, block_start + BlockBytes(info, block));
     std::memcpy(buffer + (from - offset), block_data + (from - block_start), size_t(to - from));
   };
-
-  std::vector<uint8_t> fetched;
-  uint32_t block = first;
-  while (block <= last) {
+  auto copy_cached = [&](uint32_t block) {
     uint64_t block_start = uint64_t(block) * bs;
     uint64_t from = std::max(offset, block_start);
     uint64_t to = std::min<uint64_t>(read_end, block_start + BlockBytes(info, block));
-    if (CopyCachedBlock(file, block, from - block_start, buffer + (from - offset),
-                        size_t(to - from))) {
-      ++block;
-      continue;
-    }
-    // Coalesce the run of missing blocks into one request.
-    uint32_t run_end = block;
-    {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      while (run_end < last && run_end - block + 1 < max_blocks) {
-        uint32_t next = run_end + 1;
-        if (lru_index_.count(BlockKey{file, next})) break;
-        PersistentFile* pf = GetPersistentFile(file);
-        if (pf && pf->Has(next)) break;
-        run_end = next;
-      }
-    }
-    if (!FetchBlocks(file, block, run_end, fetched)) {
-      return false;
-    }
-    {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      for (uint32_t b = block; b <= run_end; ++b) {
-        const uint8_t* data = fetched.data() + uint64_t(b - block) * bs;
-        InsertMemoryBlock(file, b, data, BlockBytes(info, b));
-      }
-      WritePersistentBlocks(file, block, fetched.data(), fetched.size());
-    }
-    for (uint32_t b = block; b <= run_end; ++b) {
-      copy_part(b, fetched.data() + uint64_t(b - block) * bs);
-    }
-    block = run_end + 1;
+    return CopyCachedBlock(file, block, from - block_start, buffer + (from - offset),
+                           size_t(to - from));
+  };
+
+  // 1. Cached blocks.
+  std::vector<uint32_t> missing;
+  for (uint32_t b = first; b <= last; ++b) {
+    if (!copy_cached(b)) missing.push_back(b);
   }
+
+  if (!missing.empty()) {
+    // 2. Claim the missing blocks nobody is downloading yet, as runs of consecutive blocks.
+    // Blocks already in flight (read-ahead, another reader) are waited for in step 4.
+    struct Run {
+      uint32_t first, last;
+    };
+    std::vector<Run> runs;
+    std::vector<uint32_t> waits;
+    uint32_t claimed = 0;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      for (uint32_t b : missing) {
+        BlockKey key{file, b};
+        if (inflight_.count(key) || IsCachedLocked(file, b)) {
+          waits.push_back(b);
+          continue;
+        }
+        inflight_.insert(key);
+        ++claimed;
+        if (!runs.empty() && runs.back().last + 1 == b) {
+          runs.back().last = b;
+        } else {
+          runs.push_back(Run{b, b});
+        }
+      }
+    }
+
+    // 3. One piece per thread (the reader + the pool), each one Range request of at most
+    // max_request_bytes. The reader fetches the first piece and every piece no fetch thread has
+    // started yet, so a busy pool never makes a read slower than fetching alone.
+    const uint32_t parallel = pool_ ? pool_->thread_count + 1 : 1;
+    const uint32_t piece_blocks =
+        std::clamp<uint32_t>((claimed + parallel - 1) / parallel, 1, max_blocks);
+    std::vector<std::shared_ptr<FetchJob>> jobs;
+    for (const Run& r : runs) {
+      for (uint64_t b = r.first; b <= r.last; b += piece_blocks) {
+        auto job = std::make_shared<FetchJob>();
+        job->file = file;
+        job->first = uint32_t(b);
+        job->last = uint32_t(std::min<uint64_t>(r.last, b + piece_blocks - 1));
+        jobs.push_back(std::move(job));
+      }
+    }
+    const bool use_pool = pool_ && jobs.size() > 1;
+    if (use_pool) {
+      {
+        std::lock_guard<std::mutex> lock(pool_->mutex);
+        for (size_t i = 1; i < jobs.size(); ++i) pool_->demand.push_back(jobs[i]);
+      }
+      pool_->work_cv.notify_all();
+    }
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      bool mine = i == 0 || !use_pool;
+      if (!mine) {
+        std::lock_guard<std::mutex> lock(pool_->mutex);
+        mine = pool_->TakeBackLocked(jobs[i]);
+      }
+      if (mine) {
+        jobs[i]->ok = FetchClaimed(file, jobs[i]->first, jobs[i]->last, jobs[i]->data);
+        if (use_pool) {
+          std::lock_guard<std::mutex> lock(pool_->mutex);
+          jobs[i]->state = FetchJob::State::kDone;
+        } else {
+          jobs[i]->state = FetchJob::State::kDone;
+        }
+      }
+    }
+    if (use_pool) {
+      std::unique_lock<std::mutex> lock(pool_->mutex);
+      pool_->done_cv.wait(lock, [&] {
+        return std::all_of(jobs.begin(), jobs.end(), [](const std::shared_ptr<FetchJob>& j) {
+          return j->state == FetchJob::State::kDone;
+        });
+      });
+    }
+    bool ok = true;
+    for (const auto& job : jobs) {
+      if (!job->ok) {
+        ok = false;
+        continue;
+      }
+      for (uint32_t b = job->first; b <= job->last; ++b) {
+        copy_part(b, job->data.data() + uint64_t(b - job->first) * bs);
+      }
+    }
+    if (!ok) return false;
+
+    // 4. Blocks another thread was downloading. A queued read-ahead piece is taken over by the
+    // reader instead of waiting behind the pool; a block that is gone again (evicted, or that
+    // download failed) is fetched here.
+    for (uint32_t b : waits) {
+      for (;;) {
+        std::shared_ptr<FetchJob> takeover;
+        if (pool_) {
+          std::lock_guard<std::mutex> lock(pool_->mutex);
+          for (auto it = pool_->ahead.begin(); it != pool_->ahead.end(); ++it) {
+            if ((*it)->file == file && (*it)->first <= b && b <= (*it)->last) {
+              takeover = std::move(*it);
+              pool_->ahead.erase(it);
+              takeover->state = FetchJob::State::kRunning;
+              break;
+            }
+          }
+        }
+        if (takeover) {
+          if (!FetchClaimed(file, takeover->first, takeover->last, takeover->data)) return false;
+          copy_part(b, takeover->data.data() + uint64_t(b - takeover->first) * bs);
+          break;
+        }
+        {
+          std::unique_lock<std::mutex> lock(cache_mutex_);
+          if (inflight_.count(BlockKey{file, b})) {
+            stat_inflight_waits_.fetch_add(1, std::memory_order_relaxed);
+            inflight_cv_.wait(lock, [&] { return !inflight_.count(BlockKey{file, b}); });
+          }
+        }
+        if (copy_cached(b)) break;
+        bool mine = false;
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex_);
+          if (inflight_.insert(BlockKey{file, b}).second) mine = true;
+        }
+        if (!mine) continue;
+        std::vector<uint8_t> data;
+        if (!FetchClaimed(file, b, b, data)) return false;
+        copy_part(b, data.data());
+        break;
+      }
+    }
+  }
+
+  MaybeReadAhead(file, first, last);
   *out_bytes_read = length;
   return true;
 }
@@ -674,6 +963,9 @@ HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   s.bytes_downloaded = stat_bytes_.load(std::memory_order_relaxed);
   s.memory_hits = stat_memory_hits_.load(std::memory_order_relaxed);
   s.persistent_hits = stat_persistent_hits_.load(std::memory_order_relaxed);
+  s.pool_requests = stat_pool_requests_.load(std::memory_order_relaxed);
+  s.read_ahead_blocks = stat_read_ahead_blocks_.load(std::memory_order_relaxed);
+  s.inflight_waits = stat_inflight_waits_.load(std::memory_order_relaxed);
   return s;
 }
 

@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- Shell for tests/web/http_range_bench.cpp. ?sw=1: register /sw.js (the Halo page's service
+     worker) and reload once controlled, so the benchmark's Range requests go through it. -->
+<meta charset="utf-8">
+<title>HttpRangeDevice bench</title>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  if (q.get('sw') === '1' && 'serviceWorker' in navigator) {
+    if (!navigator.serviceWorker.controller) {
+      await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+      location.reload();
+      return;
+    }
+    console.log('service worker controls the page');
+    globalThis.benchSwStats = () => new Promise((resolve) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = (e) => resolve(e.data);
+      navigator.serviceWorker.controller.postMessage({ type: 'stats' }, [ch.port2]);
+    });
+  }
+  globalThis.Module = {
+    print: async (t) => {
+      console.log(t);
+      if (t === 'BENCH DONE' && globalThis.benchSwStats) console.log('sw stats ' + JSON.stringify(await benchSwStats()));
+    },
+    printErr: (t) => console.log(t),
+  };
+  const s = document.createElement('script');
+  s.src = 'http_range_bench.js';
+  document.body.appendChild(s);
+})();
+</script>
+<body></body>

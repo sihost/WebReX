@@ -4,8 +4,12 @@
  *
  * The browser build has no host directory to mount for game:/cache:. This device builds its
  * entry tree from the server manifest (GET <manifest_url> -> {"files":[{path,size,sha256}]})
- * and serves reads with synchronous `Range:` requests from the calling pthread (Worker), in
- * aligned blocks, through two caches:
+ * and serves reads with synchronous `Range:` requests (sync XHR) in aligned blocks. The missing
+ * blocks of one read are split over the reader and a small pool of fetch threads (each a
+ * Worker issuing its own sync XHR), and a sequential reader gets the next blocks fetched
+ * ahead on the pool; a block being downloaded is never requested twice (readers wait for it).
+ * A service worker in front of the data URLs (the Halo page's web/sw.js) sees the same
+ * Range + If-Match GETs, just several at a time. Blocks go through two caches:
  *   1. an in-memory LRU of blocks shared by all files;
  *   2. optionally a persistent block cache in a directory on the OPFS mount
  *      (rex/filesystem/web_storage.h), keyed by sha256, which a loader may also pre-populate
@@ -22,12 +26,14 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/filesystem/device.h>
@@ -47,6 +53,13 @@ struct HttpRangeDeviceOptions {
   uint32_t memory_cache_blocks = 64;
   // Upper bound for one coalesced Range request (consecutive missing blocks).
   uint32_t max_request_bytes = 8u << 20;
+  // Fetch threads (Workers doing sync XHR) that download the missing blocks of a read in
+  // parallel with the reader and run read-ahead. -1 = cvar vfs_http_fetch_threads; 0 = every
+  // request on the reading thread, one at a time, and no read-ahead.
+  int32_t fetch_threads = -1;
+  // Blocks fetched ahead (on the fetch threads) of a file that is read sequentially.
+  // -1 = cvar vfs_http_read_ahead_blocks; 0 = off. Capped at memory_cache_blocks / 2.
+  int32_t read_ahead_blocks = -1;
   // Device name reported to the guest (NtQueryVolumeInformationFile).
   std::string name = "STFS";
 };
@@ -95,6 +108,9 @@ class HttpRangeDevice : public Device {
     uint64_t bytes_downloaded = 0;  // payload bytes received
     uint64_t memory_hits = 0;       // blocks served from the in-memory LRU
     uint64_t persistent_hits = 0;   // blocks served from the OPFS cache
+    uint64_t pool_requests = 0;     // requests issued on the fetch threads (subset of requests)
+    uint64_t read_ahead_blocks = 0; // blocks downloaded by read-ahead
+    uint64_t inflight_waits = 0;    // blocks a read waited for (already being downloaded)
   };
   Stats stats() const;
 
@@ -114,6 +130,8 @@ class HttpRangeDevice : public Device {
     std::vector<uint8_t> data;
   };
   struct PersistentFile;
+  struct FetchJob;
+  struct FetchPool;
 
   bool BuildTree();
   std::string UrlFor(const HttpRangeFileInfo& file) const;
@@ -130,6 +148,15 @@ class HttpRangeDevice : public Device {
   PersistentFile* GetPersistentFile(uint32_t file);
   // Downloads blocks [first, last] in one Range request into `out`.
   bool FetchBlocks(uint32_t file, uint32_t first, uint32_t last, std::vector<uint8_t>& out);
+  // FetchBlocks for blocks the caller claimed in inflight_, then stores them in both caches,
+  // releases the claims (also on failure) and wakes readers waiting for them.
+  bool FetchClaimed(uint32_t file, uint32_t first, uint32_t last, std::vector<uint8_t>& out);
+  // cache_mutex_ held: block is in the memory LRU or the persistent cache.
+  bool IsCachedLocked(uint32_t file, uint32_t block);
+  // Queues read-ahead after a read of blocks [first, last] if the file is read sequentially.
+  void MaybeReadAhead(uint32_t file, uint32_t first, uint32_t last);
+  void StartPool();
+  void StopPool();
 
   HttpRangeDeviceOptions options_;
   std::vector<HttpRangeFileInfo> files_;
@@ -140,11 +167,21 @@ class HttpRangeDevice : public Device {
   std::unordered_map<BlockKey, std::list<CachedBlock>::iterator, BlockKeyHash> lru_index_;
   std::unordered_map<uint32_t, std::unique_ptr<PersistentFile>> persistent_;
   bool persistent_enabled_ = false;
+  // Blocks some thread is downloading right now (guarded by cache_mutex_); inflight_cv_ is
+  // notified whenever claims are released.
+  std::unordered_set<BlockKey, BlockKeyHash> inflight_;
+  std::condition_variable inflight_cv_;
+  std::unordered_map<uint32_t, uint32_t> last_read_block_;  // file -> last block of its last read
+  uint32_t read_ahead_ = 0;
+  std::unique_ptr<FetchPool> pool_;
 
   std::atomic<uint64_t> stat_requests_{0};
   std::atomic<uint64_t> stat_bytes_{0};
   std::atomic<uint64_t> stat_memory_hits_{0};
   std::atomic<uint64_t> stat_persistent_hits_{0};
+  std::atomic<uint64_t> stat_pool_requests_{0};
+  std::atomic<uint64_t> stat_read_ahead_blocks_{0};
+  std::atomic<uint64_t> stat_inflight_waits_{0};
 };
 
 }  // namespace rex::filesystem

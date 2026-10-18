@@ -97,6 +97,16 @@ HttpRangeDeviceOptions Options() {
   o.block_size = 64 * 1024;
   o.memory_cache_blocks = 8;
   o.max_request_bytes = 256 * 1024;
+  o.fetch_threads = 0;  // sections 1-8: serial transport, exact request counts
+  return o;
+}
+
+HttpRangeDeviceOptions ParallelOptions() {
+  auto o = Options();
+  o.persistent_cache_dir.clear();
+  o.fetch_threads = 4;
+  o.read_ahead_blocks = 4;
+  o.memory_cache_blocks = 16;
   return o;
 }
 
@@ -233,6 +243,96 @@ int main() {
           x = x * 6364136223846793005ull + 1442695040888963407ull;
           uint64_t off = (x >> 20) % kMapSize;
           size_t len = size_t((x >> 8) % 200000);
+          size_t g = 0;
+          X_STATUS s = 0;
+          std::string d = ReadAll(f, off, len, &g, &s);
+          if (s != X_STATUS_SUCCESS || g != std::min<uint64_t>(len, kMapSize - off) ||
+              !Matches(d, off)) {
+            ++bad;
+          }
+        }
+        f->Destroy();
+      });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(bad == 0);
+  }
+
+  // 9. Fetch pool: a large read is split over the reader + pool threads.
+  {
+    HttpRangeDevice par("\\Device\\Web\\Game4", ParallelOptions());
+    CHECK(par.Initialize());
+    Entry* e = par.ResolvePath("maps\\Test.map");
+    File* f = nullptr;
+    CHECK(e && e->Open(rex::filesystem::FileAccess::kGenericRead, &f) == X_STATUS_SUCCESS);
+    if (f) {
+      std::string d = ReadAll(f, 1000, 1000000, &got, &st);
+      CHECK(st == X_STATUS_SUCCESS && got == 1000000 && Matches(d, 1000));
+      auto s = par.stats();
+      CHECK(s.requests == 4);  // 16 blocks over 5 threads: 4 pieces of 4 blocks (256 KiB)
+      CHECK(s.bytes_downloaded == 16 * 64 * 1024);
+      f->Destroy();
+    }
+  }
+
+  // 10. Read-ahead: a sequential reader downloads every block once, mostly ahead of itself.
+  {
+    HttpRangeDevice seq("\\Device\\Web\\Game5", ParallelOptions());
+    CHECK(seq.Initialize());
+    Entry* e = seq.ResolvePath("maps\\Test.map");
+    File* f = nullptr;
+    CHECK(e && e->Open(rex::filesystem::FileAccess::kGenericRead, &f) == X_STATUS_SUCCESS);
+    if (f) {
+      bool ok = true;
+      for (uint64_t off = 0; off < kMapSize; off += 24 * 1024) {
+        std::string d = ReadAll(f, off, 24 * 1024, &got, &st);
+        ok = ok && st == X_STATUS_SUCCESS && Matches(d, off) &&
+             got == std::min<uint64_t>(24 * 1024, kMapSize - off);
+      }
+      CHECK(ok);
+      auto s = seq.stats();
+      CHECK(s.read_ahead_blocks > 0);
+      CHECK(s.pool_requests > 0);
+      CHECK(s.bytes_downloaded <= kMapSize);  // no block twice
+      std::printf("  sequential: %llu requests (%llu on the pool), %llu blocks read ahead, "
+                  "%llu in-flight waits\n",
+                  (unsigned long long)s.requests, (unsigned long long)s.pool_requests,
+                  (unsigned long long)s.read_ahead_blocks, (unsigned long long)s.inflight_waits);
+      f->Destroy();
+    }
+  }
+
+  // 11. Concurrent readers (random + sequential) with the pool, read-ahead and a tiny LRU;
+  //     the device is destroyed with read-ahead possibly still queued.
+  {
+    auto o = ParallelOptions();
+    o.memory_cache_blocks = 8;
+    HttpRangeDevice conc("\\Device\\Web\\Game6", o);
+    CHECK(conc.Initialize());
+    Entry* e = conc.ResolvePath("maps\\Test.map");
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+      threads.emplace_back([&, t] {
+        File* f = nullptr;
+        if (e->Open(rex::filesystem::FileAccess::kGenericRead, &f) != X_STATUS_SUCCESS) {
+          ++bad;
+          return;
+        }
+        uint64_t x = 777 + t;
+        uint64_t seq_off = uint64_t(t) * 700000;
+        for (int i = 0; i < 300; ++i) {
+          x = x * 6364136223846793005ull + 1442695040888963407ull;
+          uint64_t off;
+          size_t len;
+          if (t % 2) {
+            off = (x >> 20) % kMapSize;
+            len = size_t((x >> 8) % 400000);
+          } else {
+            off = seq_off % kMapSize;
+            len = 30000;
+            seq_off += len;
+          }
           size_t g = 0;
           X_STATUS s = 0;
           std::string d = ReadAll(f, off, len, &g, &s);
