@@ -24,12 +24,15 @@ static_assert(REX_PLATFORM_WEB, "HttpRangeDevice is web-only (Emscripten)");
 
 #include <emscripten/em_js.h>
 #include <emscripten/emscripten.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +49,16 @@ static_assert(REX_PLATFORM_WEB, "HttpRangeDevice is web-only (Emscripten)");
 #include <rex/string.h>
 #include <rex/string/utf8.h>
 
+REXCVAR_DEFINE_INT32(vfs_http_retry_budget_ms, 60000, "Filesystem",
+                     "Web HttpRangeDevice: how long a game data read keeps retrying a network "
+                     "error (or HTTP 5xx/408/429) with exponential backoff before the guest gets "
+                     "an I/O error. Time the browser reports offline does not count. 0 = one "
+                     "immediate retry only")
+    .range(0, 3600000);
+REXCVAR_DEFINE_INT32(vfs_http_retry_max_delay_ms, 5000, "Filesystem",
+                     "Web HttpRangeDevice: longest pause between two retries of a failing read "
+                     "(the pause doubles from 250 ms up to this)")
+    .range(50, 60000);
 REXCVAR_DEFINE_INT32(vfs_http_fetch_threads, 4, "Filesystem",
                      "Web HttpRangeDevice: fetch threads (Workers, one sync Range request each) "
                      "that download the missing blocks of a read in parallel with the reader "
@@ -115,6 +128,25 @@ EM_JS(double, rex_web_http_read_range,
   return n2;
 });
 
+// 1 if the browser reports no network (navigator.onLine === false in this Worker), else 0.
+EM_JS(int, rex_web_is_offline, (), {
+  return (typeof navigator != 'undefined' && navigator.onLine === false) ? 1 : 0;
+});
+
+// Browser main thread: Module.rexOnIoStall({path, attempt, waitedMs, offline, done, ok}) so the
+// page can show "reconnecting" while a read retries (done = it went through or gave up).
+EM_JS(void, rex_web_notify_io_stall,
+      (double path_ptr, int attempt, double waited_ms, int offline, int done, int ok), {
+  var cb = Module['rexOnIoStall'];
+  if (typeof cb != 'function') return;
+  try {
+    cb({path: UTF8ToString(path_ptr), attempt: attempt, waitedMs: waited_ms, offline: !!offline,
+        done: !!done, ok: !!ok});
+  } catch (e) {
+    console.error(e);
+  }
+});
+
 // Copies the pending text (see below) into dst (capacity cap, NUL-terminated) and clears it.
 EM_JS(void, rex_web_take_text, (double dst, double cap), {
   stringToUTF8(globalThis["__rexPendingText"] || "", dst, cap);
@@ -176,6 +208,38 @@ namespace {
 
 double PtrArg(const void* ptr) {
   return static_cast<double>(reinterpret_cast<uintptr_t>(ptr));
+}
+
+struct IoStallNotice {
+  std::string path;
+  int attempt;
+  double waited_ms;
+  int offline, done, ok;
+};
+
+// Any thread (a reader or a fetch thread): posts the stall status to the page.
+void NotifyIoStall(const std::string& path, int attempt, double waited_ms, bool offline,
+                   bool done, bool ok) {
+  auto* n = new IoStallNotice{path, attempt, waited_ms, offline, done, ok};
+  auto run = [](void* arg) {
+    auto* s = static_cast<IoStallNotice*>(arg);
+    rex_web_notify_io_stall(PtrArg(s->path.c_str()), s->attempt, s->waited_ms, s->offline,
+                            s->done, s->ok);
+    delete s;
+  };
+  if (emscripten_is_main_runtime_thread()) {
+    run(n);
+  } else if (!emscripten_proxy_async(emscripten_proxy_get_system_queue(),
+                                     emscripten_main_runtime_thread_id(), run, n)) {
+    delete n;
+  }
+}
+
+// Worth retrying: network error (-1, includes CORS/abort), server errors and the transient
+// client statuses. 404/412/416 and other 4xx fail at once (retrying cannot fix them).
+bool IsRetryable(double got) {
+  int status = int(-got);
+  return got == -1 || status == 408 || status == 425 || status == 429 || status >= 500;
 }
 
 // Collects the pending text after a successful rex_web_* call that returned `length`.
@@ -684,33 +748,99 @@ bool HttpRangeDevice::FetchBlocks(uint32_t file, uint32_t first, uint32_t last,
   out.resize(length);
   std::string url = UrlFor(info);
   std::string if_match = info.sha256.empty() ? std::string() : "\"" + info.sha256 + "\"";
-  // One retry on network errors (not on HTTP errors).
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  // Retries (network errors, 5xx/408/425/429): the first at once, then with exponential backoff
+  // (250 ms doubling to vfs_http_retry_max_delay_ms) until vfs_http_retry_budget_ms of online
+  // time has passed; while the browser reports offline, wait for it to come back (not counted).
+  // A Wi-Fi or tunnel blip during a map load then delays the read instead of failing it. All
+  // state is local: fetch threads run this concurrently.
+  using Clock = std::chrono::steady_clock;
+  const auto budget = std::chrono::milliseconds(REXCVAR_GET(vfs_http_retry_budget_ms));
+  const auto max_delay = std::chrono::milliseconds(REXCVAR_GET(vfs_http_retry_max_delay_ms));
+  const Clock::time_point start = Clock::now();
+  Clock::duration offline_time{0};
+  auto delay = std::chrono::milliseconds(250);
+  bool stalled = false;
+  Clock::time_point last_notice{};
+  auto waited_ms = [&] {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
+  for (int attempt = 1;; ++attempt) {
     stat_requests_.fetch_add(1, std::memory_order_relaxed);
     double got = rex_web_http_read_range(PtrArg(url.c_str()), double(offset), double(length),
                                          PtrArg(out.data()),
                                          if_match.empty() ? 0.0 : PtrArg(if_match.c_str()));
     if (got >= 0) {
       stat_bytes_.fetch_add(uint64_t(got), std::memory_order_relaxed);
-      if (size_t(got) != length) {
+      bool ok = size_t(got) == length;
+      if (!ok) {
         REXFS_ERROR("HttpRangeDevice: short response for {} [{}+{}]: {} bytes", info.path, offset,
                     length, size_t(got));
-        return false;
+        stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      } else if (stalled) {
+        REXFS_WARN("HttpRangeDevice: {} [{}+{}] read again after {} attempts, {:.0f} ms",
+                   info.path, offset, length, attempt, waited_ms());
       }
-      return true;
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, ok);
+      return ok;
     }
     if (got == -412) {
       REXFS_ERROR("HttpRangeDevice: {} changed on the server (ETag != sha256 {}); reload the page",
                   info.path, info.sha256);
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
       return false;
     }
-    if (got != -1) {
+    if (!IsRetryable(got)) {
       REXFS_ERROR("HttpRangeDevice: HTTP {} for {} [{}+{}]", -got, info.path, offset, length);
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
       return false;
     }
+    if (Clock::now() - start - offline_time >= budget) {
+      REXFS_ERROR(
+          "HttpRangeDevice: {} reading {} [{}+{}], giving up after {} attempts in {:.0f} ms "
+          "(vfs_http_retry_budget_ms {})",
+          got == -1 ? std::string("network error") : fmt::format("HTTP {}", -got), info.path,
+          offset, length, attempt, waited_ms(), budget.count());
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
+      return false;
+    }
+    stat_retries_.fetch_add(1, std::memory_order_relaxed);
+    if (attempt == 1) {
+      continue;  // one immediate retry (as before): most blips are a single dropped request
+    }
+    bool offline = rex_web_is_offline() != 0;
+    if (!stalled) {
+      stalled = true;
+      stat_stalls_.fetch_add(1, std::memory_order_relaxed);
+      REXFS_WARN("HttpRangeDevice: {} reading {} [{}+{}]; retrying with backoff for up to {} ms{}",
+                 got == -1 ? std::string("network error") : fmt::format("HTTP {}", -got),
+                 info.path, offset, length, budget.count(),
+                 offline ? " (browser offline: waiting for the network)" : "");
+    }
+    // At most one page notice a second per read.
+    if (Clock::now() - last_notice >= std::chrono::seconds(1)) {
+      last_notice = Clock::now();
+      NotifyIoStall(info.path, attempt, waited_ms(), offline, false, false);
+    }
+    if (offline) {
+      // Poll navigator.onLine (cheap) instead of burning requests; retry once it is back.
+      Clock::time_point offline_start = Clock::now();
+      while (rex_web_is_offline() && Clock::now() - offline_start < std::chrono::minutes(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (Clock::now() - last_notice >= std::chrono::seconds(1)) {
+          last_notice = Clock::now();
+          NotifyIoStall(info.path, attempt, waited_ms(), true, false, false);
+        }
+      }
+      offline_time += Clock::now() - offline_start;
+      delay = std::chrono::milliseconds(250);
+      continue;
+    }
+    std::this_thread::sleep_for(delay);
+    delay = std::min<std::chrono::milliseconds>(delay * 2, max_delay);
   }
-  REXFS_ERROR("HttpRangeDevice: network error reading {} [{}+{}]", info.path, offset, length);
-  return false;
 }
 
 bool HttpRangeDevice::IsCachedLocked(uint32_t file, uint32_t block) {
@@ -960,6 +1090,9 @@ bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, 
 HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   Stats s;
   s.requests = stat_requests_.load(std::memory_order_relaxed);
+  s.retries = stat_retries_.load(std::memory_order_relaxed);
+  s.stalls = stat_stalls_.load(std::memory_order_relaxed);
+  s.failed_reads = stat_failed_reads_.load(std::memory_order_relaxed);
   s.bytes_downloaded = stat_bytes_.load(std::memory_order_relaxed);
   s.memory_hits = stat_memory_hits_.load(std::memory_order_relaxed);
   s.persistent_hits = stat_persistent_hits_.load(std::memory_order_relaxed);

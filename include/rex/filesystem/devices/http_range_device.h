@@ -105,6 +105,9 @@ class HttpRangeDevice : public Device {
 
   struct Stats {
     uint64_t requests = 0;          // HTTP Range requests issued
+    uint64_t retries = 0;           // requests repeated after a network / 5xx / 408 / 429 error
+    uint64_t stalls = 0;            // reads that kept failing past the first retry (backoff)
+    uint64_t failed_reads = 0;      // reads given up (HTTP error or vfs_http_retry_budget_ms)
     uint64_t bytes_downloaded = 0;  // payload bytes received
     uint64_t memory_hits = 0;       // blocks served from the in-memory LRU
     uint64_t persistent_hits = 0;   // blocks served from the OPFS cache
@@ -182,6 +185,9 @@ class HttpRangeDevice : public Device {
   std::atomic<uint64_t> stat_pool_requests_{0};
   std::atomic<uint64_t> stat_read_ahead_blocks_{0};
   std::atomic<uint64_t> stat_inflight_waits_{0};
+  std::atomic<uint64_t> stat_retries_{0};
+  std::atomic<uint64_t> stat_stalls_{0};
+  std::atomic<uint64_t> stat_failed_reads_{0};
 };
 
 }  // namespace rex::filesystem
