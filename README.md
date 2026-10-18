@@ -48,8 +48,25 @@ Tested with a full recompiled retail game in Chrome on Windows:
 - frames match the native D3D12 build at fixed game ticks (about 36–40 dB PSNR)
 - saved films play back and closely match native (some draws still skipped, see below)
 
-Known gaps: occlusion queries are not emulated yet, and a large game needs about 8 GB of wasm
-memory per tab.
+Occlusion queries need no host emulation: titles that end a query at a different address than
+they begin it get the same fixed results natively.
+
+### Known gaps
+
+| Area | Gap |
+|---|---|
+| Browsers | Chromium only. Firefox stops at a WebGPU error (`setBindGroup`: dynamic offsets passed as a view of the >2 GB wasm memory); Safari is untested |
+| Memory | A large game needs about 8 GB of wasm memory per tab (Halo 3: ~3.5 GB heap break in play) |
+| GPU | First boot with an empty shader cache: draws are skipped while their pipelines are created, and render targets sampled for many frames stay wrong (16.7–24.7 dB vs native until the cache is warm) |
+| GPU | Some Xenos shaders do not translate (pixel shaders failing SPIR-V validation; "couldn't extract memexport stream constant index") |
+| GPU | Draws with no render target are dropped (WebGPU needs an attachment; no dummy target yet) |
+| GPU | 16-bit normalized textures are stored as float16 so they stay filterable (precision differs from native) |
+| Runtime | Fibers: `Fiber::Create` and switching to another fiber abort (no stack switching on wasm); titles importing `KeSetCurrentStackPointers` will not run |
+| Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only) and cooperative suspend/terminate only |
+| Files | `HttpRangeDevice` reads one synchronous 1 MiB block at a time; parallel download and read-ahead must be done by the page (e.g. a service worker) |
+| Audio | Stereo downmix only (no 5.1); ~90 ms output latency; a hidden tab's audio thread is starved by the browser |
+| Network | System link only (no Xbox Live); the WebSocket relay server is not included |
+| Input | Browsers expose a gamepad only after a button press; rumble depends on the browser's `vibrationActuator` |
 
 ## Example
 
