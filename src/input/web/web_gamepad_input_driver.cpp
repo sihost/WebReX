@@ -11,6 +11,7 @@
 #include <rex/input/web/web_input.h>
 
 #include <cstring>
+#include <mutex>
 
 #include <emscripten/emscripten.h>
 
@@ -18,6 +19,42 @@
 #include <rex/logging.h>
 
 namespace rex::input::web {
+
+namespace {
+std::mutex g_pad_log_mutex;
+}  // namespace
+
+// Logs what the poll loop queued (pads connecting, their layout, user assignment), so a
+// player's log shows which device the game reads and how.
+void WebGamepadInputDriver::LogPadEvents() {
+  std::unique_lock lock(g_pad_log_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  PadEvent e;
+  while (PopPadEvent(&e)) {
+    switch (e.kind) {
+      case PadEvent::kConnected:
+        REXLOG_INFO(
+            "web gamepad: navigator pad {} connected: \"{}\" vendor {:04x} product {:04x} layout "
+            "{} (axes: LT {} RT {} RX {} RY {} hat {})",
+            e.browser_index, e.id, e.vendor, e.product, PadLayoutName(e.layout), e.lt_axis,
+            e.rt_axis, e.rx_axis, e.ry_axis, e.hat_axis);
+        break;
+      case PadEvent::kDisconnected:
+        REXLOG_INFO("web gamepad: navigator pad {} disconnected (\"{}\")", e.browser_index, e.id);
+        break;
+      case PadEvent::kAssigned:
+        if (e.browser_index < 0) {
+          REXLOG_INFO("web gamepad: XInput user {} -> no pad", e.user);
+        } else {
+          REXLOG_INFO("web gamepad: XInput user {} -> navigator pad {} \"{}\" ({})", e.user,
+                      e.browser_index, e.id, PadLayoutName(e.layout));
+        }
+        break;
+    }
+  }
+}
 
 WebGamepadInputDriver::WebGamepadInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
@@ -35,6 +72,7 @@ X_STATUS WebGamepadInputDriver::Setup() {
 X_RESULT WebGamepadInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                                 X_INPUT_CAPABILITIES* out_caps) {
   (void)flags;
+  LogPadEvents();
   GamepadSnapshot pad;
   if (!ReadGamepad(user_index, &pad)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -58,6 +96,7 @@ X_RESULT WebGamepadInputDriver::GetCapabilities(uint32_t user_index, uint32_t fl
 }
 
 X_RESULT WebGamepadInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  LogPadEvents();
   GamepadSnapshot pad;
   if (!ReadGamepad(user_index, &pad)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -65,8 +104,9 @@ X_RESULT WebGamepadInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out
   if (out_state) {
     std::memset(out_state, 0, sizeof(*out_state));
     out_state->packet_number = pad.packet_number;
-    // Unfocused/hidden page (or ImGui overlay owning input): neutral but connected.
-    if (HasFocus() && is_active()) {
+    // Hidden page, unfocused with web_gamepad_requires_focus, or the ImGui overlay owning
+    // input: neutral but connected.
+    if (GamepadInputAllowed() && is_active()) {
       out_state->gamepad.buttons = pad.buttons;
       out_state->gamepad.left_trigger = pad.left_trigger;
       out_state->gamepad.right_trigger = pad.right_trigger;
@@ -94,6 +134,10 @@ X_RESULT WebGamepadInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION*
     return X_ERROR_SUCCESS;  // XInput vibration is level-triggered; only send changes
   }
   last_rumble_[user_index] = packed;
+  const int browser_index = GamepadBrowserIndex(user_index);
+  if (browser_index < 0) {
+    return X_ERROR_SUCCESS;
+  }
   // GamepadHapticActuator lives on the browser main thread; fire and forget.
   // (No top-level commas allowed in the EM_ASM block: it is a macro argument.)
   MAIN_THREAD_ASYNC_EM_ASM(
@@ -120,7 +164,7 @@ X_RESULT WebGamepadInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION*
         } catch (e) {
         }
       },
-      user_index, left, right);
+      browser_index, left, right);
   return X_ERROR_SUCCESS;
 }
 
