@@ -98,6 +98,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   virtual std::unique_ptr<CommandProcessor> CreateCommandProcessor() = 0;
 
+  // Called once by OnHostGpuLossFromAnyThread (any thread). A backend that can keep the
+  // process alive without the device (WebGPU: tell the page, sync files, stop the command
+  // processor) returns true; false (default) = rex::FatalError as before.
+  virtual bool HandleHostGpuLoss([[maybe_unused]] bool is_responsible) { return false; }
+
   static uint32_t ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr);
   static void WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,
                                  uint32_t value);

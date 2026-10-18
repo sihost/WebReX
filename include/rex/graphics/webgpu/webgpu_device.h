@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,12 @@ class WebGPUDevice {
   WGPUTextureFormat surface_format() const { return surface_format_; }
 
   bool is_lost() const { return lost_.load(std::memory_order_acquire); }
+  // After is_lost(): the WGPUDeviceLostReason and the browser's message (any thread). A
+  // device destroyed by rex_debug_lose_gpu_device reports Destroyed and "debug hook".
+  uint32_t lost_reason() const { return lost_reason_.load(std::memory_order_acquire); }
+  std::string lost_message() const;
+  // The device of the running WebGPU graphics system (for page debug hooks), or null.
+  static WebGPUDevice* current();
   uint32_t uncaptured_error_count() const {
     return uncaptured_error_count_.load(std::memory_order_relaxed);
   }
@@ -169,6 +176,13 @@ class WebGPUDevice {
   WGPUTextureFormat surface_format_ = WGPUTextureFormat_Undefined;
 
   std::atomic<bool> lost_{false};
+  std::atomic<uint32_t> lost_reason_{0};
+  mutable std::mutex lost_mutex_;
+  std::string lost_message_;
+  // Set on the device thread before the debug hook destroys the device: that Destroyed is
+  // a loss, not the normal release.
+  bool debug_loss_ = false;
+  friend void DebugLoseDevice(WebGPUDevice& device);
   std::atomic<uint32_t> uncaptured_error_count_{0};
   std::atomic<uint64_t> published_canvas_size_{0};
 };

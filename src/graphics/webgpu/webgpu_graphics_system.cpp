@@ -95,6 +95,9 @@ X_STATUS WebGPUGraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispa
 void WebGPUGraphicsSystem::Shutdown() {
   // Releases the command processor (its ShutdownContext drains the streams),
   // the presenter and the provider, all of which use the device.
+  if (command_processor_ && command_processor_->is_paused()) {
+    command_processor_->Resume();
+  }
   GraphicsSystem::Shutdown();
   device_.reset();
 }

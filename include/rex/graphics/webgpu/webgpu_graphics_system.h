@@ -48,6 +48,14 @@ class WebGPUGraphicsSystem : public GraphicsSystem {
   // Null if Setup fell back to the null command processor.
   WebGPUDevice* webgpu_device() const { return device_.get(); }
 
+ protected:
+  // Device loss (graceful part; src/graphics/webgpu/webgpu_gpu_loss.cpp): instead of a
+  // FatalError, logs the reason, syncs every open file (OPFS saves), posts
+  // Module.rexOnGpuLost(reason, message) to the page (and a 'rexgpulost' window event), then
+  // pauses the command processor. The guest keeps running until it waits for the GPU;
+  // the page offers a reload. Full recovery (a new device) is not implemented.
+  bool HandleHostGpuLoss(bool is_responsible) override;
+
  private:
   std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
 
