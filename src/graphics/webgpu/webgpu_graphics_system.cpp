@@ -10,13 +10,18 @@
 
 #include <emscripten/emscripten.h>
 
+#include <string>
+#include <vector>
+
 #include <rex/cvar.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/null/command_processor.h>
 #include <rex/graphics/null/graphics_system.h>
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
 #include <rex/graphics/webgpu/webgpu_device.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/overlay/debug_overlay.h>
 
 // The presenter and its GraphicsProvider are the presenter package's (WP6,
 // ui/webgpu). Built without it, the system runs headless (no presenter).
@@ -33,11 +38,61 @@ REXCVAR_DEFINE_STRING(gpu, "webgpu", "GPU",
     .allowed({"webgpu", "null"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(webgpu_clip_distances, true, "GPU",
+                    "WebGPU: user clip planes (PA_CL_CLIP_CNTL ucp_ena) through clip_distances "
+                    "when the device has clip-distances (false: the planes are ignored, as on a "
+                    "device without the feature; for testing that fallback)");
+
+// Defined by the WebGPU texture cache.
+REXCVAR_DECLARE(bool, webgpu_texture_bc);
+REXCVAR_DECLARE(bool, webgpu_texture_bc_sliced_3d);
+REXCVAR_DECLARE(bool, webgpu_float32_filterable);
+REXCVAR_DECLARE(bool, webgpu_texture_component_swizzle);
+
 namespace {
 
 EM_JS(int, rexwgpu_navigator_gpu_available, (), {
   return (typeof navigator !== 'undefined' && navigator.gpu) ? 1 : 0;
 });
+
+// One line naming every optional-feature fallback this device / these cvars select, so a
+// report from another adapter (Intel, Apple, Android) shows at once what renders differently.
+// The fallbacks themselves are in the texture cache, the EDRAM and the pipeline cache.
+std::string DescribeDegradedFeatures(const rex::graphics::webgpu::WebGPUDevice& device) {
+  std::vector<std::string> d;
+  auto check = [&](bool on, const char* what) {
+    if (!on) {
+      d.emplace_back(what);
+    }
+  };
+  const bool bc = REXCVAR_GET(webgpu_texture_bc) &&
+                  device.HasFeature(WGPUFeatureName_TextureCompressionBC);
+  check(bc, "no texture-compression-bc: DXT/DXN textures decompressed in compute (4-8x memory)");
+  check(!bc || (REXCVAR_GET(webgpu_texture_bc_sliced_3d) &&
+                device.HasFeature(WGPUFeatureName_TextureCompressionBCSliced3D)),
+        "no texture-compression-bc-sliced-3d: 3D BC textures decompressed");
+  check(REXCVAR_GET(gamma_render_target_as_unorm16) &&
+            device.HasFeature(WGPUFeatureName_TextureFormatsTier1),
+        "no texture-formats-tier1: 8_8_8_8_GAMMA render targets blend in gamma space");
+  check(REXCVAR_GET(webgpu_float32_filterable) &&
+            device.HasFeature(WGPUFeatureName_Float32Filterable),
+        "no float32-filterable: 32-bit float textures sampled nearest");
+  check(REXCVAR_GET(webgpu_clip_distances) && device.HasFeature(WGPUFeatureName_ClipDistances),
+        "no clip-distances: user clip planes ignored");
+  check(device.HasFeature(WGPUFeatureName_DepthClipControl),
+        "no depth-clip-control: depth clipping cannot be disabled");
+  check(device.HasFeature(WGPUFeatureName_Depth32FloatStencil8),
+        "no depth32float-stencil8: D24FS8 depth stored in depth24plus");
+  check(REXCVAR_GET(webgpu_texture_component_swizzle) &&
+            device.HasFeature(WGPUFeatureName_TextureComponentSwizzle),
+        "no texture-component-swizzle: swizzles applied in shaders (slower, same result)");
+  std::string s;
+  for (const auto& item : d) {
+    s += s.empty() ? "" : "; ";
+    s += item;
+  }
+  return s;
+}
 
 }  // namespace
 
@@ -73,6 +128,15 @@ X_STATUS WebGPUGraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispa
   if (device_) {
     REXGPU_INFO("WebGPU graphics system: device ready ({}), canvas surface: {}",
                 device_->adapter_description(), device_->has_surface());
+    std::string degraded = DescribeDegradedFeatures(*device_);
+    if (degraded.empty()) {
+      REXGPU_INFO("WebGPU degraded features: none (every optional feature in use)");
+    } else {
+      REXGPU_WARN("WebGPU degraded features: {}", degraded);
+    }
+    ::rex::ui::DebugOverlayDialog::SetGpuNote(
+        "WebGPU: " + device_->adapter_description() + "\nDegraded: " +
+        (degraded.empty() ? std::string("none") : degraded));
 #if REX_WEBGPU_HAS_PROVIDER
     if (with_presentation) {
       provider_ = ::rex::ui::webgpu::WebGPUProvider::Create(*device_);
