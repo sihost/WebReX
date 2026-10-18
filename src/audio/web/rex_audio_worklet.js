@@ -7,10 +7,18 @@
 'use strict';
 
 const CTL_WRITE = 0, CTL_READ = 1, CTL_QUANTA = 5, CTL_UNDERRUN = 6, CTL_PLAYED = 7,
-  CTL_PEAK = 10, CTL_MUTED = 12, CTL_STOP = 16, CTL_COUNT = 32;
+  CTL_PEAK = 10, CTL_MUTED = 12, CTL_STOP = 16, CTL_PRIME = 18, CTL_COUNT = 32;
 // After an underrun, wait for this many queued frames (10.7 ms) before playing again, so
 // a producer that is just keeping up does not alternate frame / silence quantum.
 const PRIME_FRAMES = 2;
+// A bursty producer (a hidden tab's guest threads get less CPU) underruns again and again:
+// each underrun that follows the previous one within PRIME_RAISE_QUANTA raises the prime
+// level by a frame, up to PRIME_FRAMES_MAX (32 ms, below the guest's default 8 frames in
+// flight), so gaps become fewer and longer instead of a crackle; it drops back by a frame
+// after PRIME_DECAY_QUANTA without an underrun.
+const PRIME_FRAMES_MAX = 6;
+const PRIME_RAISE_QUANTA = 375;   // 1 s
+const PRIME_DECAY_QUANTA = 3750;  // 10 s
 
 class RexAudioProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -26,6 +34,10 @@ class RexAudioProcessor extends AudioWorkletProcessor {
     this.pos = 0;   // sample position inside that slot
     this.primed = false;
     this.peak = 0;
+    this.prime = PRIME_FRAMES;
+    this.quantum = 0;
+    this.lastUnderrun = -1e9;
+    Atomics.store(this.ctl, CTL_PRIME, this.prime);
   }
 
   process(inputs, outputs) {
@@ -37,14 +49,27 @@ class RexAudioProcessor extends AudioWorkletProcessor {
     const n = left.length;
     const muted = Atomics.load(ctl, CTL_MUTED) !== 0;
     const ss = this.slotSamples;
+    const q = ++this.quantum;
+    if (this.prime > PRIME_FRAMES && q - this.lastUnderrun > PRIME_DECAY_QUANTA) {
+      --this.prime;
+      this.lastUnderrun = q;
+      Atomics.store(this.ctl, CTL_PRIME, this.prime);
+    }
     let i = 0;
     while (i < n) {
       if (this.cur < 0) {
         const r = Atomics.load(ctl, CTL_READ);
         const avail = (Atomics.load(ctl, CTL_WRITE) - r) | 0;
-        if (avail <= 0 || (!this.primed && avail < PRIME_FRAMES)) {
+        if (avail <= 0 || (!this.primed && avail < this.prime)) {
           // Underrun: the rest of this quantum stays silent (outputs start zeroed).
-          if (avail <= 0) this.primed = false;
+          if (avail <= 0 && this.primed) {
+            this.primed = false;
+            if (q - this.lastUnderrun < PRIME_RAISE_QUANTA && this.prime < PRIME_FRAMES_MAX) {
+              ++this.prime;
+              Atomics.store(ctl, CTL_PRIME, this.prime);
+            }
+            this.lastUnderrun = q;
+          }
           Atomics.add(ctl, CTL_UNDERRUN, 1);
           break;
         }

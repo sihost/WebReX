@@ -30,9 +30,11 @@ REXCVAR_DEFINE_BOOL(webgpu_texture_bc, true, "GPU",
 REXCVAR_DEFINE_BOOL(webgpu_texture_bc_sliced_3d, true, "GPU",
                     "WebGPU: BC-compressed 3D textures with texture-compression-bc-sliced-3d "
                     "(false: decompress 3D BC textures)");
-REXCVAR_DEFINE_BOOL(webgpu_texture_formats_tier1, true, "GPU",
-                    "WebGPU: r/rg/rgba16 unorm/snorm textures with texture-formats-tier1 (false: "
-                    "16-bit normalized data as float16)");
+REXCVAR_DEFINE_BOOL(webgpu_texture_formats_tier1, false, "GPU",
+                    "WebGPU: r/rg/rgba16 unorm/snorm textures with texture-formats-tier1. These "
+                    "are unfilterable-float in WebGPU, so such textures are then bound as the "
+                    "null texture (the texture layouts are filterable float); false (default): "
+                    "16-bit normalized data as float16, filterable");
 REXCVAR_DEFINE_BOOL(webgpu_texture_component_swizzle, true, "GPU",
                     "WebGPU: apply texture swizzles in views with texture-component-swizzle "
                     "(false: shaders swizzle)");
@@ -134,7 +136,8 @@ bool WebGPUTextureCache::Initialize() {
       "WebGPU texture cache: BC {}, BC 3D {}, 16-bit normalized formats {}, float32 filtering "
       "{}, view swizzle {}",
       features.bc ? "native" : "decompressed", features.bc_sliced_3d ? "native" : "decompressed",
-      features.formats_tier1 ? "native" : "as float16", features.float32_filterable ? "yes" : "no",
+      features.formats_tier1 ? "native (unfilterable, bound as null)" : "as float16",
+      features.float32_filterable ? "yes" : "no",
       component_swizzle_ ? "yes" : "no (in shaders)");
   return true;
 }

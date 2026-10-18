@@ -32,8 +32,19 @@ constexpr char kWorkletSource[] = {
 using Clock = std::chrono::steady_clock;
 constexpr auto kFrameDuration = std::chrono::nanoseconds(
     1000000000ll * WebAudioOutput::kChannelSamples / WebAudioOutput::kSampleRate);
-// No worklet quantum for this long = the worklet is not rendering; pace in free-run.
+// No worklet quantum for this long = the worklet is not rendering; pace in free-run (which
+// discards the queued frames at 48 kHz). While the AudioContext is not running (not created
+// yet, suspended by the autoplay gate, Web Audio unavailable) the worklet can't render, so
+// free-run starts quickly.
 constexpr auto kStallTimeout = std::chrono::milliseconds(60);
+// While the AudioContext is running, the worklet renders even in hidden tabs, but Chrome
+// deprioritizes a hidden (or occluded) tab's renderer: its audio thread was measured at
+// 68-214 quanta/s instead of 375 for seconds at a time. Taking over after 60 ms there
+// threw the queued frames away (never played) and the worklet then played whatever came
+// next: choppy, "fast" audio in background tabs. A running context's worklet is only
+// waited for: playback is late, never skipped, and the guest is paced by real playback.
+// Free-run only if it renders nothing for this long (audio device gone).
+constexpr auto kRunningStallTimeout = std::chrono::milliseconds(1500);
 
 static_assert(sizeof(std::atomic<int32_t>) == 4 && std::atomic<int32_t>::is_always_lock_free,
               "the control block is shared with JS Int32Array Atomics");
@@ -105,6 +116,7 @@ EM_JS(void, rex_audio_js_start,
                                             outputLatencyUs : Atomics.load(o.ctl, 14),
                                             submitted : Atomics.load(o.ctl, 15),
                                             maxBatch : Atomics.load(o.ctl, 17),
+                                            prime : Atomics.load(o.ctl, 18),
                                             contextState : ctx.state
                                           }));
           const url = URL.createObjectURL(new Blob([src], {type : 'text/javascript'}));
@@ -309,7 +321,11 @@ void WebAudioOutput::PacingThread() {
       last_quanta = quanta;
       last_quanta_change = now;
       free_run = false;
-    } else if (!free_run && now - last_quanta_change > kStallTimeout) {
+    } else if (!free_run &&
+               now - last_quanta_change >
+                   (ctl_[kCtlState].load(std::memory_order_relaxed) == kStateRunning
+                        ? kRunningStallTimeout
+                        : std::chrono::milliseconds(kStallTimeout))) {
       free_run = true;
       free_run_base = now;
     }
