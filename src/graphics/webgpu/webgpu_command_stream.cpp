@@ -1192,6 +1192,7 @@ void WebGPUCommandQueue::ReplayOnDeviceThread(WebGPUCommandStream* stream, uint6
     last_stats_ = stats;
   }
   replay_count_.fetch_add(1, std::memory_order_relaxed);
+  draws_skipped_total_.fetch_add(stats.draws_skipped, std::memory_order_relaxed);
   stream->Reset();
   {
     std::lock_guard<std::mutex> lock(free_mutex_);

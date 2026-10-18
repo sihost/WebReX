@@ -3200,15 +3200,17 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                      (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
             if (source_color_format != dest_color_format) {
-              // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
+              // Between k_8_8_8_8 and k_8_8_8_8_GAMMA (only transferred when
+              // the gamma one is stored linear, gamma_render_target_as_unorm16):
+              // the EDRAM bits are kept, as on the guest, so the 8-bit values
+              // of k_8_8_8_8 are the PWL gamma codes of the linear storage.
               if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
+                  DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 2, 0, 2, 1);
                 }
               } else {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 2, 0, 2, 1);
+                  DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
                 }
               }
             }

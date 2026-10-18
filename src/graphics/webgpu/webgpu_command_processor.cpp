@@ -57,6 +57,12 @@ REXCVAR_DEFINE_INT32(webgpu_occlusion_query_log, 0, "GPU",
                      "WebGPU: log the first N guest occlusion query events (EVENT_WRITE_ZPD begin / "
                      "end, the sample count address, and the draws since the previous event)");
 
+REXCVAR_DEFINE_INT32(webgpu_pipeline_wait_ms, 0, "GPU",
+                     "WebGPU: per-frame budget (ms) of the GPU command thread waiting for the "
+                     "pipelines of draws whose shaders are still converting or whose pipeline the "
+                     "browser is still creating; such draws are otherwise skipped. -1 = wait for "
+                     "every pipeline (as synchronous creation), 0 = never wait");
+
 namespace rex::graphics::webgpu {
 
 using SpirvTr = SpirvShaderTranslator;
@@ -628,6 +634,7 @@ bool WebGPUCommandProcessor::IssueMemExportCompute(
     ++statistics_.memexport_unsupported;
     return true;
   }
+  WaitForPipeline(pipeline);
   // The destination must hold current data around the exported elements.
   for (const draw_util::MemExportRange& range : ranges) {
     if (!shared_memory_->RequestRange(range.base_address_dwords << 2, range.size_bytes)) {
@@ -953,6 +960,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++statistics_.drops_pipeline;
     return true;
   }
+  WaitForPipeline(pipeline);
 
   // Viewport and scissor, within the pass attachments (WebGPU validates both
   // against the render target size).
@@ -1356,6 +1364,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
 
+  pipeline_wait_frame_ms_ = 0.0;
+
   if (swap_index == 1 || swap_index % 600 == 0 || REXCVAR_GET(webgpu_log_frames)) {
     const WebGPUReplayStats replay = command_queue_->last_replay_stats();
     const WebGPUPipelineCache::Statistics& pipelines = pipeline_cache_->statistics();
@@ -1373,7 +1383,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
         "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
         "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
-        "the tessellator",
+        "the tessellator | skipped (pipeline not ready) {} in all replays, pipeline waits {} "
+        "({} timed out, {:.0f} ms)",
         swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, refreshed,
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
@@ -1397,7 +1408,33 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         tessellator_ ? tessellator_->statistics().patches : 0,
         tessellator_ ? tessellator_->statistics().max_slot_points : 0,
         tessellator_ ? tessellator_->statistics().max_slot_indices : 0,
-        statistics_.drops_tessellation);
+        statistics_.drops_tessellation, command_queue_->draws_skipped_total(),
+        statistics_.pipeline_waits, statistics_.pipeline_wait_timeouts,
+        statistics_.pipeline_wait_ms);
+  }
+}
+
+void WebGPUCommandProcessor::WaitForPipeline(PipelineId pipeline) {
+  int32_t budget = REXCVAR_GET(webgpu_pipeline_wait_ms);
+  if (!budget || pipeline == kInvalidPipelineId) {
+    return;
+  }
+  int32_t timeout = -1;
+  if (budget > 0) {
+    double left = double(budget) - pipeline_wait_frame_ms_;
+    if (left < 1.0) {
+      return;
+    }
+    timeout = int32_t(left);
+  }
+  double waited = pipeline_cache_->WaitForPipeline(pipeline, timeout);
+  if (waited >= 0.1) {
+    ++statistics_.pipeline_waits;
+    statistics_.pipeline_wait_ms += waited;
+    pipeline_wait_frame_ms_ += waited;
+    if (timeout >= 0 && waited >= double(timeout)) {
+      ++statistics_.pipeline_wait_timeouts;
+    }
   }
 }
 

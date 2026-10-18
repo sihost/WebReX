@@ -3710,15 +3710,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                      (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
             if (source_color_format != dest_color_format) {
-              // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
+              // Between k_8_8_8_8 and k_8_8_8_8_GAMMA (only transferred when
+              // the gamma one is stored linear, gamma_render_target_as_unorm16):
+              // the EDRAM bits are kept, as on the guest, so the 8-bit values
+              // of k_8_8_8_8 are the PWL gamma codes of the linear storage.
               if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  source_color[0][i] = LinearToPWLGamma(source_color[0][i], true);
+                  source_color[0][i] = PWLGammaToLinear(source_color[0][i], true);
                 }
               } else {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  source_color[0][i] = PWLGammaToLinear(source_color[0][i], true);
+                  source_color[0][i] = LinearToPWLGamma(source_color[0][i], true);
                 }
               }
             }
