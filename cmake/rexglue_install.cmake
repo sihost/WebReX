@@ -137,6 +137,7 @@ install(FILES
     src/ui/windowed_app_main_win.cpp
     src/ui/windowed_app_main_posix.cpp
     src/ui/windowed_app_main_web.cpp
+    src/ui/rex_web_pre.js
     src/ui/rex_app.cpp
     DESTINATION ${CMAKE_INSTALL_DATADIR}/rexglue
 )

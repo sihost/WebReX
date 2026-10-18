@@ -30,8 +30,15 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+#include <rex/web_page.h>
 
 REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
+
+REXCVAR_DEFINE_BOOL(web_pause_when_hidden, false, "Web",
+                    "Web: no guest vblanks while the browser tab is hidden or frozen, so a game "
+                    "paced by vblank (Halo 3) stops advancing and its CPU/GPU use drops; it "
+                    "continues where it was when the tab is shown again. Off (default): a hidden "
+                    "tab keeps running at full speed (needed for System Link hosts)");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
 
@@ -135,8 +142,20 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t next_frame_time = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
+        bool paused_hidden = false;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          bool pause = REXCVAR_GET(web_pause_when_hidden) && rex::web::IsPageHidden();
+          if (pause != paused_hidden) {
+            paused_hidden = pause;
+            REXGPU_INFO("web_pause_when_hidden: guest vblanks {} (page {})",
+                        pause ? "paused" : "resumed", pause ? "hidden" : "visible");
+          }
+          if (pause) {
+            next_frame_time = current_time + vsync_interval_ticks;
+            rex::thread::Sleep(std::chrono::milliseconds(20));
+            continue;
+          }
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           if (current_time >= next_frame_time) {
