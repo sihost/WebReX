@@ -46,6 +46,9 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// graphics/command_processor.cpp
+REXCVAR_DECLARE(int32_t, occlusion_query_log);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -216,6 +219,10 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   if (!is_end) {
     if (active_occlusion_query_.valid &&
         active_occlusion_query_.sample_count_address != sample_count_addr) {
+      REXGPU_WARN(
+          "D3D12: guest occlusion query begun at {:08X} while one at {:08X} is active: host "
+          "occlusion queries off, fixed results (query_occlusion_fake_sample_count) from now on",
+          sample_count_addr, active_occlusion_query_.sample_count_address);
       DisableHostOcclusionQueries();
       return write_fallback_result();
     }
@@ -227,6 +234,14 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
 
   if (!active_occlusion_query_.valid ||
       active_occlusion_query_.sample_count_address != sample_count_addr) {
+    // Titles may begin at a second sample count block and end at the first
+    // (begin address = end address + 0x20), which host queries here don't
+    // pair.
+    REXGPU_WARN(
+        "D3D12: guest occlusion query ended at {:08X}, begun at {:08X} (active {}): host "
+        "occlusion queries off, fixed results (query_occlusion_fake_sample_count) from now on",
+        sample_count_addr, active_occlusion_query_.sample_count_address,
+        active_occlusion_query_.valid);
     DisableHostOcclusionQueries();
     return write_fallback_result();
   }
@@ -5004,6 +5019,12 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   uint64_t samples = occlusion_query_readback_mapping_[host_index];
   samples = NormalizeOcclusionSamples(samples);
   WriteGuestOcclusionResult(sample_counts, samples);
+  static uint32_t logged = 0;
+  if (logged < uint32_t(std::max(REXCVAR_GET(occlusion_query_log), 0))) {
+    ++logged;
+    REXGPU_INFO("D3D12: occlusion query #{} at {:08X}: host result {} samples", logged,
+                sample_count_address, samples);
+  }
   return true;
 }
 

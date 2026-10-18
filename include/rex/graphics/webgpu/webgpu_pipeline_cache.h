@@ -54,6 +54,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -220,6 +221,13 @@ class WebGPUPipelineCache {
 
   uint64_t shader_count() const { return shaders_.size(); }
 
+  // CP thread. Blocks until the pipeline `id` (render or memexport compute) is
+  // created or has failed, or for at most timeout_ms (< 0: no limit). Returns
+  // the milliseconds waited. Used for webgpu_pipeline_wait_ms: a draw recorded
+  // before its pipeline exists is skipped by the replay, and a draw skipped
+  // once may leave a render target that is sampled for many frames incomplete.
+  double WaitForPipeline(PipelineId id, int32_t timeout_ms);
+
   // CP thread.
   struct Statistics {
     uint64_t wgsl_memory_hits = 0;
@@ -257,6 +265,17 @@ class WebGPUPipelineCache {
     std::atomic<uint64_t> wgsl_failures{0};
     // Shaders queued for or in conversion.
     std::atomic<uint64_t> wgsl_converting{0};
+    // Pipeline ids created or failed (WaitForPipeline).
+    std::mutex settled_mutex;
+    std::condition_variable settled_cv;
+    std::unordered_set<PipelineId> settled;
+    void Settle(PipelineId id) {
+      {
+        std::lock_guard<std::mutex> lock(settled_mutex);
+        settled.insert(id);
+      }
+      settled_cv.notify_all();
+    }
   };
   uint64_t pipelines_created() const { return async_counters_->pipelines_created.load(); }
   uint64_t pipelines_failed() const { return async_counters_->pipelines_failed.load(); }
@@ -376,6 +395,8 @@ class WebGPUPipelineCache {
   std::unordered_map<uint64_t, std::unique_ptr<WebGPUShaderBindings>> shader_bindings_;
   mutable Statistics statistics_;
   std::shared_ptr<AsyncCounters> async_counters_ = std::make_shared<AsyncCounters>();
+  // CP thread: ids known to be settled (no lock needed for them any more).
+  std::vector<bool> settled_known_;
 };
 
 }  // namespace rex::graphics::webgpu

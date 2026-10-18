@@ -358,6 +358,10 @@ class WebGPUCommandQueue {
   // Statistics of the most recently replayed stream, and running totals.
   WebGPUReplayStats last_replay_stats() const;
   uint64_t replay_count() const { return replay_count_.load(std::memory_order_relaxed); }
+  // Draws and dispatches skipped by all replays so far (pipeline not ready).
+  uint64_t draws_skipped_total() const {
+    return draws_skipped_total_.load(std::memory_order_relaxed);
+  }
 
  private:
   void ReplayOnDeviceThread(WebGPUCommandStream* stream, uint64_t submission);
@@ -377,6 +381,7 @@ class WebGPUCommandQueue {
   mutable std::mutex stats_mutex_;
   WebGPUReplayStats last_stats_;
   std::atomic<uint64_t> replay_count_{0};
+  std::atomic<uint64_t> draws_skipped_total_{0};
   bool initialized_ = false;
 };
 

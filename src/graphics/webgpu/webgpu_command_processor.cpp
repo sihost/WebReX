@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <cstring>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/heap.h>
+#include <unistd.h>
+#endif
+
 #include <rex/bit.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -56,6 +61,12 @@ REXCVAR_DEFINE_BOOL(webgpu_swap_gamma_ramp, true, "GPU",
 REXCVAR_DEFINE_INT32(webgpu_occlusion_query_log, 0, "GPU",
                      "WebGPU: log the first N guest occlusion query events (EVENT_WRITE_ZPD begin / "
                      "end, the sample count address, and the draws since the previous event)");
+
+REXCVAR_DEFINE_INT32(webgpu_pipeline_wait_ms, 0, "GPU",
+                     "WebGPU: per-frame budget (ms) of the GPU command thread waiting for the "
+                     "pipelines of draws whose shaders are still converting or whose pipeline the "
+                     "browser is still creating; such draws are otherwise skipped. -1 = wait for "
+                     "every pipeline (as synchronous creation), 0 = never wait");
 
 namespace rex::graphics::webgpu {
 
@@ -628,6 +639,7 @@ bool WebGPUCommandProcessor::IssueMemExportCompute(
     ++statistics_.memexport_unsupported;
     return true;
   }
+  WaitForPipeline(pipeline);
   // The destination must hold current data around the exported elements.
   for (const draw_util::MemExportRange& range : ranges) {
     if (!shared_memory_->RequestRange(range.base_address_dwords << 2, range.size_bytes)) {
@@ -879,8 +891,29 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!is_rasterization_done) {
       ++statistics_.drops_rt_no_rasterization;
     }
-    if (drop_details_logged_ < 8) {
+    // Nothing to write: no color mask, no depth / stencil, no memexport (for
+    // example point-list draws inside a VIZ_QUERY). Natively they rasterize
+    // into no attachment, which has no effect either. The guest's visibility
+    // and occlusion results don't depend on them on any backend: VIZ_QUERY
+    // always reports visible (CommandProcessor::ExecutePacketType3_VIZ_QUERY),
+    // and EVENT_WRITE_ZPD writes query_occlusion_fake_sample_count, as D3D12 /
+    // Vulkan do once a guest query does not end at its begin address.
+    if (!normalized_color_mask && !normalized_depth_control.z_enable &&
+        !normalized_depth_control.stencil_enable && !memexport_used_vertex &&
+        !(pixel_shader && pixel_shader->memexport_eM_written())) {
+      ++statistics_.drops_rt_no_output;
+    }
+    // The first 8, and with webgpu_occlusion_query_log 8 more once a guest
+    // occlusion query was seen (in game, with the query context).
+    if (drop_details_logged_ < 8 ||
+        (zpd_events_logged_ && drop_details_logged_ < 16 &&
+         zpd_events_logged_ < uint32_t(std::max(REXCVAR_GET(webgpu_occlusion_query_log), 0)))) {
       ++drop_details_logged_;
+      REXGPU_WARN(
+          "WebGPU: draw without render targets dropped: PA_SC_VIZ_QUERY {:08X} indices {} "
+          "draw initiator {:08X}, ZPD events so far {}",
+          regs[XE_GPU_REG_PA_SC_VIZ_QUERY], regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices,
+          regs[XE_GPU_REG_VGT_DRAW_INITIATOR], zpd_events_logged_);
       REXGPU_WARN(
           "WebGPU: draw without render targets dropped: vs {:016X} (memexport {:X}) ps {:016X} "
           "(memexport {:X}) prim {} rasterization {} edram mode {} color mask {:04X} depth {} "
@@ -932,6 +965,7 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++statistics_.drops_pipeline;
     return true;
   }
+  WaitForPipeline(pipeline);
 
   // Viewport and scissor, within the pass attachments (WebGPU validates both
   // against the render target size).
@@ -1335,6 +1369,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
 
+  pipeline_wait_frame_ms_ = 0.0;
+
   if (swap_index == 1 || swap_index % 600 == 0 || REXCVAR_GET(webgpu_log_frames)) {
     const WebGPUReplayStats replay = command_queue_->last_replay_stats();
     const WebGPUPipelineCache::Statistics& pipelines = pipeline_cache_->statistics();
@@ -1342,7 +1378,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_INFO(
         "WebGPU: swap #{} front buffer {:08X} {}x{} presented={} swap texture {}x{} fmt {} ({}) | "
         "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | drops: render "
-        "targets {} (no attachments {}, vs memexport {}, no rasterization {}), pipeline {} (ps "
+        "targets {} (no attachments {}, vs memexport {}, no rasterization {}, no output {}), "
+        "pipeline {} (ps "
         "memexport {}, bindings {}, tessellation "
         "{}, cull both {}, no pipeline {}), constants {}, sampler {} | pipelines {} "
         "requested {} created {} failed | textures {} loads {} failures {} | constants {} KiB | "
@@ -1351,13 +1388,15 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
         "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
         "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
-        "the tessellator",
+        "the tessellator | skipped (pipeline not ready) {} in all replays, pipeline waits {} "
+        "({} timed out, {:.0f} ms)",
         swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, refreshed,
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
         statistics_.draws_culled, pipelines.draws_unsupported, statistics_.copies,
         statistics_.drops_render_targets, render_target_cache_->statistics().updates_without_attachments,
         statistics_.drops_rt_memexport_vs, statistics_.drops_rt_no_rasterization,
+        statistics_.drops_rt_no_output,
         statistics_.drops_pipeline, pipelines.draws_refused_ps_memexport,
         pipelines.draws_refused_bindings, pipelines.draws_refused_tessellation,
         pipelines.draws_refused_cull_both, pipelines.draws_refused_no_pipeline,
@@ -1374,7 +1413,39 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         tessellator_ ? tessellator_->statistics().patches : 0,
         tessellator_ ? tessellator_->statistics().max_slot_points : 0,
         tessellator_ ? tessellator_->statistics().max_slot_indices : 0,
-        statistics_.drops_tessellation);
+        statistics_.drops_tessellation, command_queue_->draws_skipped_total(),
+        statistics_.pipeline_waits, statistics_.pipeline_wait_timeouts,
+        statistics_.pipeline_wait_ms);
+#ifdef __EMSCRIPTEN__
+    // The malloc heap's break never moves down, so it is the peak of host heap plus guest window.
+    uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
+    REXGPU_INFO("WebGPU: swap #{} memory: heap break {} MiB of {} MiB wasm memory", swap_index,
+                heap_break >> 20, uint64_t(emscripten_get_heap_size()) >> 20);
+#endif
+  }
+}
+
+void WebGPUCommandProcessor::WaitForPipeline(PipelineId pipeline) {
+  int32_t budget = REXCVAR_GET(webgpu_pipeline_wait_ms);
+  if (!budget || pipeline == kInvalidPipelineId) {
+    return;
+  }
+  int32_t timeout = -1;
+  if (budget > 0) {
+    double left = double(budget) - pipeline_wait_frame_ms_;
+    if (left < 1.0) {
+      return;
+    }
+    timeout = int32_t(left);
+  }
+  double waited = pipeline_cache_->WaitForPipeline(pipeline, timeout);
+  if (waited >= 0.1) {
+    ++statistics_.pipeline_waits;
+    statistics_.pipeline_wait_ms += waited;
+    pipeline_wait_frame_ms_ += waited;
+    if (timeout >= 0 && waited >= double(timeout)) {
+      ++statistics_.pipeline_wait_timeouts;
+    }
   }
 }
 

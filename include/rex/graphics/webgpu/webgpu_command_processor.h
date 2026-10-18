@@ -109,9 +109,12 @@ class WebGPUCommandProcessor : public CommandProcessor {
     // attachment at all), ConfigurePipeline refused (WebGPUPipelineCache
     // draws_refused_*), the constant arena was full, a sampler couldn't be made.
     uint64_t drops_render_targets = 0;
-    // Of drops_render_targets: the vertex shader memexports; rasterization is off.
+    // Of drops_render_targets: the vertex shader memexports; rasterization is off;
+    // the draw writes nothing (no color mask, depth, stencil or memexport), which
+    // is also its whole effect natively.
     uint64_t drops_rt_memexport_vs = 0;
     uint64_t drops_rt_no_rasterization = 0;
+    uint64_t drops_rt_no_output = 0;
     // Vertex memexport as compute (webgpu_vertex_memexport): dispatches
     // recorded, and memexporting draws whose compute variant isn't available.
     uint64_t memexport_dispatches = 0;
@@ -130,6 +133,12 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint64_t constant_bytes = 0;
     uint64_t copies = 0;
     uint64_t submissions = 0;
+    // webgpu_pipeline_wait_ms: draws / dispatches whose pipeline the CP waited
+    // for, of which still not ready when the frame's budget ran out, and the
+    // total wait.
+    uint64_t pipeline_waits = 0;
+    uint64_t pipeline_wait_timeouts = 0;
+    double pipeline_wait_ms = 0.0;
   };
   const Statistics& statistics() const { return statistics_; }
 
@@ -223,6 +232,11 @@ class WebGPUCommandProcessor : public CommandProcessor {
   Statistics statistics_;
   bool memexport_logged_ = false;
   uint32_t drop_details_logged_ = 0;
+  // webgpu_pipeline_wait_ms spent in the current frame (reset by IssueSwap).
+  double pipeline_wait_frame_ms_ = 0.0;
+  // Waits for the pipeline of a draw or dispatch about to be recorded, within
+  // the frame's webgpu_pipeline_wait_ms budget.
+  void WaitForPipeline(PipelineId pipeline);
 
   // Draws since the last ZPD event (webgpu_occlusion_query_log).
   struct QueryDrawCounts {

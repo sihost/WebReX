@@ -672,6 +672,7 @@ void WebGPUPipelineCache::CompleteSlot(const std::shared_ptr<WgslSlot>& slot,
     if (!vs_wgsl || (pipeline->ps && !ps_wgsl)) {
       // Its draws stay skipped (the id never gets a pipeline).
       async_counters_->pipelines_failed.fetch_add(1, std::memory_order_relaxed);
+      async_counters_->Settle(pipeline->id);
       REXGPU_ERROR("WebGPU: render pipeline {} ({}) not created: a shader failed to convert",
                    pipeline->id, pipeline->label);
       continue;
@@ -971,6 +972,7 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
   std::string label = fmt::format("xe vs {:016X}:{:016X} memexport compute", key.hash, mod.value);
   device.RunAsync([&device, &table, stats, id, wgsl, label, layout_array]() {
     if (device.is_lost()) {
+      stats->Settle(id);
       return;
     }
     WGPUDevice wgpu_device = device.device();
@@ -1012,6 +1014,7 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
         REXGPU_ERROR("WebGPU: compute pipeline {} ({}) failed: {}", context->id, context->label,
                      ToStringView(message));
       }
+      context->stats->Settle(context->id);
     };
     callback.userdata1 = new Context{&table, stats, id, label};
     wgpuDeviceCreateComputePipelineAsync(wgpu_device, &desc, callback);
@@ -1127,6 +1130,37 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
   return id;
 }
 
+double WebGPUPipelineCache::WaitForPipeline(PipelineId id, int32_t timeout_ms) {
+  if (id == kInvalidPipelineId || !timeout_ms) {
+    return 0.0;
+  }
+  if (id < settled_known_.size() && settled_known_[id]) {
+    return 0.0;
+  }
+  AsyncCounters& counters = *async_counters_;
+  auto start = std::chrono::steady_clock::now();
+  bool settled;
+  {
+    std::unique_lock<std::mutex> lock(counters.settled_mutex);
+    auto is_settled = [&]() { return counters.settled.count(id) != 0; };
+    if (timeout_ms < 0) {
+      counters.settled_cv.wait(lock, is_settled);
+      settled = true;
+    } else {
+      settled = counters.settled_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                             is_settled);
+    }
+  }
+  if (settled) {
+    if (id >= settled_known_.size()) {
+      settled_known_.resize(size_t(id) + 1024);
+    }
+    settled_known_[id] = true;
+  }
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+      .count();
+}
+
 void WebGPUPipelineCache::CreateRenderPipelineAsync(
     PipelineId id, const WebGPUPipelineDescription& d, std::shared_ptr<const std::string> vs_wgsl,
     std::shared_ptr<const std::string> ps_wgsl, std::string label,
@@ -1136,6 +1170,7 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
   std::shared_ptr<AsyncCounters> stats = async_counters_;
   device.RunAsync([&device, &table, stats, id, d, vs_wgsl, ps_wgsl, label, layout_array]() {
     if (device.is_lost()) {
+      stats->Settle(id);
       return;
     }
     WGPUDevice wgpu_device = device.device();
@@ -1281,6 +1316,7 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
         REXGPU_ERROR("WebGPU: render pipeline {} ({}) failed: {}", context->id, context->label,
                      ToStringView(message));
       }
+      context->stats->Settle(context->id);
     };
     callback.userdata1 = new Context{&table, stats, id, label};
     wgpuDeviceCreateRenderPipelineAsync(wgpu_device, &desc, callback);

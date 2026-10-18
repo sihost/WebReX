@@ -79,6 +79,12 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
     .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(occlusion_query_log, 0, "GPU",
+                     "Log the first N guest occlusion query results (EVENT_WRITE_ZPD begin / end, "
+                     "the sample count address, the values written for the guest: fixed by "
+                     "query_occlusion_fake_sample_count, or host query results on D3D12), to "
+                     "compare what the game reads between backends");
+
 REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
@@ -1429,6 +1435,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     if (is_end_via_z_pass || is_end_via_z_fail) {
       pSampleCounts->ZPass_A = fake_sample_count;
       pSampleCounts->Total_A = fake_sample_count;
+    }
+    static uint32_t logged = 0;
+    if (logged < uint32_t(std::max(REXCVAR_GET(occlusion_query_log), 0))) {
+      ++logged;
+      REXGPU_INFO("Occlusion query #{}: {} at {:08X}: fixed result written (Total_A {}, ZPass_A {})",
+                  logged, (is_end_via_z_pass || is_end_via_z_fail) ? "end" : "begin",
+                  register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR],
+                  uint32_t(pSampleCounts->Total_A), uint32_t(pSampleCounts->ZPass_A));
     }
   }
 
