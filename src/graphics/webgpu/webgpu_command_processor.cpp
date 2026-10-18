@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <cstring>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/heap.h>
+#include <unistd.h>
+#endif
+
 #include <rex/bit.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -1411,6 +1416,12 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         statistics_.drops_tessellation, command_queue_->draws_skipped_total(),
         statistics_.pipeline_waits, statistics_.pipeline_wait_timeouts,
         statistics_.pipeline_wait_ms);
+#ifdef __EMSCRIPTEN__
+    // The malloc heap's break never moves down, so it is the peak of host heap plus guest window.
+    uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
+    REXGPU_INFO("WebGPU: swap #{} memory: heap break {} MiB of {} MiB wasm memory", swap_index,
+                heap_break >> 20, uint64_t(emscripten_get_heap_size()) >> 20);
+#endif
   }
 }
 
