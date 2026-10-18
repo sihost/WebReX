@@ -83,6 +83,7 @@ set(REXGRAPHICS_WEBGPU_SOURCES
     webgpu/webgpu_texture_cache.cpp
     webgpu/webgpu_command_processor.cpp
     webgpu/webgpu_graphics_system.cpp
+    webgpu/webgpu_gpu_loss.cpp
 )
 
 # D3D12 backend

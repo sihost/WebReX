@@ -174,6 +174,8 @@ struct CompletionTask {
   const std::function<void(rex::graphics::webgpu::WebGPUDevice::Completion)>* fn;
 };
 
+std::atomic<rex::graphics::webgpu::WebGPUDevice*> g_current_device{nullptr};
+
 }  // namespace
 
 namespace rex::graphics::webgpu {
@@ -235,10 +237,32 @@ std::unique_ptr<WebGPUDevice> WebGPUDevice::Create(const Options& options) {
     REXWGPU_ERROR("WebGPU: device initialization failed");
     return nullptr;
   }
+  g_current_device.store(device.get(), std::memory_order_release);
   return device;
 }
 
+WebGPUDevice* WebGPUDevice::current() {
+  return g_current_device.load(std::memory_order_acquire);
+}
+
+std::string WebGPUDevice::lost_message() const {
+  std::lock_guard<std::mutex> lock(lost_mutex_);
+  return lost_message_;
+}
+
+// Device thread.
+void DebugLoseDevice(WebGPUDevice& device) {
+  if (!device.device_ || device.is_lost()) {
+    return;
+  }
+  REXWGPU_WARN("WebGPU: rex_debug_lose_gpu_device: destroying the device to test device loss");
+  device.debug_loss_ = true;
+  wgpuDeviceDestroy(device.device_);
+}
+
 WebGPUDevice::~WebGPUDevice() {
+  WebGPUDevice* self = this;
+  g_current_device.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
   if (thread_created_) {
     RunSync([this]() { ReleaseOnDeviceThread(); });
     // The device thread lives in its event loop (exit_with_live_runtime); end it
@@ -552,9 +576,16 @@ void WebGPUDevice::OnDevice(WGPURequestDeviceStatus status, WGPUDevice device,
 void WebGPUDevice::OnDeviceLost(WGPUDevice const* /*device*/, WGPUDeviceLostReason reason,
                                 WGPUStringView message, void* userdata1, void* /*userdata2*/) {
   auto* self = static_cast<WebGPUDevice*>(userdata1);
+  {
+    std::lock_guard<std::mutex> lock(self->lost_mutex_);
+    self->lost_message_ = self->debug_loss_ ? std::string("debug hook (rex_debug_lose_gpu_device)")
+                                            : std::string(ToStringView(message));
+  }
+  self->lost_reason_.store(uint32_t(reason), std::memory_order_release);
   self->lost_.store(true, std::memory_order_release);
-  if (reason == WGPUDeviceLostReason_Destroyed ||
-      reason == WGPUDeviceLostReason_CallbackCancelled) {
+  if ((reason == WGPUDeviceLostReason_Destroyed ||
+       reason == WGPUDeviceLostReason_CallbackCancelled) &&
+      !self->debug_loss_) {
     REXWGPU_INFO("WebGPU device released (reason {})", uint32_t(reason));
     return;
   }
@@ -604,3 +635,16 @@ void WebGPUDevice::ReleaseOnDeviceThread() {
 }
 
 }  // namespace rex::graphics::webgpu
+
+// Page debug hook (e.g. Module._rex_debug_lose_gpu_device() from the console or a test):
+// destroys the WebGPU device on its thread, which the runtime handles as a device loss
+// (WebGPUGraphicsSystem::HandleHostGpuLoss: Module.rexOnGpuLost, files synced, the command
+// processor stopped). Any thread; returns at once.
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_debug_lose_gpu_device() {
+  using rex::graphics::webgpu::WebGPUDevice;
+  WebGPUDevice* device = WebGPUDevice::current();
+  if (!device) {
+    return;
+  }
+  device->RunAsync([device]() { rex::graphics::webgpu::DebugLoseDevice(*device); });
+}

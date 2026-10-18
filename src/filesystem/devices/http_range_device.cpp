@@ -4,10 +4,13 @@
  *
  * See rex/filesystem/devices/http_range_device.h and docs/port/vfs.md (project repo).
  *
- * Transport: synchronous XMLHttpRequest from the calling pthread. Every guest file read runs
- * on a pthread (a Worker; PROXY_TO_PTHREAD keeps even main() off the browser main thread), and
- * sync XHR with responseType "arraybuffer" is allowed in Workers. Under node (tests) the same
- * entry points read from the local directory named by $REX_WEB_TEST_DATA_ROOT instead.
+ * Transport: synchronous XMLHttpRequest from a pthread. Every guest file read runs on a pthread
+ * (a Worker; PROXY_TO_PTHREAD keeps even main() off the browser main thread), and sync XHR with
+ * responseType "arraybuffer" is allowed in Workers. Parallelism comes from more pthreads: the
+ * missing blocks of a read are split into pieces, the reader fetches one and a pool of fetch
+ * threads (--vfs_http_fetch_threads) the others, and sequential readers get blocks read ahead
+ * (--vfs_http_read_ahead_blocks) on the same pool. Under node (tests) the same entry points
+ * read from the local directory named by $REX_WEB_TEST_DATA_ROOT instead.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -21,24 +24,50 @@ static_assert(REX_PLATFORM_WEB, "HttpRangeDevice is web-only (Emscripten)");
 
 #include <emscripten/em_js.h>
 #include <emscripten/emscripten.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <span>
 #include <string_view>
+#include <thread>
 
+#include <rex/cvar.h>
 #include <rex/filesystem/entry.h>
 #include <rex/filesystem/file.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string.h>
 #include <rex/string/utf8.h>
+
+REXCVAR_DEFINE_INT32(vfs_http_retry_budget_ms, 60000, "Filesystem",
+                     "Web HttpRangeDevice: how long a game data read keeps retrying a network "
+                     "error (or HTTP 5xx/408/429) with exponential backoff before the guest gets "
+                     "an I/O error. Time the browser reports offline does not count. 0 = one "
+                     "immediate retry only")
+    .range(0, 3600000);
+REXCVAR_DEFINE_INT32(vfs_http_retry_max_delay_ms, 5000, "Filesystem",
+                     "Web HttpRangeDevice: longest pause between two retries of a failing read "
+                     "(the pause doubles from 250 ms up to this)")
+    .range(50, 60000);
+REXCVAR_DEFINE_INT32(vfs_http_fetch_threads, 4, "Filesystem",
+                     "Web HttpRangeDevice: fetch threads (Workers, one sync Range request each) "
+                     "that download the missing blocks of a read in parallel with the reader "
+                     "and run read-ahead. 0 = one request at a time on the reader, no read-ahead")
+    .range(0, 16);
+REXCVAR_DEFINE_INT32(vfs_http_read_ahead_blocks, 8, "Filesystem",
+                     "Web HttpRangeDevice: blocks fetched ahead of a file read sequentially "
+                     "(needs vfs_http_fetch_threads > 0; capped at half the memory cache). 0 = off")
+    .range(0, 64);
 
 // -------------------------------------------------------------------------------------------
 // JS transport. All pointers and 64-bit integers are passed as doubles (exact below 2^53), which
@@ -97,6 +126,25 @@ EM_JS(double, rex_web_http_read_range,
   var n2 = Math.min(body.length, length);
   HEAPU8.set(body.subarray(0, n2), dst);
   return n2;
+});
+
+// 1 if the browser reports no network (navigator.onLine === false in this Worker), else 0.
+EM_JS(int, rex_web_is_offline, (), {
+  return (typeof navigator != 'undefined' && navigator.onLine === false) ? 1 : 0;
+});
+
+// Browser main thread: Module.rexOnIoStall({path, attempt, waitedMs, offline, done, ok}) so the
+// page can show "reconnecting" while a read retries (done = it went through or gave up).
+EM_JS(void, rex_web_notify_io_stall,
+      (double path_ptr, int attempt, double waited_ms, int offline, int done, int ok), {
+  var cb = Module['rexOnIoStall'];
+  if (typeof cb != 'function') return;
+  try {
+    cb({path: UTF8ToString(path_ptr), attempt: attempt, waitedMs: waited_ms, offline: !!offline,
+        done: !!done, ok: !!ok});
+  } catch (e) {
+    console.error(e);
+  }
 });
 
 // Copies the pending text (see below) into dst (capacity cap, NUL-terminated) and clears it.
@@ -160,6 +208,38 @@ namespace {
 
 double PtrArg(const void* ptr) {
   return static_cast<double>(reinterpret_cast<uintptr_t>(ptr));
+}
+
+struct IoStallNotice {
+  std::string path;
+  int attempt;
+  double waited_ms;
+  int offline, done, ok;
+};
+
+// Any thread (a reader or a fetch thread): posts the stall status to the page.
+void NotifyIoStall(const std::string& path, int attempt, double waited_ms, bool offline,
+                   bool done, bool ok) {
+  auto* n = new IoStallNotice{path, attempt, waited_ms, offline, done, ok};
+  auto run = [](void* arg) {
+    auto* s = static_cast<IoStallNotice*>(arg);
+    rex_web_notify_io_stall(PtrArg(s->path.c_str()), s->attempt, s->waited_ms, s->offline,
+                            s->done, s->ok);
+    delete s;
+  };
+  if (emscripten_is_main_runtime_thread()) {
+    run(n);
+  } else if (!emscripten_proxy_async(emscripten_proxy_get_system_queue(),
+                                     emscripten_main_runtime_thread_id(), run, n)) {
+    delete n;
+  }
+}
+
+// Worth retrying: network error (-1, includes CORS/abort), server errors and the transient
+// client statuses. 404/412/416 and other 4xx fail at once (retrying cannot fix them).
+bool IsRetryable(double got) {
+  int status = int(-got);
+  return got == -1 || status == 408 || status == 425 || status == 429 || status >= 500;
 }
 
 // Collects the pending text after a successful rex_web_* call that returned `length`.
@@ -310,6 +390,40 @@ struct HttpRangeDevice::PersistentFile {
   }
 };
 
+// -------------------------------------------------------------------------------------------
+// Fetch pool: threads that run FetchClaimed for pieces of demand reads (first) and read-ahead.
+// -------------------------------------------------------------------------------------------
+
+struct HttpRangeDevice::FetchJob {
+  enum class State { kQueued, kRunning, kDone };
+  uint32_t file = 0;
+  uint32_t first = 0;
+  uint32_t last = 0;
+  std::vector<uint8_t> data;
+  bool ok = false;
+  State state = State::kQueued;  // guarded by FetchPool::mutex
+};
+
+struct HttpRangeDevice::FetchPool {
+  std::mutex mutex;
+  std::condition_variable work_cv;  // workers: a job was queued or stop
+  std::condition_variable done_cv;  // readers: a job finished
+  std::deque<std::shared_ptr<FetchJob>> demand;
+  std::deque<std::shared_ptr<FetchJob>> ahead;
+  std::vector<std::thread> threads;
+  uint32_t thread_count = 0;
+  bool stop = false;
+
+  // Removes `job` from the demand queue if no worker took it yet (the reader runs it itself).
+  bool TakeBackLocked(const std::shared_ptr<FetchJob>& job) {
+    auto it = std::find(demand.begin(), demand.end(), job);
+    if (it == demand.end()) return false;
+    demand.erase(it);
+    job->state = FetchJob::State::kRunning;
+    return true;
+  }
+};
+
 HttpRangeDevice::HttpRangeDevice(const std::string_view mount_path,
                                  HttpRangeDeviceOptions options)
     : Device(mount_path), options_(std::move(options)) {
@@ -317,7 +431,63 @@ HttpRangeDevice::HttpRangeDevice(const std::string_view mount_path,
   options_.max_request_bytes = std::max(options_.max_request_bytes, options_.block_size);
 }
 
-HttpRangeDevice::~HttpRangeDevice() = default;
+HttpRangeDevice::~HttpRangeDevice() {
+  StopPool();
+}
+
+void HttpRangeDevice::StartPool() {
+  int32_t threads = options_.fetch_threads >= 0 ? options_.fetch_threads
+                                                : REXCVAR_GET(vfs_http_fetch_threads);
+  int32_t ahead = options_.read_ahead_blocks >= 0 ? options_.read_ahead_blocks
+                                                  : REXCVAR_GET(vfs_http_read_ahead_blocks);
+  threads = std::clamp(threads, 0, 16);
+  read_ahead_ = threads > 0 ? uint32_t(std::clamp(ahead, 0, 64)) : 0;
+  read_ahead_ = std::min(read_ahead_, options_.memory_cache_blocks / 2);
+  if (threads <= 0 || pool_) return;
+  pool_ = std::make_unique<FetchPool>();
+  pool_->thread_count = uint32_t(threads);
+  for (int32_t i = 0; i < threads; ++i) {
+    pool_->threads.emplace_back([this] {
+      FetchPool& pool = *pool_;
+      std::unique_lock<std::mutex> lock(pool.mutex);
+      for (;;) {
+        pool.work_cv.wait(lock, [&] { return pool.stop || !pool.demand.empty() || !pool.ahead.empty(); });
+        if (pool.stop) return;
+        auto& queue = !pool.demand.empty() ? pool.demand : pool.ahead;
+        std::shared_ptr<FetchJob> job = std::move(queue.front());
+        queue.pop_front();
+        job->state = FetchJob::State::kRunning;
+        lock.unlock();
+        stat_pool_requests_.fetch_add(1, std::memory_order_relaxed);
+        job->ok = FetchClaimed(job->file, job->first, job->last, job->data);
+        lock.lock();
+        job->state = FetchJob::State::kDone;
+        pool.done_cv.notify_all();
+      }
+    });
+  }
+}
+
+void HttpRangeDevice::StopPool() {
+  if (!pool_) return;
+  std::vector<std::shared_ptr<FetchJob>> dropped;
+  {
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    pool_->stop = true;
+    dropped.assign(pool_->ahead.begin(), pool_->ahead.end());
+    pool_->ahead.clear();
+  }
+  pool_->work_cv.notify_all();
+  for (auto& t : pool_->threads) {
+    if (t.joinable()) t.join();
+  }
+  // Release the claims of read-ahead that never ran (no reader can be left at this point).
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  for (auto& job : dropped) {
+    for (uint32_t b = job->first; b <= job->last; ++b) inflight_.erase(BlockKey{job->file, b});
+  }
+  pool_.reset();
+}
 
 bool HttpRangeDevice::Initialize() {
   std::string json;
@@ -376,9 +546,13 @@ bool HttpRangeDevice::InitializeFromManifest(const std::string& manifest_json) {
   if (!BuildTree()) {
     return false;
   }
-  REXFS_INFO("HttpRangeDevice: {} files from {} (base {}, block {} KiB, cache {})", files_.size(),
-             options_.manifest_url, options_.base_url, options_.block_size / 1024,
-             persistent_enabled_ ? options_.persistent_cache_dir : std::string("memory only"));
+  StartPool();
+  REXFS_INFO(
+      "HttpRangeDevice: {} files from {} (base {}, block {} KiB, cache {}, fetch threads {}, "
+      "read-ahead {} blocks)",
+      files_.size(), options_.manifest_url, options_.base_url, options_.block_size / 1024,
+      persistent_enabled_ ? options_.persistent_cache_dir : std::string("memory only"),
+      pool_ ? pool_->thread_count : 0, read_ahead_);
   return true;
 }
 
@@ -574,33 +748,172 @@ bool HttpRangeDevice::FetchBlocks(uint32_t file, uint32_t first, uint32_t last,
   out.resize(length);
   std::string url = UrlFor(info);
   std::string if_match = info.sha256.empty() ? std::string() : "\"" + info.sha256 + "\"";
-  // One retry on network errors (not on HTTP errors).
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  // Retries (network errors, 5xx/408/425/429): the first at once, then with exponential backoff
+  // (250 ms doubling to vfs_http_retry_max_delay_ms) until vfs_http_retry_budget_ms of online
+  // time has passed; while the browser reports offline, wait for it to come back (not counted).
+  // A Wi-Fi or tunnel blip during a map load then delays the read instead of failing it. All
+  // state is local: fetch threads run this concurrently.
+  using Clock = std::chrono::steady_clock;
+  const auto budget = std::chrono::milliseconds(REXCVAR_GET(vfs_http_retry_budget_ms));
+  const auto max_delay = std::chrono::milliseconds(REXCVAR_GET(vfs_http_retry_max_delay_ms));
+  const Clock::time_point start = Clock::now();
+  Clock::duration offline_time{0};
+  auto delay = std::chrono::milliseconds(250);
+  bool stalled = false;
+  Clock::time_point last_notice{};
+  auto waited_ms = [&] {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
+  for (int attempt = 1;; ++attempt) {
     stat_requests_.fetch_add(1, std::memory_order_relaxed);
     double got = rex_web_http_read_range(PtrArg(url.c_str()), double(offset), double(length),
                                          PtrArg(out.data()),
                                          if_match.empty() ? 0.0 : PtrArg(if_match.c_str()));
     if (got >= 0) {
       stat_bytes_.fetch_add(uint64_t(got), std::memory_order_relaxed);
-      if (size_t(got) != length) {
+      bool ok = size_t(got) == length;
+      if (!ok) {
         REXFS_ERROR("HttpRangeDevice: short response for {} [{}+{}]: {} bytes", info.path, offset,
                     length, size_t(got));
-        return false;
+        stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      } else if (stalled) {
+        REXFS_WARN("HttpRangeDevice: {} [{}+{}] read again after {} attempts, {:.0f} ms",
+                   info.path, offset, length, attempt, waited_ms());
       }
-      return true;
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, ok);
+      return ok;
     }
     if (got == -412) {
       REXFS_ERROR("HttpRangeDevice: {} changed on the server (ETag != sha256 {}); reload the page",
                   info.path, info.sha256);
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
       return false;
     }
-    if (got != -1) {
+    if (!IsRetryable(got)) {
       REXFS_ERROR("HttpRangeDevice: HTTP {} for {} [{}+{}]", -got, info.path, offset, length);
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
       return false;
+    }
+    if (Clock::now() - start - offline_time >= budget) {
+      REXFS_ERROR(
+          "HttpRangeDevice: {} reading {} [{}+{}], giving up after {} attempts in {:.0f} ms "
+          "(vfs_http_retry_budget_ms {})",
+          got == -1 ? std::string("network error") : fmt::format("HTTP {}", -got), info.path,
+          offset, length, attempt, waited_ms(), budget.count());
+      stat_failed_reads_.fetch_add(1, std::memory_order_relaxed);
+      if (stalled) NotifyIoStall(info.path, attempt, waited_ms(), false, true, false);
+      return false;
+    }
+    stat_retries_.fetch_add(1, std::memory_order_relaxed);
+    if (attempt == 1) {
+      continue;  // one immediate retry (as before): most blips are a single dropped request
+    }
+    bool offline = rex_web_is_offline() != 0;
+    if (!stalled) {
+      stalled = true;
+      stat_stalls_.fetch_add(1, std::memory_order_relaxed);
+      REXFS_WARN("HttpRangeDevice: {} reading {} [{}+{}]; retrying with backoff for up to {} ms{}",
+                 got == -1 ? std::string("network error") : fmt::format("HTTP {}", -got),
+                 info.path, offset, length, budget.count(),
+                 offline ? " (browser offline: waiting for the network)" : "");
+    }
+    // At most one page notice a second per read.
+    if (Clock::now() - last_notice >= std::chrono::seconds(1)) {
+      last_notice = Clock::now();
+      NotifyIoStall(info.path, attempt, waited_ms(), offline, false, false);
+    }
+    if (offline) {
+      // Poll navigator.onLine (cheap) instead of burning requests; retry once it is back.
+      Clock::time_point offline_start = Clock::now();
+      while (rex_web_is_offline() && Clock::now() - offline_start < std::chrono::minutes(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (Clock::now() - last_notice >= std::chrono::seconds(1)) {
+          last_notice = Clock::now();
+          NotifyIoStall(info.path, attempt, waited_ms(), true, false, false);
+        }
+      }
+      offline_time += Clock::now() - offline_start;
+      delay = std::chrono::milliseconds(250);
+      continue;
+    }
+    std::this_thread::sleep_for(delay);
+    delay = std::min<std::chrono::milliseconds>(delay * 2, max_delay);
+  }
+}
+
+bool HttpRangeDevice::IsCachedLocked(uint32_t file, uint32_t block) {
+  if (lru_index_.count(BlockKey{file, block})) return true;
+  PersistentFile* pf = GetPersistentFile(file);
+  return pf && pf->Has(block);
+}
+
+bool HttpRangeDevice::FetchClaimed(uint32_t file, uint32_t first, uint32_t last,
+                                   std::vector<uint8_t>& out) {
+  const bool ok = FetchBlocks(file, first, last, out);
+  const auto& info = files_[file];
+  const uint32_t bs = options_.block_size;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (ok) {
+      for (uint32_t b = first; b <= last; ++b) {
+        InsertMemoryBlock(file, b, out.data() + uint64_t(b - first) * bs, BlockBytes(info, b));
+      }
+      WritePersistentBlocks(file, first, out.data(), out.size());
+    }
+    for (uint32_t b = first; b <= last; ++b) {
+      inflight_.erase(BlockKey{file, b});
     }
   }
-  REXFS_ERROR("HttpRangeDevice: network error reading {} [{}+{}]", info.path, offset, length);
-  return false;
+  inflight_cv_.notify_all();
+  return ok;
+}
+
+void HttpRangeDevice::MaybeReadAhead(uint32_t file, uint32_t first, uint32_t last) {
+  if (!pool_ || read_ahead_ == 0) return;
+  {
+    // Enough read-ahead queued already (the pool is the bottleneck): skip.
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    if (pool_->ahead.size() >= size_t(pool_->thread_count) * 2) return;
+  }
+  const uint32_t count = BlockCount(files_[file]);
+  const uint32_t piece_blocks =
+      std::clamp<uint32_t>((read_ahead_ + pool_->thread_count - 1) / pool_->thread_count, 1,
+                           std::max<uint32_t>(1, options_.max_request_bytes / options_.block_size));
+  std::vector<std::shared_ptr<FetchJob>> jobs;
+  uint64_t blocks = 0;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = last_read_block_.find(file);
+    const bool sequential =
+        it != last_read_block_.end() && first >= it->second && first <= it->second + 1;
+    last_read_block_[file] = last;
+    if (!sequential) return;
+    const uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(last) + read_ahead_, count - 1));
+    for (uint64_t b = uint64_t(last) + 1; b <= end; ++b) {
+      BlockKey key{file, uint32_t(b)};
+      if (inflight_.count(key) || IsCachedLocked(file, uint32_t(b))) continue;
+      inflight_.insert(key);
+      ++blocks;
+      if (!jobs.empty() && jobs.back()->last + 1 == b &&
+          jobs.back()->last - jobs.back()->first + 1 < piece_blocks) {
+        jobs.back()->last = uint32_t(b);
+      } else {
+        auto job = std::make_shared<FetchJob>();
+        job->file = file;
+        job->first = job->last = uint32_t(b);
+        jobs.push_back(std::move(job));
+      }
+    }
+  }
+  if (jobs.empty()) return;
+  stat_read_ahead_blocks_.fetch_add(blocks, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(pool_->mutex);
+    for (auto& job : jobs) pool_->ahead.push_back(std::move(job));
+  }
+  pool_->work_cv.notify_all();
 }
 
 bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, size_t length,
@@ -624,46 +937,152 @@ bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, 
     uint64_t to = std::min<uint64_t>(read_end, block_start + BlockBytes(info, block));
     std::memcpy(buffer + (from - offset), block_data + (from - block_start), size_t(to - from));
   };
-
-  std::vector<uint8_t> fetched;
-  uint32_t block = first;
-  while (block <= last) {
+  auto copy_cached = [&](uint32_t block) {
     uint64_t block_start = uint64_t(block) * bs;
     uint64_t from = std::max(offset, block_start);
     uint64_t to = std::min<uint64_t>(read_end, block_start + BlockBytes(info, block));
-    if (CopyCachedBlock(file, block, from - block_start, buffer + (from - offset),
-                        size_t(to - from))) {
-      ++block;
-      continue;
-    }
-    // Coalesce the run of missing blocks into one request.
-    uint32_t run_end = block;
-    {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      while (run_end < last && run_end - block + 1 < max_blocks) {
-        uint32_t next = run_end + 1;
-        if (lru_index_.count(BlockKey{file, next})) break;
-        PersistentFile* pf = GetPersistentFile(file);
-        if (pf && pf->Has(next)) break;
-        run_end = next;
-      }
-    }
-    if (!FetchBlocks(file, block, run_end, fetched)) {
-      return false;
-    }
-    {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      for (uint32_t b = block; b <= run_end; ++b) {
-        const uint8_t* data = fetched.data() + uint64_t(b - block) * bs;
-        InsertMemoryBlock(file, b, data, BlockBytes(info, b));
-      }
-      WritePersistentBlocks(file, block, fetched.data(), fetched.size());
-    }
-    for (uint32_t b = block; b <= run_end; ++b) {
-      copy_part(b, fetched.data() + uint64_t(b - block) * bs);
-    }
-    block = run_end + 1;
+    return CopyCachedBlock(file, block, from - block_start, buffer + (from - offset),
+                           size_t(to - from));
+  };
+
+  // 1. Cached blocks.
+  std::vector<uint32_t> missing;
+  for (uint32_t b = first; b <= last; ++b) {
+    if (!copy_cached(b)) missing.push_back(b);
   }
+
+  if (!missing.empty()) {
+    // 2. Claim the missing blocks nobody is downloading yet, as runs of consecutive blocks.
+    // Blocks already in flight (read-ahead, another reader) are waited for in step 4.
+    struct Run {
+      uint32_t first, last;
+    };
+    std::vector<Run> runs;
+    std::vector<uint32_t> waits;
+    uint32_t claimed = 0;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      for (uint32_t b : missing) {
+        BlockKey key{file, b};
+        if (inflight_.count(key) || IsCachedLocked(file, b)) {
+          waits.push_back(b);
+          continue;
+        }
+        inflight_.insert(key);
+        ++claimed;
+        if (!runs.empty() && runs.back().last + 1 == b) {
+          runs.back().last = b;
+        } else {
+          runs.push_back(Run{b, b});
+        }
+      }
+    }
+
+    // 3. One piece per thread (the reader + the pool), each one Range request of at most
+    // max_request_bytes. The reader fetches the first piece and every piece no fetch thread has
+    // started yet, so a busy pool never makes a read slower than fetching alone.
+    const uint32_t parallel = pool_ ? pool_->thread_count + 1 : 1;
+    const uint32_t piece_blocks =
+        std::clamp<uint32_t>((claimed + parallel - 1) / parallel, 1, max_blocks);
+    std::vector<std::shared_ptr<FetchJob>> jobs;
+    for (const Run& r : runs) {
+      for (uint64_t b = r.first; b <= r.last; b += piece_blocks) {
+        auto job = std::make_shared<FetchJob>();
+        job->file = file;
+        job->first = uint32_t(b);
+        job->last = uint32_t(std::min<uint64_t>(r.last, b + piece_blocks - 1));
+        jobs.push_back(std::move(job));
+      }
+    }
+    const bool use_pool = pool_ && jobs.size() > 1;
+    if (use_pool) {
+      {
+        std::lock_guard<std::mutex> lock(pool_->mutex);
+        for (size_t i = 1; i < jobs.size(); ++i) pool_->demand.push_back(jobs[i]);
+      }
+      pool_->work_cv.notify_all();
+    }
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      bool mine = i == 0 || !use_pool;
+      if (!mine) {
+        std::lock_guard<std::mutex> lock(pool_->mutex);
+        mine = pool_->TakeBackLocked(jobs[i]);
+      }
+      if (mine) {
+        jobs[i]->ok = FetchClaimed(file, jobs[i]->first, jobs[i]->last, jobs[i]->data);
+        if (use_pool) {
+          std::lock_guard<std::mutex> lock(pool_->mutex);
+          jobs[i]->state = FetchJob::State::kDone;
+        } else {
+          jobs[i]->state = FetchJob::State::kDone;
+        }
+      }
+    }
+    if (use_pool) {
+      std::unique_lock<std::mutex> lock(pool_->mutex);
+      pool_->done_cv.wait(lock, [&] {
+        return std::all_of(jobs.begin(), jobs.end(), [](const std::shared_ptr<FetchJob>& j) {
+          return j->state == FetchJob::State::kDone;
+        });
+      });
+    }
+    bool ok = true;
+    for (const auto& job : jobs) {
+      if (!job->ok) {
+        ok = false;
+        continue;
+      }
+      for (uint32_t b = job->first; b <= job->last; ++b) {
+        copy_part(b, job->data.data() + uint64_t(b - job->first) * bs);
+      }
+    }
+    if (!ok) return false;
+
+    // 4. Blocks another thread was downloading. A queued read-ahead piece is taken over by the
+    // reader instead of waiting behind the pool; a block that is gone again (evicted, or that
+    // download failed) is fetched here.
+    for (uint32_t b : waits) {
+      for (;;) {
+        std::shared_ptr<FetchJob> takeover;
+        if (pool_) {
+          std::lock_guard<std::mutex> lock(pool_->mutex);
+          for (auto it = pool_->ahead.begin(); it != pool_->ahead.end(); ++it) {
+            if ((*it)->file == file && (*it)->first <= b && b <= (*it)->last) {
+              takeover = std::move(*it);
+              pool_->ahead.erase(it);
+              takeover->state = FetchJob::State::kRunning;
+              break;
+            }
+          }
+        }
+        if (takeover) {
+          if (!FetchClaimed(file, takeover->first, takeover->last, takeover->data)) return false;
+          copy_part(b, takeover->data.data() + uint64_t(b - takeover->first) * bs);
+          break;
+        }
+        {
+          std::unique_lock<std::mutex> lock(cache_mutex_);
+          if (inflight_.count(BlockKey{file, b})) {
+            stat_inflight_waits_.fetch_add(1, std::memory_order_relaxed);
+            inflight_cv_.wait(lock, [&] { return !inflight_.count(BlockKey{file, b}); });
+          }
+        }
+        if (copy_cached(b)) break;
+        bool mine = false;
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex_);
+          if (inflight_.insert(BlockKey{file, b}).second) mine = true;
+        }
+        if (!mine) continue;
+        std::vector<uint8_t> data;
+        if (!FetchClaimed(file, b, b, data)) return false;
+        copy_part(b, data.data());
+        break;
+      }
+    }
+  }
+
+  MaybeReadAhead(file, first, last);
   *out_bytes_read = length;
   return true;
 }
@@ -671,9 +1090,15 @@ bool HttpRangeDevice::Read(size_t file_index, uint64_t offset, uint8_t* buffer, 
 HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   Stats s;
   s.requests = stat_requests_.load(std::memory_order_relaxed);
+  s.retries = stat_retries_.load(std::memory_order_relaxed);
+  s.stalls = stat_stalls_.load(std::memory_order_relaxed);
+  s.failed_reads = stat_failed_reads_.load(std::memory_order_relaxed);
   s.bytes_downloaded = stat_bytes_.load(std::memory_order_relaxed);
   s.memory_hits = stat_memory_hits_.load(std::memory_order_relaxed);
   s.persistent_hits = stat_persistent_hits_.load(std::memory_order_relaxed);
+  s.pool_requests = stat_pool_requests_.load(std::memory_order_relaxed);
+  s.read_ahead_blocks = stat_read_ahead_blocks_.load(std::memory_order_relaxed);
+  s.inflight_waits = stat_inflight_waits_.load(std::memory_order_relaxed);
   return s;
 }
 

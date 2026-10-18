@@ -1,0 +1,120 @@
+# web_relay: reference relay for the web net shim
+
+WebReX builds have no sockets: on the web, the SDK's net shim
+(`src/system/web/net_relay.{cpp,js}`, `include/rex/system/web/net_relay.h`) turns guest UDP/VDP
+sockets into datagrams carried over **one WebSocket per browser tab** to a relay. Every tab in a
+relay *room* is one console on a virtual LAN `10.80.0.0/24` (relay peer id N = `10.80.0.N`), so
+system link works between tabs on different machines.
+
+This directory is a small, dependency-free Node (22+) implementation of that relay. A game's own
+web server can embed `lib/relay.mjs` (Halo 3's `server/lib/relay.mjs` speaks the same protocol), or
+it can run on its own, e.g. next to a static host that cannot do WebSockets.
+
+```bat
+node tools/web_relay/server.mjs --port 8090
+rem relay listening on ws://0.0.0.0:8090/net?room=<name> (origins: *)
+```
+
+| Option | Default | |
+|---|---|---|
+| `--port N` / `--bind ADDR` | `8090` / `0.0.0.0` | Listen address. |
+| `--allow-origin O` (repeat) | `*` | Browser `Origin`s allowed to open `/net` (e.g. `https://game.example`). Clients that send no Origin (tools, tests) are always allowed. List your page's origin on a public relay so other sites cannot use it through visitors' browsers. |
+| `--default-room NAME` | `default` | Room of a client that names none. |
+| `--max-peers N` / `--max-rooms N` | `16` / `64` | Over the limit the handshake gets HTTP 503. |
+| `--keepalive-ms N` | `20000` | WebSocket ping to every peer (0 = off). |
+| `--idle-timeout-ms N` | `90000` | Close a peer that sent nothing, not even a pong, for this long (0 = never). |
+| `--resume-grace-ms N` | `30000` | How long a lost peer keeps its id for a resume (0 = off; see Resume). |
+| `--latency MS[:JITTER]` | `0` | Testing: deliver each datagram MS + [0, JITTER) ms late (order kept per receiver), like a tunnel. |
+| `--tls-pfx F --tls-pass P` or `--tls-cert F --tls-key F` | off | Serve `wss://` (pages served over https can only open `wss://`). |
+| `--quiet` | | No per-peer log lines. |
+
+Endpoints: `GET /net?room=<name>` (WebSocket upgrade; a plain GET gets 426), `GET /net/status?room=<name>`
+(`{room, peers, maxPeers, players, defaultRoom, rooms}`; `rooms` = every room with peers, fullest
+first), `GET /net/progress?room=&client=&name=&have=&total=&ready=` (optional download-progress side
+channel, 204/400), `GET /healthz` (counters). HTTP responses carry `Cross-Origin-Resource-Policy:
+cross-origin` and CORS for allowed origins, so a cross-origin-isolated page (COEP `require-corp`) on
+another origin can poll the status. WebSockets are not subject to COEP.
+
+## Pointing a game at it
+
+The game starts the shim with `rex::system::web::net_relay::Start(url, room)`: an empty `url`
+means same origin, `ws(s)://<page host>/net?room=<room>`; an empty `room` means the page's
+`?room=`, else `default`. Expose both as cvars so players can pick a relay; Halo 3's project does
+(`source/main.cpp`: `net_relay_url`, `net_relay_room`, passed on the web as `?arg=--name=value`):
+
+```
+https://game.example/?room=friday&arg=--net_relay_url=wss://relay.example/net?room%3Dfriday
+```
+
+Players who should see each other use the same relay and room.
+
+## Protocol
+
+Connect: `ws://<host>/net?room=<name>[&resume=<token>][&id=<previous id>]`, `name` =
+`[A-Za-z0-9_.-]{1,64}`. Max 16 peers per room (peers in their resume grace count),
+64 rooms (HTTP 503 at the handshake over the limit; 400 for a bad name; 403 for a refused Origin;
+404 for another path).
+
+**Text frames = JSON control.** Server → client:
+- `{"type":"welcome","id":<u32>,"room":"<name>","peers":[<ids already present>],"maxPayload":65536,
+  "resume":"<token>","resumeGraceMs":30000,"resumed":false}`, always the first message. `id` is the
+  lowest free id ≥ 1 in the room (ids are reused). `peers` includes peers in their resume grace
+  (nobody was told they left).
+- `{"type":"join","id":n}` / `{"type":"leave","id":n}` when other peers come and go.
+- `{"type":"pong","t":<echo>}` answering a client `{"type":"ping","t":any}` (application-level
+  RTT probe; optional).
+- `{"type":"progress","id":n,"client","name","have","total","ready"}`: another peer's
+  `{"type":"progress",...}` report, forwarded (optional side channel; pages may ignore it).
+
+Other text is ignored.
+
+**Binary frames = datagrams**, a 10-byte big-endian header then 0..65536 payload bytes:
+
+| offset | size | field |
+|---|---|---|
+| 0 | u32 | `src`: sender's peer id. **Overwritten by the relay** (no spoofing). |
+| 4 | u32 | `dst`: peer id, or `0xFFFFFFFF` = every other peer in the room. |
+| 8 | u16 | `port`: destination game port; opaque to the relay, delivered unchanged. |
+| 10 | … | payload |
+
+UDP-like semantics: unknown `dst` and frames shorter than 10 bytes are dropped silently; a datagram
+to a receiver with more than 4 MiB queued is dropped; per sender→receiver pair the order is kept
+(one TCP stream), nothing else is ordered. A message over 65546 bytes closes the socket (1009).
+
+The SDK shim's payload starts with its own 4-byte header (`net_relay.h`: u16 source port, u8 proto
+17 = UDP / 254 = VDP, u8 version 1), then the guest datagram, so guest datagrams are at most
+65532 bytes. The relay does not look at it.
+
+**Resume.** Every welcome carries a new one-time `resume` token (128-bit hex). When a socket ends
+*without* a client close frame of code 1000 (or no code), e.g. TCP loss, a proxy timeout, the
+relay's idle close, page unload's 1001, the peer's id stays reserved for `resumeGraceMs`: the
+others get no `leave`, datagrams to it are dropped (counted in `/healthz` `droppedResuming`).
+Reconnecting with `&resume=<latest token>` within the grace gives the same id back
+(`"resumed":true`, current `peers`), and nobody gets a `leave`/`join`. This also works when the
+relay has not noticed yet that the old socket is dead: that socket is closed with 4001 and the id
+moves to the new one. After the grace the room gets the `leave` and the id is free again. An
+unknown or expired token is a normal join (`"resumed":false`); then `&id=<previous id>` (1..254)
+is honoured if that id is free, so a tab keeps its `10.80.0.<id>` across a relay restart. A client
+that leaves on purpose closes with 1000 and the others see the `leave` at once.
+
+**Keepalive.** A tab loading a level can send nothing for minutes, and proxies close idle
+WebSockets (Cloudflare after 100 s). The relay sends a WebSocket ping frame to every peer every
+`--keepalive-ms`; browsers answer pings with pongs themselves (also in background tabs), so pages
+need no code for it. A peer from which nothing at all arrived for `--idle-timeout-ms` (half-open
+TCP: network gone, machine asleep) is closed with 1001 and the others get its `leave`.
+
+## Tests
+
+```bat
+node --test tools/web_relay/test/relay.test.mjs
+```
+
+Welcome/join/leave and id reuse, unicast with src rewrite, echo, broadcast, room isolation,
+dropped unknown-dst and runt frames, a 64 KiB datagram, shim-format payloads passed through,
+text ping/pong, 1009 on oversize messages, `/net/status`, progress over HTTP and over the relay,
+426/404, room-full and room-count 503, Origin allowlist (403) and CORS headers, default room,
+injected latency keeping order, keepalive (server pings arrive, a peer that never answers is
+closed and seen leaving after its grace, browser-like and pong-answering clients stay connected),
+and resume (lost connection keeps the id with no leave/join, datagrams to it dropped, same id
+back with the token, spent token refused, grace expiry, takeover of a live socket with 4001,
+`&id=` after a restart, clean close and grace 0 leave at once). 15/15.

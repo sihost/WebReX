@@ -36,6 +36,13 @@
 
 REXCVAR_DEFINE_BOOL(web_pointer_lock, true, "Input/Web",
                     "Request Pointer Lock on the canvas when it is clicked (mouse look)");
+REXCVAR_DEFINE_BOOL(web_pointer_lock_raw, true, "Input/Web",
+                    "Request Pointer Lock with unadjustedMovement (raw mouse deltas without OS "
+                    "acceleration, like native raw input); falls back to the accelerated lock "
+                    "where the browser does not support it");
+REXCVAR_DEFINE_BOOL(web_fullscreen_key, true, "Input/Web",
+                    "F11 toggles fullscreen of the game canvas (with Keyboard Lock, so Esc "
+                    "reaches the game) instead of the browser's own fullscreen");
 REXCVAR_DEFINE_BOOL(web_mouse_look_requires_pointer_lock, true, "Input/Web",
                     "Only feed mouse motion to the right stick while the pointer is locked");
 REXCVAR_DEFINE_BOOL(web_gamepad_requires_focus, false, "Input/Web",
@@ -97,6 +104,71 @@ int g_canvas_result = 0;
 // ---------------------------------------------------------------------------
 // Producer helpers.
 // ---------------------------------------------------------------------------
+
+// Browser main thread, inside the click gesture. raw: ask for unadjustedMovement first and
+// fall back to the accelerated lock when the browser says NotSupportedError (remembered).
+// Firefox returns no promise and ignores the option. Module.rexPointerLock keeps counters
+// for pages/tests: raw, adjusted (locks granted), refused, rawUnsupported, mode.
+EM_JS(void, rexinput_request_pointer_lock, (double selector_ptr, int raw), {
+  if (typeof document == 'undefined') return;
+  var el = document.querySelector(UTF8ToString(selector_ptr));
+  if (!el || !el.requestPointerLock) return;
+  var st = Module['rexPointerLock'] ||
+           (Module['rexPointerLock'] =
+                {raw : 0, adjusted : 0, refused : 0, rawUnsupported : false, mode : ""});
+  var refused = function(e) {
+    st.refused++;
+    // Chrome refuses the lock for about a second after the user left it with Esc.
+    console.log('[rex] pointer lock refused (' + (e && e.name) + '); click the game again');
+  };
+  var plain = function() {
+    var q;
+    try {
+      q = el.requestPointerLock();
+    } catch (e) {
+      refused(e);
+      return;
+    }
+    if (q && q.then) {
+      q.then(function() {
+        st.adjusted++;
+        st.mode = 'adjusted';
+      }, refused);
+    } else {
+      st.mode = 'adjusted (no promise)';
+    }
+  };
+  if (!raw || st.rawUnsupported) {
+    plain();
+    return;
+  }
+  var p;
+  try {
+    p = el.requestPointerLock({unadjustedMovement : true});
+  } catch (e) {
+    st.rawUnsupported = true;
+    plain();
+    return;
+  }
+  if (!p || !p.then) {
+    st.mode = 'no promise (option ignored)';
+    return;
+  }
+  p.then(function() {
+    st.raw++;
+    st.mode = 'unadjusted';
+  }, function(e) {
+    if (e && e.name == 'NotSupportedError') {
+      st.rawUnsupported = true;
+      console.log('[rex] raw (unadjusted) pointer lock not supported here; using the ' +
+                  'accelerated one');
+      plain();  // still inside the activation window of the click
+    } else {
+      refused(e);
+    }
+  });
+});
+EM_JS_DEPS(rex_dom_input_bridge, "$UTF8ToString");
 
 bool KeyBit(uint16_t vk) {
   return (g_key_bits[vk >> 5].load(std::memory_order_relaxed) >> (vk & 31)) & 1;
@@ -335,6 +407,15 @@ bool OnKey(int event_type, const EmscriptenKeyboardEvent* e, void*) {
     return false;
   }
   const bool down = event_type == EMSCRIPTEN_EVENT_KEYDOWN;
+  if (vk == uint16_t(VirtualKey::kF11) && REXCVAR_GET(web_fullscreen_key) && !e->ctrlKey &&
+      !e->altKey && !e->metaKey) {
+    // Element fullscreen of the canvas (Keyboard Lock needs it; the browser's own F11
+    // fullscreen cannot lock keys). Inside this keydown: user activation is available.
+    if (down && !e->repeat) {
+      rex::ui::web::ToggleFullscreenFromGesture();
+    }
+    return true;
+  }
   g_key_events.fetch_add(1, std::memory_order_relaxed);
   if (down && !g_has_focus.load(std::memory_order_relaxed)) {
     SetFocus(true);  // a key event means the page has focus (missed focus event)
@@ -405,7 +486,8 @@ bool OnMouseDown(int, const EmscriptenMouseEvent* e, void*) {
       !rex::ui::web::UIWantsPointer()) {
     // Inside a user gesture: the browser allows the lock request here. The click
     // that acquires the lock is not a game input (it would otherwise fire).
-    emscripten_request_pointerlock(g_canvas_selector, false);
+    rexinput_request_pointer_lock(double(uintptr_t(g_canvas_selector)),
+                                  REXCVAR_GET(web_pointer_lock_raw) ? 1 : 0);
     if (REXCVAR_GET(web_mouse_look_requires_pointer_lock) && e->button < 32) {
       g_swallowed_buttons |= 1u << e->button;
       return true;

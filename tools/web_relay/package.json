@@ -1,0 +1,13 @@
+{
+  "name": "rexglue-web-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reference WebSocket datagram relay for the ReXGlue web net shim (system link between browser tabs)",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": { "rexglue-web-relay": "server.mjs" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/relay.test.mjs"
+  }
+}

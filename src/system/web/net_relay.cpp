@@ -51,6 +51,7 @@ enum Ctl : int {
   kTxFrames = 8,
   kCloseCode = 9,
   kTxDroppedJs = 10,
+  kReconnects = 11,
   kCtlCount = 16,
 };
 
@@ -108,9 +109,13 @@ State LoadState() {
   return g_ctl ? State(g_ctl[kState].load(std::memory_order_acquire)) : State::kIdle;
 }
 
+// The id stays published while net_relay.js reconnects (state kConnecting after the first
+// welcome): the relay normally gives the same id back, and the guest keeps its address.
+// Sends are dropped meanwhile (SendTo checks kUp).
 uint32_t LoadId() {
-  return g_ctl && LoadState() == State::kUp ? uint32_t(g_ctl[kId].load(std::memory_order_acquire))
-                                            : 0;
+  return g_ctl && LoadState() != State::kIdle
+             ? uint32_t(g_ctl[kId].load(std::memory_order_acquire))
+             : 0;
 }
 
 void WakeWaiters() {
@@ -651,6 +656,7 @@ Stats GetStats() {
   s.id = LoadId();
   s.rx_ring_dropped = g_ctl ? uint32_t(g_ctl[kRingDropped].load(std::memory_order_relaxed)) : 0;
   s.tx_dropped += g_ctl ? uint32_t(g_ctl[kTxDroppedJs].load(std::memory_order_relaxed)) : 0;
+  s.reconnects = g_ctl ? uint32_t(g_ctl[kReconnects].load(std::memory_order_relaxed)) : 0;
   return s;
 }
 
