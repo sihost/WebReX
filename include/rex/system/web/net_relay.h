@@ -60,6 +60,9 @@ constexpr uint32_t kShimHeaderSize = 4;
 constexpr uint8_t kShimVersion = 1;
 constexpr uint32_t kMaxDatagram = 65536 - kShimHeaderSize;
 
+// kConnecting also while the link is being re-established after a drop (net_relay.js retries
+// with backoff forever and resumes the same id); kDown only after an explicit close or a URL
+// that cannot work.
 enum class State : int32_t { kIdle = 0, kConnecting = 1, kUp = 2, kDown = 3 };
 
 // Starts connecting (once; later calls are no-ops). url: full ws:// or wss:// URL, or
@@ -70,8 +73,8 @@ void Start(const char* url, const char* room);
 // failed, or timeout_ms elapsed. Returns true if up.
 bool WaitUntilUp(uint32_t timeout_ms);
 State GetState();
-uint32_t PeerId();        // 0 until up
-uint32_t LocalAddress();  // 10.80.0.<id>, 0 until up
+uint32_t PeerId();        // 0 until first up; kept while reconnecting
+uint32_t LocalAddress();  // 10.80.0.<id>, 0 until first up; kept while reconnecting
 uint32_t PeerCount();     // other peers currently in the room
 
 // Sockets. type: 1 = SOCK_STREAM, 2 = SOCK_DGRAM. Stream sockets can be created but every
@@ -113,6 +116,7 @@ struct Stats {
   uint32_t peers;
   int32_t state;
   uint32_t id;
+  uint32_t reconnects;  // links re-established after a drop (resumed or not)
 };
 Stats GetStats();
 
