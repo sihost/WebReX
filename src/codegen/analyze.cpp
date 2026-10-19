@@ -48,14 +48,23 @@ Result<void> Analyze(CodegenContext& ctx) {
     return discoverResult;
   }
 
-  // 3.5. Function pointer scan: find lis/addi pairs loading code addresses
-  // TODO(tomc): disabled for now, causes too many false positives
-  // functionPointerScan(ctx);
+  // 3.5. Pointer scan: functions reached only through pointers (data words, lis/addi pairs)
+  // or tail branches, accepted only at uncovered code after a terminator
+  auto pointerResult = phases::PointerScan(ctx);
+  if (!pointerResult) {
+    return pointerResult;
+  }
 
   // 4. Gap fill uncovered regions + discover blocks for gap-filled functions + cleanup
   auto gapFillResult = phases::GapFill(ctx);
   if (!gapFillResult) {
     return gapFillResult;
+  }
+
+  // 4.5. Tail-branch targets still in no function get their own entry
+  auto orphanResult = phases::OrphanBranches(ctx);
+  if (!orphanResult) {
+    return orphanResult;
   }
 
   // 5. Merge: resolve jumps and seal functions

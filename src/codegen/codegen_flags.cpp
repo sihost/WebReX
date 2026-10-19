@@ -89,6 +89,12 @@ REXCVAR_DEFINE_UINT32(max_seh_scope_entries, 100, "Codegen",
 // Codegen/Discovery
 //=============================================================================
 
+REXCVAR_DEFINE_BOOL(pointer_scan, true, "Codegen",
+                    "Register functions reached only through pointers (code addresses in data "
+                    "sections and lis/addi pairs) or only by tail branches, when they start in "
+                    "code no function covers, after a blr/bctr/b or padding")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_UINT32(backward_scan_limit, 64, "Codegen",
                       "Max instructions to scan backward for jump table patterns")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)

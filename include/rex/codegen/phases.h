@@ -30,8 +30,14 @@ VoidResult Discover(CodegenContext& ctx);
 /// Vacancy-based function expansion and sealing
 VoidResult Merge(CodegenContext& ctx);
 
+/// Register functions reached only through pointers (data words, lis/addi) or tail branches
+VoidResult PointerScan(CodegenContext& ctx);
+
 /// Find uncovered code regions and register them as functions
 VoidResult GapFill(CodegenContext& ctx);
+
+/// Register tail-branch targets that no function covers after GapFill
+VoidResult OrphanBranches(CodegenContext& ctx);
 
 /// Validate all call targets resolve
 VoidResult Validate(CodegenContext& ctx);
