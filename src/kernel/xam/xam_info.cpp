@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <string>
+
+#include <rex/assert.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -286,8 +289,21 @@ void XamLoaderLaunchTitle_entry(ppc_pchar_t raw_name_ptr, ppc_u32_t flags) {
       loader_data.launch_path = path;
     }
   } else {
-    assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
+    loader_data.launch_path.clear();
   }
+
+  // Titles switch executables this way (MW2: multiplayer <-> campaign) or exit to the
+  // dashboard (no name). Neither is supported: the title ends here.
+  std::string target = raw_name_ptr ? loader_data.launch_path : std::string("the dashboard");
+  REXKRNL_WARN("XamLoaderLaunchTitle({}, flags {:#x}): launching another executable is not "
+               "supported; the title ends",
+               target, uint32_t(flags));
+#if REX_PLATFORM_WEB
+  // Tell the page (crash report UX, Module.rexOnFatal) instead of stopping silently.
+  rex::FatalError(fmt::format("The game asked to switch to {} (XamLoaderLaunchTitle). The web "
+                              "build runs one executable only: reload the page to restart.",
+                              target));
+#endif
 
   // This function does not return.
   kernel_state()->TerminateTitle();

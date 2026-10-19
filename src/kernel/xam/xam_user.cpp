@@ -16,6 +16,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/xnet.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/function.h>
@@ -58,6 +59,10 @@ ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_m
         xuid = user_profile->xuid();
         result = X_E_SUCCESS;
       }
+      if (result == X_E_SUCCESS) {
+        // --xnet_unique_xuid: distinct player XUIDs per console on the virtual LAN.
+        xuid = xnet::ConsoleXuid(xuid, xnet::ConsoleIdForXuid());
+      }
     }
   } else {
     result = X_E_INVALIDARG;
@@ -99,7 +104,7 @@ ppc_hresult_result_t XamUserGetSigninInfo_entry(ppc_u32_t user_index, ppc_u32_t 
   }
 
   const auto& user_profile = kernel_state()->user_profile();
-  info->xuid = user_profile->xuid();
+  info->xuid = xnet::ConsoleXuid(user_profile->xuid(), xnet::ConsoleIdForXuid());
   info->signin_state = user_profile->signin_state();
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;

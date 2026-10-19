@@ -5,6 +5,7 @@ add_executable(unit_tests
     memory/fold_web_test.cpp
     kernel/object_table_test.cpp
     kernel/xecrypt_rsa_test.cpp
+    kernel/xnet_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/sha256_test.cpp
