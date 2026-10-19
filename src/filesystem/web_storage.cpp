@@ -105,9 +105,12 @@ EM_JS(void, rex_storage_js_refresh_estimate, (), {
             const fsu = detail('fileSystem'), caches = detail('caches'),
                   idb = detail('indexedDB');
             const persisted = p === null ? -1 : (p ? 1 : 0);
-            report(usage, quota, fsu, persisted, caches, idb);
             // Chrome's StaticStorageQuota: quota = usage + 10 GiB, whatever the real limit.
-            const padded = Math.abs(quota - usage - 10737418240) < 1048576;
+            // Firefox reports a fixed 10 GiB group limit, equal to that while usage < 1 MiB.
+            const firefox = typeof navigator != 'undefined' &&
+                            String(navigator.userAgent).indexOf('Firefox') >= 0;
+            const padded = !firefox && Math.abs(quota - usage - 10737418240) < 1048576;
+            report(usage, quota, fsu, persisted, caches, idb, padded ? 1 : 0);
             const key = Math.round(usage / 1048576) + '/' + Math.round(quota / 1048576) + '/' +
                         persisted;
             if (key != st.estimateKey) {
@@ -413,16 +416,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_storage_estimate_result(double usag
                                                                      double file_system_usage,
                                                                      int persisted,
                                                                      double caches_usage,
-                                                                     double indexed_db_usage) {
+                                                                     double indexed_db_usage,
+                                                                     int quota_padded) {
   auto& state = rex::filesystem::web::Estimate();
   state.usage.store(usage, std::memory_order_relaxed);
   state.quota.store(quota, std::memory_order_relaxed);
   state.file_system_usage.store(file_system_usage, std::memory_order_relaxed);
   state.caches_usage.store(caches_usage, std::memory_order_relaxed);
   state.indexed_db_usage.store(indexed_db_usage, std::memory_order_relaxed);
-  constexpr double kStaticPadding = 10737418240.0;  // Chrome StaticStorageQuota: 10 GiB
-  state.quota_padded.store(std::abs(quota - usage - kStaticPadding) < 1048576.0,
-                           std::memory_order_relaxed);
+  // Chrome StaticStorageQuota (quota = usage + 10 GiB), detected by the page (not on Firefox).
+  state.quota_padded.store(quota_padded != 0, std::memory_order_relaxed);
   state.persisted.store(persisted, std::memory_order_relaxed);
   state.sequence.fetch_add(1, std::memory_order_relaxed);
   state.valid.store(true, std::memory_order_release);
