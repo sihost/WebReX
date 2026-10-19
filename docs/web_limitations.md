@@ -133,8 +133,11 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   not yet.
 - **IME.** Composition text is not forwarded to `XamShowKeyboardUI`, which only decodes single code
   points.
-- **Touch.** There is no touch input in the SDK yet. wasm64 plus about 8 GB of memory keeps phones out
-  anyway.
+- **Touch.** Only an opt-in on-screen gamepad: set `Module.rexTouchGamepad = true` (or a config with
+  `show`, `canvas`, `opacity`, `size` and `layout`, documented in `src/ui/rex_web_pre.js`). It draws a
+  virtual Standard Gamepad over the canvas, driven by Pointer Events, and adds it to
+  `navigator.getGamepads()`, so the SDK reads it like a real pad. There is no direct touch-to-guest
+  input, and wasm64 plus about 8 GB of memory keeps most phones out anyway.
 
 ## Files and memory
 

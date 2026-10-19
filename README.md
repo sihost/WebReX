@@ -29,12 +29,13 @@ runtime. WebReX takes the runtime that recompiled code runs on and makes it work
 |---|---|
 | **GPU (Xenos)** | Xenos command processor on WebGPU (`src/graphics/webgpu/`): command streams recorded on the game's GPU thread and replayed on a WebGPU device thread, guest memory mirrored with a dirty map, EDRAM emulation with resolves, render-target and texture caches, Xenos texture formats decoded on the GPU, tessellation and vertex memexport as compute passes |
 | **Shaders** | Xenos shader microcode → SPIR-V → WGSL through [Tint](https://dawn.googlesource.com/dawn). Translation runs on worker threads and is cached in browser storage (OPFS). The 93 built-in shaders ship pre-translated |
-| **Display** | `WebGPUPresenter` draws the game's frames to a canvas once per animation frame, letterboxed, and handles resizes and device loss. Includes the ImGui settings/debug overlay |
+| **Display** | `WebGPUPresenter` draws the game's frames to a canvas once per animation frame, letterboxed, and handles resizes and device loss. Same CAS/FSR output effects as native (`--present_effect`), fullscreen with Keyboard Lock (F11). Includes the ImGui settings/debug overlay |
 | **Threads and memory** | Emscripten pthreads with suspend, APCs and timers like the 360 kernel expects; the 4 GB guest address space inside wasm64 memory |
 | **Files** | Game files stream over HTTP Range requests with an OPFS block cache; saves and profiles persist in OPFS across reloads |
-| **Audio** | AudioWorklet output fed from a SharedArrayBuffer ring |
-| **Input** | Gamepad API, keyboard and mouse with pointer lock |
-| **Network** | System link as a virtual UDP LAN over a WebSocket relay (relay server not included) |
+| **Audio** | AudioWorklet output fed from a SharedArrayBuffer ring, with adaptive latency and optional 5.1 |
+| **Input** | Gamepad API, keyboard and mouse with raw pointer lock, and an opt-in on-screen touch gamepad (`Module.rexTouchGamepad`) |
+| **Network** | System link as a virtual UDP LAN over a WebSocket relay. A standalone reference relay is in [`tools/web_relay`](tools/web_relay/README.md) |
+| **Page** | Crash reports from any thread (`Module.rexOnFatal`) and page lifecycle hooks for hidden tabs and Memory Saver discards (`rexOnLifecycle`, `rexOnDiscardRisk`, `rexOnDiscarded`). See [`docs/web_limitations.md`](docs/web_limitations.md) |
 
 Native builds (Windows/Linux with D3D12/Vulkan) still work from the same tree.
 
@@ -44,7 +45,8 @@ Tested with a full recompiled retail game in Chrome on Windows:
 
 - boots to the main menu, loads maps and plays with audio, controller and mouse/keyboard
 - settings and profiles survive a page reload
-- two browser tabs find each other and join one system-link lobby
+- two browser tabs find each other, join one system-link lobby and play the same match
+- a hidden tab keeps running at full speed, with clean audio
 - frames match the native D3D12 build at fixed game ticks (about 36–40 dB PSNR)
 - saved films play back and closely match native (some draws still skipped, see below)
 
@@ -61,7 +63,8 @@ they begin it get the same fixed results natively.
 | GPU | 16-bit normalized textures are stored as float16 so they stay filterable (precision differs from native) |
 | GPU | WebGPU limits: MSAA 2x runs as 4x, no ROV/FSI, no fill mode, no cull distance (see [`docs/web_limitations.md`](docs/web_limitations.md)) |
 | Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only); suspend/terminate are cooperative (kernel exports are safe points) |
-| Audio | ~90 ms output latency on a busy CPU (adaptive, lower when idle); a hidden tab's audio thread is starved by the browser |
+| Audio | ~90 ms output latency on a busy CPU (adaptive, lower when idle) |
+| Page | Chrome's Memory Saver can discard an inactive tab that plays no audio; the page is only told on the next load (`rexOnDiscarded`) |
 | Network | System link only (no Xbox Live) |
 | Input | Browsers expose a gamepad only after a button press; rumble depends on the browser's `vibrationActuator` |
 
