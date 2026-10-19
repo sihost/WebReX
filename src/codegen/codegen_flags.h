@@ -19,6 +19,7 @@
 // Codegen/Output
 REXCVAR_DECLARE(uint32_t, max_file_size_bytes);
 REXCVAR_DECLARE(uint32_t, progress_log_frequency);
+REXCVAR_DECLARE(bool, setjmp_separate_tu);
 
 // Codegen/Analysis
 REXCVAR_DECLARE(uint32_t, max_discovery_iterations);
