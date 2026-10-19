@@ -56,6 +56,7 @@
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/webgpu/webgpu_command_stream.h>
 #include <rex/graphics/webgpu/webgpu_edram.h>
+#include <rex/graphics/webgpu/webgpu_readback.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 
@@ -118,6 +119,8 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   // Called by the command processor when its stream has been submitted: any
   // render pass it had open is closed now.
   void OnStreamSubmitted() {}
+  // Also ends the delayed readback's frame (WebGPUReadback::EndFrame).
+  void BeginFrame() override;
 
   Path GetPath() const override { return Path::kHostRenderTargets; }
 
@@ -170,6 +173,13 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   // (webgpu_readback_memexport).
   bool ReadbackResolve(memory::Memory& memory, WebGPUSharedMemory& shared_memory,
                        uint32_t address, uint32_t length);
+  // After a vertex memexport dispatch wrote [address, address + length) (and
+  // RangeWrittenByGpu): copies it back into guest memory as
+  // WebGPUReadback::GetMemExportMode says (delayed by default, as natively).
+  void ReadbackMemExport(memory::Memory& memory, WebGPUSharedMemory& shared_memory,
+                         uint32_t address, uint32_t length);
+  // Delayed memexport / resolve readback (null until first used).
+  const WebGPUReadback* delayed_readback() const { return delayed_readback_.get(); }
 
   struct Statistics {
     uint64_t render_targets_created = 0;
@@ -278,6 +288,11 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   // Resolve readback (--webgpu_readback_resolve), device-thread buffer.
   WGPUBuffer readback_buffer_ = nullptr;
   uint64_t readback_buffer_size_ = 0;
+  // --webgpu_readback_memexport_delayed (needs the shared memory, created on
+  // first use).
+  std::unique_ptr<WebGPUReadback> delayed_readback_;
+  uint64_t frames_ = 0;  // BeginFrame calls
+  WebGPUReadback* GetDelayedReadback(WebGPUSharedMemory& shared_memory);
 
   Statistics statistics_;
 };

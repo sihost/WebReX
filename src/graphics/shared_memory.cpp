@@ -390,6 +390,17 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   }
 }
 
+bool SharedMemory::IsPageGpuWritten(uint32_t address) {
+  if (address >= kBufferSize) {
+    return false;
+  }
+  uint32_t page = address >> page_size_log2_;
+  uint32_t block = page >> 6;
+  auto global_lock = global_critical_region_.Acquire();
+  return block < system_page_flags_valid_and_gpu_written_.size() &&
+         ((system_page_flags_valid_and_gpu_written_[block] >> (page & 63)) & 1) != 0;
+}
+
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   uint32_t bucket = range->page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   WatchNode* node = range->node_first;
