@@ -937,6 +937,20 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
                  state.guest_primitive_type == xenos::PrimitiveType::kPointList);
   }
   vs_mod.vertex.vertex_kill_and = 0;
+  // Centroid sampling is a pixel shader property on Xenos, but WGSL requires
+  // the vertex outputs to declare the same interpolation sampling as the
+  // fragment inputs (Dawn ValidateInterStageMatching), so the VS variant
+  // carries the centroid mask of the PS it is linked with (part of the
+  // modification, so of the pipeline and the WGSL storage keys).
+  uint32_t interpolators_centroid = 0;
+  if (state.pixel_shader) {
+    interpolators_centroid =
+        state.interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
+                                      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
+                                      regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
+                                      regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+  }
+  vs_mod.vertex.interpolators_centroid = interpolators_centroid;
   desc.vertex_shader_hash = vs.ucode_data_hash();
   desc.vertex_shader_modification = vs_mod.value;
   bindings_out.vertex = GetShaderBindings(vs, vs_mod.value);
@@ -954,11 +968,7 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
     SpirvShaderTranslator::Modification ps_mod(translator_->GetDefaultPixelShaderModification(
         ps.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
     ps_mod.pixel.interpolator_mask = state.interpolator_mask;
-    ps_mod.pixel.interpolators_centroid =
-        state.interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
-                                      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
-                                      regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
-                                      regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+    ps_mod.pixel.interpolators_centroid = interpolators_centroid;
     if (ps_param_gen_used) {
       ps_mod.pixel.param_gen_enable = 1;
       ps_mod.pixel.param_gen_interpolator = state.ps_param_gen_pos;
