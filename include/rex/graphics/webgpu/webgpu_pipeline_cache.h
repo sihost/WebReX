@@ -366,6 +366,8 @@ class WebGPUPipelineCache {
                                  const std::array<WGPUBindGroupLayout, 4>& layouts);
   std::shared_ptr<const std::string> GetDepthOnlyFragmentWgsl(uint32_t depth_stencil_mode);
   std::filesystem::path StoragePath(uint64_t hash, uint64_t modification, bool vertex) const;
+  // CP thread, from InitializeShaderStorage: --webgpu_wgsl_bundle_url.
+  void ImportWgslBundle();
   // Bindings of `shader` (translating `modification` if no modification of it
   // is translated yet, as on a WGSL storage hit). Null if the shader can't be
   // bound (translation failure, over the per-stage texture / sampler limits).

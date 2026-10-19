@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
 #include <utility>
 
 #include <emscripten/emscripten.h>
@@ -803,6 +804,38 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     // one are skipped (their pipeline id was not ready yet).
     bool pipeline_ready = false;
     state.transient_bind_groups_.clear();
+    // --webgpu_log_skipped_pipelines (WebGPUCommandQueue::set_log_skipped_pipelines).
+    const bool log_skips = state.log_skipped_pipelines_;
+    const uint32_t replay_index = ++state.replay_index_;
+    PipelineId current_id = kInvalidPipelineId;
+    auto skip_stats = [&state](PipelineId id) -> WebGPUReplayState::PipelineSkipStats& {
+      if (id >= state.skip_stats_.size()) {
+        state.skip_stats_.resize(size_t(id) + 256);
+      }
+      return state.skip_stats_[id];
+    };
+    auto note_skipped = [&]() {
+      if (!log_skips || current_id == kInvalidPipelineId) {
+        return;
+      }
+      WebGPUReplayState::PipelineSkipStats& s = skip_stats(current_id);
+      if (!s.skipped++) {
+        s.first_skip_replay = replay_index;
+      }
+      s.last_skip_replay = replay_index;
+    };
+    auto note_replayed = [&]() {
+      if (!log_skips || current_id == kInvalidPipelineId) {
+        return;
+      }
+      WebGPUReplayState::PipelineSkipStats& s = skip_stats(current_id);
+      if (!s.drawn++ && s.skipped) {
+        REXWGPU_INFO(
+            "WebGPU: pipeline {} first replayed in replay {} after {} skipped draws / dispatches "
+            "in replays {}-{}",
+            current_id, replay_index, s.skipped, s.first_skip_replay, s.last_skip_replay);
+      }
+    };
     const uint8_t* record = commands_.data;
     const uint8_t* records_end = commands_.data + commands_.size;
     std::vector<WGPUBindGroupEntry> entries_scratch;
@@ -825,6 +858,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           desc.occlusionQuerySet = args->occlusion_query_set;
           render_pass = wgpuCommandEncoderBeginRenderPass(encoder, &desc);
           pipeline_ready = false;
+          current_id = kInvalidPipelineId;
           ++stats.render_passes;
           break;
         }
@@ -837,6 +871,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
           compute_pass = wgpuCommandEncoderBeginComputePass(encoder, &desc);
           pipeline_ready = false;
+          current_id = kInvalidPipelineId;
           ++stats.compute_passes;
           break;
         }
@@ -851,6 +886,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                   ? state.pipelines()->GetRender(static_cast<const ArgsId*>(args_ptr)->id)
                   : nullptr;
           pipeline_ready = pipeline != nullptr;
+          current_id = static_cast<const ArgsId*>(args_ptr)->id;
           if (pipeline) {
             wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
           }
@@ -860,6 +896,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           auto pipeline = static_cast<WGPURenderPipeline>(
               const_cast<void*>(static_cast<const ArgsHandle*>(args_ptr)->handle));
           pipeline_ready = pipeline != nullptr;
+          current_id = kInvalidPipelineId;
           if (pipeline) {
             wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
           }
@@ -900,17 +937,20 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
         case Command::kDraw: {
           if (!pipeline_ready) {
             ++stats.draws_skipped;
+            note_skipped();
             break;
           }
           const auto* args = static_cast<const ArgsDraw*>(args_ptr);
           wgpuRenderPassEncoderDraw(render_pass, args->vertex_count, args->instance_count,
                                     args->first_vertex, args->first_instance);
           ++stats.draws;
+          note_replayed();
           break;
         }
         case Command::kDrawIndexed: {
           if (!pipeline_ready) {
             ++stats.draws_skipped;
+            note_skipped();
             break;
           }
           const auto* args = static_cast<const ArgsDrawIndexed*>(args_ptr);
@@ -918,6 +958,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                                            args->first_index, args->base_vertex,
                                            args->first_instance);
           ++stats.draws;
+          note_replayed();
           break;
         }
         case Command::kSetComputePipelineId: {
@@ -926,6 +967,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                   ? state.pipelines()->GetCompute(static_cast<const ArgsId*>(args_ptr)->id)
                   : nullptr;
           pipeline_ready = pipeline != nullptr;
+          current_id = static_cast<const ArgsId*>(args_ptr)->id;
           if (pipeline) {
             wgpuComputePassEncoderSetPipeline(compute_pass, pipeline);
           }
@@ -935,6 +977,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           auto pipeline = static_cast<WGPUComputePipeline>(
               const_cast<void*>(static_cast<const ArgsHandle*>(args_ptr)->handle));
           pipeline_ready = pipeline != nullptr;
+          current_id = kInvalidPipelineId;
           if (pipeline) {
             wgpuComputePassEncoderSetPipeline(compute_pass, pipeline);
           }
@@ -943,11 +986,13 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
         case Command::kDispatch: {
           if (!pipeline_ready) {
             ++stats.draws_skipped;
+            note_skipped();
             break;
           }
           const auto* args = static_cast<const ArgsDispatch*>(args_ptr);
           wgpuComputePassEncoderDispatchWorkgroups(compute_pass, args->x, args->y, args->z);
           ++stats.dispatches;
+          note_replayed();
           break;
         }
         case Command::kSetBindGroup: {
@@ -1108,6 +1153,32 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     entry.callback(entry.user, state);
   }
 
+  if (state.log_skipped_pipelines_ && !(state.replay_index_ % 1000)) {
+    // Ids whose draws were skipped and that were never replayed since: what the
+    // guest drew only while they were not ready is missing from its targets.
+    uint32_t never = 0, never_skipped = 0, later = 0;
+    std::string list;
+    for (PipelineId id = 0; id < state.skip_stats_.size(); ++id) {
+      const WebGPUReplayState::PipelineSkipStats& s = state.skip_stats_[id];
+      if (!s.skipped) {
+        continue;
+      }
+      if (s.drawn) {
+        ++later;
+        continue;
+      }
+      ++never;
+      never_skipped += s.skipped;
+      if (never <= 48) {
+        list += " " + std::to_string(id) + "x" + std::to_string(s.skipped) + "@" +
+                std::to_string(s.first_skip_replay) + "-" + std::to_string(s.last_skip_replay);
+      }
+    }
+    REXWGPU_INFO(
+        "WebGPU: replay {}: {} pipelines had skipped draws and were replayed later, {} "
+        "({} draws) were never replayed after their skips (id x skips @ replays):{}",
+        state.replay_index_, later, never, never_skipped, list);
+  }
   stats.encode_ms = time_encoded - time_start;
   stats.submit_ms = time_submitted - time_encoded;
   if (stats_out) {
@@ -1179,6 +1250,9 @@ void WebGPUCommandQueue::Shutdown() {
 
 void WebGPUCommandQueue::ReplayOnDeviceThread(WebGPUCommandStream* stream, uint64_t submission) {
   WebGPUReplayStats stats;
+  if (replay_state_) {
+    replay_state_->log_skipped_pipelines_ = log_skipped_pipelines_.load(std::memory_order_relaxed);
+  }
   bool executed = replay_state_ && stream->Execute(*replay_state_, &stats);
   if (device_.is_lost()) {
     tracker_.MarkLost();

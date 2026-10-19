@@ -134,6 +134,7 @@ class WebGPUReplayState {
 
  private:
   friend class WebGPUCommandStream;
+  friend class WebGPUCommandQueue;
   bool EnsureBuffer(WGPUBuffer& buffer, uint64_t& buffer_size, uint64_t needed,
                     WGPUBufferUsage usage, const char* label);
 
@@ -143,6 +144,18 @@ class WebGPUReplayState {
   uint64_t staging_buffer_size_ = 0;
   WGPUBuffer constant_buffer_ = nullptr;
   uint64_t constant_buffer_size_ = 0;
+
+  // --webgpu_log_skipped_pipelines: per pipeline id, the draws / dispatches
+  // skipped while it was not ready and those replayed after it was.
+  struct PipelineSkipStats {
+    uint32_t skipped = 0;
+    uint32_t drawn = 0;
+    uint32_t first_skip_replay = 0;
+    uint32_t last_skip_replay = 0;
+  };
+  std::vector<PipelineSkipStats> skip_stats_;
+  uint32_t replay_index_ = 0;
+  bool log_skipped_pipelines_ = false;
 
   // Bind groups created from descriptors during one Execute, deduplicated.
   struct TransientBindGroup {
@@ -355,6 +368,13 @@ class WebGPUCommandQueue {
   // Submit() + wait until the device thread has replayed it.
   uint64_t SubmitAndWaitReplayed();
 
+  // Any thread: log per pipeline id the draws skipped while it was not ready
+  // (the first replay that draws it after skips, and every 1000 replays the ids
+  // skipped and never drawn since).
+  void set_log_skipped_pipelines(bool log) {
+    log_skipped_pipelines_.store(log, std::memory_order_relaxed);
+  }
+
   // Statistics of the most recently replayed stream, and running totals.
   WebGPUReplayStats last_replay_stats() const;
   uint64_t replay_count() const { return replay_count_.load(std::memory_order_relaxed); }
@@ -382,6 +402,7 @@ class WebGPUCommandQueue {
   WebGPUReplayStats last_stats_;
   std::atomic<uint64_t> replay_count_{0};
   std::atomic<uint64_t> draws_skipped_total_{0};
+  std::atomic<bool> log_skipped_pipelines_{false};
   bool initialized_ = false;
 };
 

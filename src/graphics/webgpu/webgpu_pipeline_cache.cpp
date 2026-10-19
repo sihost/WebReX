@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -35,6 +37,7 @@
 #include <rex/logging.h>
 
 #if defined(__EMSCRIPTEN__)
+#include <emscripten/em_js.h>
 #include <rex/filesystem/web_storage.h>
 #endif
 
@@ -57,9 +60,43 @@ REXCVAR_DEFINE_INT32(webgpu_wgsl_threads, 2, "GPU",
                      "shaders are still converting are skipped, as while the browser creates it. "
                      "0 = convert on the CP thread (it stalls; read at the first conversion)");
 
+REXCVAR_DEFINE_BOOL(webgpu_log_skipped_pipelines, false, "GPU",
+                    "WebGPU: log every render pipeline id with its shaders and pass, and per id "
+                    "the draws the replay skipped while it was not ready (first replay after the "
+                    "skips; every 1000 replays the ids never replayed since)");
+REXCVAR_DEFINE_STRING(webgpu_wgsl_bundle_url, "", "GPU",
+                      "WebGPU (web): URL prefix of a precompiled WGSL bundle (e.g. /wgsl/). At "
+                      "the first shader request the CP fetches <prefix><storage dir name>.wgslpack "
+                      "once per storage directory and writes the shaders it lacks into the OPFS "
+                      "shader storage, so a first boot finds them as a warm one does. Empty = off. "
+                      "Bundles: tools/wgsl_bundle in the game repo");
+
 namespace rex::graphics::webgpu {
 
 namespace {
+
+#if defined(__EMSCRIPTEN__)
+// Synchronous GET (the CP is a pthread, so sync XHR is allowed) into a JS-side
+// slot; returns the byte length, -HTTP status, or -1. Pointers as doubles
+// (wasm64, as http_range_device.cpp), no malloc from JS.
+EM_JS_DEPS(rex_wgsl_bundle, "$UTF8ToString");
+// clang-format off
+EM_JS(double, rex_wgsl_bundle_fetch, (double url_ptr), {
+  var xhr = new XMLHttpRequest();
+  xhr.open("GET", UTF8ToString(url_ptr), false);
+  xhr.responseType = "arraybuffer";
+  try { xhr.send(null); } catch (e) { return -1; }
+  if (xhr.status !== 200 || !xhr.response) return -(xhr.status || 1);
+  globalThis["__rexWgslBundle"] = new Uint8Array(xhr.response);
+  return globalThis["__rexWgslBundle"].length;
+});
+EM_JS(void, rex_wgsl_bundle_take, (double dst), {
+  var b = globalThis["__rexWgslBundle"];
+  if (b) HEAPU8.set(b, dst);
+  globalThis["__rexWgslBundle"] = undefined;
+});
+// clang-format on
+#endif
 
 using HVST = Shader::HostVertexShaderType;
 using RenderPassFormatKey = WebGPURenderTargetCache::RenderPassFormatKey;
@@ -327,6 +364,8 @@ bool WebGPUPipelineCache::Initialize() {
                 "clip distances {}",
                 GetTintRevision(), max_storage_buffer_range_ >> 20, clip_distances_);
   }
+  WebGPUCommandQueue& queue = command_processor_.command_queue();
+  queue.set_log_skipped_pipelines(REXCVAR_GET(webgpu_log_skipped_pipelines));
   return true;
 }
 
@@ -519,6 +558,89 @@ void WebGPUPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     return;
   }
   REXGPU_INFO("WebGPU shader storage: {}", storage_dir_.string());
+  ImportWgslBundle();
+}
+
+void WebGPUPipelineCache::ImportWgslBundle() {
+#if defined(__EMSCRIPTEN__)
+  std::string prefix = REXCVAR_GET(webgpu_wgsl_bundle_url);
+  if (prefix.empty() || storage_dir_.empty()) {
+    return;
+  }
+  // Once per storage directory: the marker holds the bundle size imported.
+  std::filesystem::path marker = storage_dir_ / "bundle.imported";
+  std::error_code ec;
+  if (std::filesystem::exists(marker, ec)) {
+    REXGPU_INFO("WebGPU shader storage: WGSL bundle already imported ({})", marker.string());
+    return;
+  }
+  std::string url = prefix + storage_dir_.filename().string() + ".wgslpack";
+  auto start = std::chrono::steady_clock::now();
+  double length = rex_wgsl_bundle_fetch(double(uintptr_t(url.c_str())));
+  if (length <= 0) {
+    REXGPU_INFO("WebGPU shader storage: no WGSL bundle at {} ({})", url, length);
+    return;
+  }
+  std::string data(size_t(length), '\0');
+  rex_wgsl_bundle_take(double(uintptr_t(data.data())));
+  double fetch_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  // "REXWGSL1 <storage dir name>\n", then per shader "<file name> <bytes>\n<bytes>\n".
+  size_t pos = data.find('\n');
+  std::string expected = "REXWGSL1 " + storage_dir_.filename().string();
+  if (pos == std::string::npos || data.compare(0, pos, expected)) {
+    REXGPU_WARN("WebGPU shader storage: {} is not a bundle for {}", url, expected);
+    return;
+  }
+  ++pos;
+  uint32_t written = 0, present = 0;
+  uint64_t written_bytes = 0;
+  bool valid = true;
+  while (pos < data.size()) {
+    size_t line_end = data.find('\n', pos);
+    size_t space = data.find(' ', pos);
+    if (line_end == std::string::npos || space == std::string::npos || space > line_end) {
+      valid = false;
+      break;
+    }
+    std::string name = data.substr(pos, space - pos);
+    uint64_t size = std::strtoull(data.c_str() + space + 1, nullptr, 10);
+    pos = line_end + 1;
+    if (size > data.size() - pos || name.size() < 6 ||
+        name.compare(name.size() - 5, 5, ".wgsl") || name.find_first_of("/\\:") != std::string::npos ||
+        name.find("..") != std::string::npos) {
+      valid = false;
+      break;
+    }
+    std::filesystem::path path = storage_dir_ / name;
+    if (std::filesystem::exists(path, ec)) {
+      ++present;
+    } else {
+      std::filesystem::path temp = path;
+      temp += ".tmp";
+      {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out.write(data.data() + pos, std::streamsize(size));
+      }
+      std::filesystem::rename(temp, path, ec);
+      if (!ec) {
+        ++written;
+        written_bytes += size;
+      }
+    }
+    pos += size_t(size) + 1;
+  }
+  if (valid) {
+    std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+    out << data.size() << "\n";
+  }
+  REXGPU_INFO(
+      "WebGPU shader storage: WGSL bundle {} ({} KiB, fetched in {:.0f} ms): {} shaders written "
+      "({} KiB), {} already present{}, {:.0f} ms in total",
+      url, data.size() >> 10, fetch_ms, written, written_bytes >> 10, present,
+      valid ? "" : ", malformed after them",
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+#endif
 }
 
 std::filesystem::path WebGPUPipelineCache::StoragePath(uint64_t hash, uint64_t modification,
@@ -1162,6 +1284,13 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
   }
   pipelines_.emplace(description, id);
   ++statistics_.pipelines_requested;
+  if (REXCVAR_GET(webgpu_log_skipped_pipelines)) {
+    REXGPU_INFO(
+        "WebGPU pipeline {}: {} pass {:08X} topology {} color masks {:04X} depth {:08X} "
+        "(shaders {})",
+        id, label, d.render_pass_format_key, uint32_t(d.primitive_topology), d.color_write_masks,
+        d.depth_control, deferred ? "converting" : "ready");
+  }
   if (statistics_.pipelines_requested <= 2 || !(statistics_.pipelines_requested % 32)) {
     const Statistics& statistics = this->statistics();
     REXGPU_INFO(
