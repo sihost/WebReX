@@ -79,6 +79,10 @@ class WebGPUCommandProcessor : public CommandProcessor {
   WebGPUCommandStream& command_stream() const { return command_queue_->stream(); }
   WebGPUSubmissionTracker& submission_tracker() { return submission_tracker_; }
   WebGPUSharedMemory* shared_memory() const { return shared_memory_.get(); }
+  // Draw resolution scale (draw_resolution_scale_x/y or resolution_scale, set in
+  // SetupContext before the caches are created).
+  uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
+  uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   // WP3: host index buffers and primitive type conversion.
   WebGPUPrimitiveProcessor* primitive_processor() const { return primitive_processor_.get(); }
 
@@ -201,6 +205,8 @@ class WebGPUCommandProcessor : public CommandProcessor {
   std::unique_ptr<WebGPUSharedMemory> shared_memory_;
   std::unique_ptr<WebGPUPrimitiveProcessor> primitive_processor_;  // WP3
   std::unique_ptr<WebGPUTextureCache> texture_cache_;
+  uint32_t draw_resolution_scale_x_ = 1;
+  uint32_t draw_resolution_scale_y_ = 1;
   std::unique_ptr<WebGPURenderTargetCache> render_target_cache_;
   std::unique_ptr<WebGPUPipelineCache> pipeline_cache_;
   // Tessellated draws (compute pre-pass; null if it couldn't be created).

@@ -69,8 +69,11 @@ constexpr WGPUComponentSwizzle ToComponentSwizzle(uint32_t xenos_component) {
 
 WebGPUTextureCache::WebGPUTextureCache(WebGPUCommandProcessor& command_processor,
                                        const RegisterFile& register_file,
-                                       WebGPUSharedMemory& shared_memory, memory::Memory& memory)
-    : TextureCache(register_file, shared_memory, 1, 1),
+                                       WebGPUSharedMemory& shared_memory, memory::Memory& memory,
+                                       uint32_t draw_resolution_scale_x,
+                                       uint32_t draw_resolution_scale_y)
+    : TextureCache(register_file, shared_memory, draw_resolution_scale_x,
+                   draw_resolution_scale_y),
       command_processor_(command_processor),
       memory_(memory) {}
 
@@ -93,9 +96,39 @@ bool WebGPUTextureCache::Initialize() {
                        device.HasFeature(WGPUFeatureName_TextureComponentSwizzle);
   format_table_.Initialize(features);
 
-  if (!loader_.Initialize(device)) {
+  if (!loader_.Initialize(device, IsDrawResolutionScaled())) {
     REXGPU_ERROR("WebGPU texture cache: texture loader initialization failed");
     return false;
+  }
+
+  // Scaled resolve windows: W = 8 MiB unscaled (2 * W * scale^2 bytes per window: 64 MiB at
+  // 2x, 144 MiB at 3x), halved until a window fits a storage binding.
+  scaled_window_log2_ = 0;
+  scaled_windows_.clear();
+  if (IsDrawResolutionScaled()) {
+    const WGPULimits& limits = device.limits();
+    uint64_t max_size = std::min<uint64_t>(limits.maxStorageBufferBindingSize, limits.maxBufferSize);
+    uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+    for (uint32_t log2 = 23; log2 >= 20; --log2) {
+      if ((uint64_t(2) << log2) * scale_area <= max_size) {
+        scaled_window_log2_ = log2;
+        break;
+      }
+    }
+    if (scaled_window_log2_) {
+      scaled_windows_.resize(SharedMemory::kBufferSize >> scaled_window_log2_);
+      REXGPU_INFO(
+          "WebGPU texture cache: draw resolution scale {}x{}, scaled resolve windows of {} MiB "
+          "(textures and resolves up to {} MiB are scaled)",
+          draw_resolution_scale_x(), draw_resolution_scale_y(),
+          ((uint64_t(2) << scaled_window_log2_) * scale_area) >> 20,
+          1u << (scaled_window_log2_ - 20));
+    } else {
+      REXGPU_WARN(
+          "WebGPU texture cache: draw resolution scale {}x{}, but no scaled resolve window fits "
+          "the {} MiB buffer limit: resolved textures stay at 1x",
+          draw_resolution_scale_x(), draw_resolution_scale_y(), max_size >> 20);
+    }
   }
 
   // Null textures (zero-initialized by WebGPU) for unbound or invalid fetches, matching the
@@ -174,8 +207,111 @@ void WebGPUTextureCache::Shutdown() {
         *texture = nullptr;
       }
     }
+    for (ScaledResolveWindow& window : scaled_windows_) {
+      if (window.buffer) {
+        wgpuBufferDestroy(window.buffer);
+        wgpuBufferRelease(window.buffer);
+        window = {};
+      }
+    }
   });
   loader_.Shutdown();
+}
+
+const WebGPUTextureCache::ScaledResolveWindow* WebGPUTextureCache::GetScaledResolveWindow(
+    uint32_t index) {
+  if (index >= scaled_windows_.size()) {
+    return nullptr;
+  }
+  ScaledResolveWindow& window = scaled_windows_[index];
+  if (window.buffer) {
+    return &window;
+  }
+  uint32_t start = index << scaled_window_log2_;
+  uint64_t size_unscaled =
+      std::min<uint64_t>(uint64_t(2) << scaled_window_log2_, SharedMemory::kBufferSize - start);
+  uint64_t size = size_unscaled * draw_resolution_scale_x() * draw_resolution_scale_y();
+  WGPUBuffer buffer = nullptr;
+  WebGPUDevice& device = command_processor_.device();
+  device.RunSync([&]() {
+    WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+    desc.label = MakeStringView("rex scaled resolve window");
+    desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+    desc.size = size;
+    buffer = wgpuDeviceCreateBuffer(device.device(), &desc);
+  });
+  if (!buffer) {
+    REXGPU_ERROR("WebGPU texture cache: creating the {} MiB scaled resolve window {} failed",
+                 size >> 20, index);
+    return nullptr;
+  }
+  window.buffer = buffer;
+  window.start_unscaled = start;
+  window.size_scaled = size;
+  ++statistics_.scaled_windows;
+  REXGPU_INFO("WebGPU texture cache: scaled resolve window {} (0x{:08X}, {} MiB), {} in total",
+              index, start, size >> 20, statistics_.scaled_windows);
+  return &window;
+}
+
+bool WebGPUTextureCache::GetScaledResolveWriteWindows(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    std::vector<ScaledResolveWindow>& windows_out) {
+  windows_out.clear();
+  if (!scaled_window_log2_ || !length_unscaled ||
+      length_unscaled > scaled_window_unscaled_size() ||
+      start_unscaled >= SharedMemory::kBufferSize) {
+    return false;
+  }
+  uint32_t first = start_unscaled >> scaled_window_log2_;
+  first -= first != 0;
+  uint32_t last = uint32_t((std::min<uint64_t>(uint64_t(start_unscaled) + length_unscaled,
+                                                SharedMemory::kBufferSize) -
+                            1) >>
+                           scaled_window_log2_);
+  for (uint32_t i = first; i <= last; ++i) {
+    const ScaledResolveWindow* window = GetScaledResolveWindow(i);
+    if (!window) {
+      windows_out.clear();
+      return false;
+    }
+    windows_out.push_back(*window);
+  }
+  return true;
+}
+
+const WebGPUTextureCache::ScaledResolveWindow* WebGPUTextureCache::GetScaledResolveReadWindow(
+    uint32_t start_unscaled, uint32_t length_unscaled) {
+  if (!scaled_window_log2_ || length_unscaled > scaled_window_unscaled_size()) {
+    return nullptr;
+  }
+  return GetScaledResolveWindow(start_unscaled >> scaled_window_log2_);
+}
+
+bool WebGPUTextureCache::EnsureScaledResolveMemoryCommitted(
+    uint32_t start_unscaled, uint32_t length_unscaled, uint32_t /*length_scaled_alignment_log2*/) {
+  return GetScaledResolveReadWindow(start_unscaled, length_unscaled) != nullptr;
+}
+
+bool WebGPUTextureCache::IsScaledResolveSupportedForFormat(TextureKey key) const {
+  if (!scaled_window_log2_) {
+    return false;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (format_info->block_width != 1 || format_info->block_height != 1) {
+    return false;
+  }
+  const WebGPUTextureHostFormat& host_format =
+      WebGPUTextureFormatTable::GetHostFormat(GetHostFormatPair(key), key.signed_separate);
+  if (host_format.block_compressed || !loader_.HasScaledPipeline(host_format.load_shader) ||
+      (host_format.convert_shader != WebGPUTextureLoadShader::kUnknown &&
+       !loader_.HasPipeline(host_format.convert_shader))) {
+    return false;
+  }
+  // Each of the base and the mips must lie within one window.
+  texture_util::TextureGuestLayout layout = key.GetGuestLayout();
+  uint32_t window = scaled_window_unscaled_size();
+  return layout.base.level_data_extent_bytes <= window && layout.mips_total_extent_bytes <= window;
 }
 
 void WebGPUTextureCache::ClearCache() {
@@ -430,7 +566,11 @@ WGPUSampler WebGPUTextureCache::UseSampler(WebGPUSamplerParameters parameters) {
 
 WGPUTextureView WebGPUTextureCache::RequestSwapTexture(uint32_t& width_out, uint32_t& height_out,
                                                        xenos::TextureFormat& format_out,
-                                                       bool* swap_source_needs_rb_swap_out) {
+                                                       bool* swap_source_needs_rb_swap_out,
+                                                       bool* scaled_out) {
+  if (scaled_out) {
+    *scaled_out = false;
+  }
   UpdateSubmission();
   xenos::xe_gpu_texture_fetch_t fetch = register_file().GetTextureFetch(0);
   width_out = fetch.size_2d.width + 1;
@@ -473,6 +613,13 @@ WGPUTextureView WebGPUTextureCache::RequestSwapTexture(uint32_t& width_out, uint
   key = texture->key();
   width_out = key.GetWidth();
   height_out = key.GetHeight();
+  if (key.scaled_resolve) {
+    width_out *= draw_resolution_scale_x();
+    height_out *= draw_resolution_scale_y();
+    if (scaled_out) {
+      *scaled_out = true;
+    }
+  }
   format_out = key.format;
   // A frame boundary: rebind (and recheck) everything next frame.
   BeginFrame();
@@ -519,9 +666,18 @@ uint32_t WebGPUTextureCache::GetMaxHostTextureDepthOrArraySize(
 
 std::unique_ptr<TextureCache::Texture> WebGPUTextureCache::CreateTexture(TextureKey key) {
   WebGPUHostTextureInfo info;
+  // The host format follows the guest size (BC alignment), the host size the resolution scale.
+  uint32_t host_width = key.GetWidth() * (key.scaled_resolve ? draw_resolution_scale_x() : 1);
+  uint32_t host_height = key.GetHeight() * (key.scaled_resolve ? draw_resolution_scale_y() : 1);
   if (!GetHostTextureInfo(format_table_, key.format, key.dimension, key.GetWidth(),
                           key.GetHeight(), key.GetDepthOrArraySize(), key.mip_max_level,
                           key.signed_separate, info)) {
+    return nullptr;
+  }
+  if (key.scaled_resolve &&
+      !GetHostTextureInfo(format_table_, key.format, key.dimension, host_width, host_height,
+                          key.GetDepthOrArraySize(), key.mip_max_level, key.signed_separate,
+                          info)) {
     return nullptr;
   }
   WGPUTexture texture = nullptr;
@@ -569,6 +725,41 @@ bool WebGPUTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   desc.mips_offset = uint64_t(key.mip_page) << 12;
   desc.load_base = load_base;
   desc.load_mips = load_mips && desc.mip_max_level != 0;
+  if (key.scaled_resolve) {
+    // From the scaled resolve windows of the base and of the mips.
+    uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+    desc.scale_x = draw_resolution_scale_x();
+    desc.scale_y = draw_resolution_scale_y();
+    desc.source = nullptr;
+    desc.source_size = 0;
+    if (desc.load_base) {
+      const ScaledResolveWindow* window =
+          GetScaledResolveReadWindow(key.base_page << 12, texture.GetGuestBaseSize());
+      if (!window) {
+        ++statistics_.load_failures;
+        return false;
+      }
+      desc.source = window->buffer;
+      desc.source_size = window->size_scaled;
+      desc.base_offset = ((uint64_t(key.base_page) << 12) - window->start_unscaled) * scale_area;
+    }
+    if (desc.load_mips) {
+      const ScaledResolveWindow* window =
+          GetScaledResolveReadWindow(key.mip_page << 12, texture.GetGuestMipsSize());
+      if (!window) {
+        ++statistics_.load_failures;
+        return false;
+      }
+      desc.mips_source = window->buffer;
+      desc.mips_source_size = window->size_scaled;
+      desc.mips_offset = ((uint64_t(key.mip_page) << 12) - window->start_unscaled) * scale_area;
+      if (!desc.source) {
+        desc.source = window->buffer;
+        desc.source_size = window->size_scaled;
+      }
+    }
+    ++statistics_.scaled_loads;
+  }
   desc.guest_layout = &texture.guest_layout();
   if (!desc.load_base && !desc.load_mips) {
     // Only mips beyond the host's levels were outdated.

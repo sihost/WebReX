@@ -119,7 +119,10 @@ class WebGPUEdram {
   static constexpr uint32_t kTileBytes = 80 * 16 * 4;
   static constexpr uint32_t kBufferSize = kTileCount * kTileBytes;
 
-  explicit WebGPUEdram(WebGPUDevice& device) : device_(device) {}
+  // Draw resolution scale: tiles of (80 or 40) * scale_x x 16 * scale_y host samples, a
+  // kBufferSize * scale_x * scale_y buffer.
+  explicit WebGPUEdram(WebGPUDevice& device, uint32_t scale_x = 1, uint32_t scale_y = 1)
+      : device_(device), scale_x_(scale_x ? scale_x : 1), scale_y_(scale_y ? scale_y : 1) {}
   WebGPUEdram(const WebGPUEdram&) = delete;
   WebGPUEdram& operator=(const WebGPUEdram&) = delete;
   // Shutdown() must have run on the device thread.
@@ -131,6 +134,10 @@ class WebGPUEdram {
 
   // ---- Any thread after Initialize. ----
   WGPUBuffer buffer() const { return buffer_; }
+  uint64_t buffer_size() const { return uint64_t(kBufferSize) * scale_x_ * scale_y_; }
+  uint32_t scale_x() const { return scale_x_; }
+  uint32_t scale_y() const { return scale_y_; }
+  bool is_scaled() const { return scale_x_ > 1 || scale_y_ > 1; }
   bool has_depth32float_stencil8() const { return has_depth32float_stencil8_; }
   // Host formats (docs/port/webgpu.md section 5). Undefined for invalid input.
   static WGPUTextureFormat GetColorHostFormat(uint32_t color_format);
@@ -163,9 +170,13 @@ class WebGPUEdram {
                   uint64_t clear_value = 0);
   // Compute pass open. dest_buffer [dest_offset, dest_offset + dest_size) is
   // bound as the destination (dest_offset a multiple of 256);
-  // constants.dest_base is relative to dest_offset.
+  // constants.dest_base is relative to dest_offset. constants are in guest pixels;
+  // scaled_dest (only when is_scaled()): the destination is a scaled resolve buffer
+  // range (xenia's resolution-scaled layout, dest_base in scaled bytes), written at the
+  // host resolution; otherwise guest pixels are written, each from the middle host pixel.
   void RecordResolve(WebGPUCommandStream& stream, const WebGPUResolveConstants& constants,
-                     WGPUBuffer dest_buffer, uint64_t dest_offset, uint64_t dest_size);
+                     WGPUBuffer dest_buffer, uint64_t dest_offset, uint64_t dest_size,
+                     bool scaled_dest = false);
 
   struct Statistics {
     uint64_t dumps = 0;
@@ -187,6 +198,8 @@ class WebGPUEdram {
                       const WebGPUEdramRectangle* rectangles, uint32_t rectangle_count);
 
   WebGPUDevice& device_;
+  uint32_t scale_x_;
+  uint32_t scale_y_;
   bool has_depth32float_stencil8_ = false;
   static inline bool gamma_as_unorm16_ = false;
 
@@ -207,6 +220,8 @@ class WebGPUEdram {
   WGPURenderPipeline depth_load_pipelines_[2][2][kDepthPipelineVariants] = {};
   WGPUBindGroupLayout resolve_layout_ = nullptr;
   WGPUComputePipeline resolve_pipeline_ = nullptr;
+  // Writing the scaled resolve buffer (scaled only).
+  WGPUComputePipeline resolve_scaled_pipeline_ = nullptr;
 
   Statistics statistics_;
 };

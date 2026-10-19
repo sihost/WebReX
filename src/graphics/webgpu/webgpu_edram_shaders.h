@@ -14,6 +14,11 @@
  * tile is 80x16 samples of one dword, a 64bpp tile 40x16 samples of two
  * dwords, row-major within the tile. Depth tiles have their two 40-sample
  * halves swapped. Element index = (tile & 2047) * tile_w * 16 + y * tile_w + x.
+ * Draw resolution scaling (kScaleX / kScaleY, appended to the prelude by
+ * WebGPUEdram::Initialize): a tile is (80 or 40) * kScaleX x 16 * kScaleY host
+ * samples, so the buffer is kScaleX * kScaleY times larger; only these shaders
+ * read and write it, so the layout is internal (the EDRAM snapshot of trace
+ * playback is the 1x layout and is not restored when scaled).
  * Guest samples: 2x MSAA = 1x2 samples per pixel (0 top, 1 bottom), 4x = 2x2
  * (bit 0 horizontal, bit 1 vertical). Host 2x is emulated with 4x (host
  * samples 0/1 = guest top, 2/3 = guest bottom; dumps read host 0 and 3).
@@ -55,7 +60,7 @@ fn xe_edram_index(tile_non_wrapped : u32, x : u32, y : u32, tile_w : u32, is_dep
       sx = sx - half;
     }
   }
-  return (tile_non_wrapped & (kTileCount - 1u)) * (tile_w * 16u) + y * tile_w + sx;
+  return (tile_non_wrapped & (kTileCount - 1u)) * (tile_w * 16u * kScaleY) + y * tile_w + sx;
 }
 
 fn xe_f7e3_to_f32(v : u32) -> f32 {
@@ -358,17 +363,18 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     return;
   }
   let wide = !kDumpIsDepth && xe_is_64bpp(xe_dump.format);
-  let tile_w = select(80u, 40u, wide);
+  let tile_w = select(80u, 40u, wide) * kScaleX;
+  let tile_h = 16u * kScaleY;
   let tile_x = id.x / tile_w;
   let sample_x = id.x % tile_w;
-  let tile_y = id.y >> 4u;
-  let sample_y = id.y & 15u;
+  let tile_y = id.y / tile_h;
+  let sample_y = id.y % tile_h;
   // Not wrapped yet, so the tile relative to the source base is not negative.
   let edram_tile = xe_dump.first_tile + xe_dump.dispatch_pitch_tiles * tile_y + tile_x;
   let index = xe_edram_index(edram_tile, sample_x, sample_y, tile_w, kDumpIsDepth);
   let source_tile = edram_tile - xe_dump.source_base_tiles;
   let ssx = (source_tile % xe_dump.source_pitch_tiles) * tile_w + sample_x;
-  let ssy = (source_tile / xe_dump.source_pitch_tiles) * 16u + sample_y;
+  let ssy = (source_tile / xe_dump.source_pitch_tiles) * tile_h + sample_y;
   var px = ssx;
   var py = ssy;
   var s = 0u;
@@ -431,7 +437,8 @@ fn xe_fetch(pos : vec4<f32>, s : u32, is_depth : bool) -> vec2<u32> {
     return vec2<u32>(xe_load.constant_lo, xe_load.constant_hi);
   }
   let wide = !is_depth && xe_is_64bpp(xe_load.format);
-  let tile_w = select(80u, 40u, wide);
+  let tile_w = select(80u, 40u, wide) * kScaleX;
+  let tile_h = 16u * kScaleY;
   var sx = u32(pos.x);
   var sy = u32(pos.y);
   if (xe_load.msaa_samples >= 1u) {
@@ -440,8 +447,8 @@ fn xe_fetch(pos : vec4<f32>, s : u32, is_depth : bool) -> vec2<u32> {
       sx = (sx << 1u) | (s & 1u);
     }
   }
-  let tile = xe_load.base_tiles + (sy >> 4u) * xe_load.pitch_tiles + sx / tile_w;
-  let index = xe_edram_index(tile, sx % tile_w, sy & 15u, tile_w, is_depth);
+  let tile = xe_load.base_tiles + (sy / tile_h) * xe_load.pitch_tiles + sx / tile_w;
+  let index = xe_edram_index(tile, sx % tile_w, sy % tile_h, tile_w, is_depth);
   if (wide) {
     return vec2<u32>(xe_edram[index * 2u], xe_edram[index * 2u + 1u]);
   }
@@ -514,9 +521,10 @@ struct ResolveParams {
 @group(0) @binding(1) var<storage, read_write> xe_dest : array<u32>;
 @group(0) @binding(2) var<uniform> xe_resolve : ResolveParams;
 
+// x, y: host (resolution-scaled) pixels relative to the resolve origin.
 fn xe_source_index(x : u32, y : u32, s : u32, tile_w : u32) -> u32 {
-  var sx = xe_resolve.offset_x + x;
-  var sy = xe_resolve.offset_y + y;
+  var sx = xe_resolve.offset_x * kScaleX + x;
+  var sy = xe_resolve.offset_y * kScaleY + y;
   if (xe_resolve.edram_msaa_samples >= 1u) {
     if (xe_resolve.edram_msaa_samples >= 2u) {
       sx = (sx << 1u) | (s & 1u);
@@ -525,8 +533,10 @@ fn xe_source_index(x : u32, y : u32, s : u32, tile_w : u32) -> u32 {
       sy = (sy << 1u) | (s & 1u);
     }
   }
-  let tile = xe_resolve.edram_base_tiles + (sy >> 4u) * xe_resolve.edram_pitch_tiles + sx / tile_w;
-  return xe_edram_index(tile, sx % tile_w, sy & 15u, tile_w, xe_resolve.edram_is_depth != 0u);
+  let tile_h = 16u * kScaleY;
+  let tile = xe_resolve.edram_base_tiles + (sy / tile_h) * xe_resolve.edram_pitch_tiles +
+             sx / tile_w;
+  return xe_edram_index(tile, sx % tile_w, sy % tile_h, tile_w, xe_resolve.edram_is_depth != 0u);
 }
 
 fn xe_load_source(x : u32, y : u32, s : u32, tile_w : u32) -> vec2<u32> {
@@ -699,13 +709,29 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
   let ppi_log2 = select(0u, 2u - bpp_log2, bpp_log2 < 2u);
   let x0 = id.x << ppi_log2;
   let y = id.y;
-  if (x0 >= xe_resolve.width || y >= xe_resolve.height) {
+  // Unscaled destination (the shared memory): guest pixels, each taken from the middle host
+  // pixel of its kScaleX x kScaleY block. Scaled destination (kResolveScaledDest, a window of
+  // the scaled resolve buffer): host pixels.
+  var width = xe_resolve.width;
+  var height = xe_resolve.height;
+  var src_x_mul = kScaleX;
+  var src_x_add = kScaleX >> 1u;
+  var src_y = y * kScaleY + (kScaleY >> 1u);
+  if (kResolveScaledDest) {
+    width = width * kScaleX;
+    height = height * kScaleY;
+    src_x_mul = 1u;
+    src_x_add = 0u;
+    src_y = y;
+  }
+  if (x0 >= width || y >= height) {
     return;
   }
-  let tile_w = select(80u, 40u, xe_resolve.edram_is_64bpp != 0u);
+  let tile_w = select(80u, 40u, xe_resolve.edram_is_64bpp != 0u) * kScaleX;
   var words = vec4<u32>(0u);
   if (xe_resolve.raw != 0u) {
-    words = vec4<u32>(xe_load_source(x0, y, xe_resolve.sample_select, tile_w), 0u, 0u);
+    words = vec4<u32>(xe_load_source(x0 * src_x_mul + src_x_add, src_y, xe_resolve.sample_select,
+                                     tile_w), 0u, 0u);
     if (xe_resolve.dest_swap != 0u) {
       // Red/blue swap of the bitwise-equivalent formats, as xenia's
       // resolve_fast_32bpp/64bpp shaders (by the EDRAM format): 8_8_8_8(_GAMMA)
@@ -727,7 +753,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
   } else {
     let scale = ldexp(1.0, xe_resolve.dest_exp_bias);
     for (var k = 0u; k < (1u << ppi_log2); k = k + 1u) {
-      var c = xe_load_color(x0 + k, y, tile_w) * scale;
+      var c = xe_load_color((x0 + k) * src_x_mul + src_x_add, src_y, tile_w) * scale;
       if (xe_resolve.dest_swap != 0u) {
         c = c.zyxw;
       }
@@ -740,15 +766,35 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     }
   }
   words = xe_endian_swap(words, xe_resolve.dest_endian);
-  let dx = i32(xe_resolve.dest_offset_x + x0);
-  let dy = i32(xe_resolve.dest_offset_y + y);
-  var address : i32;
+  var dx = i32(xe_resolve.dest_offset_x + x0);
+  var dy = i32(xe_resolve.dest_offset_y + y);
+  // Scaled layout (xenia's, which the texture_load_*_scaled shaders read): every guest unit
+  // of 8 elements (8 and 16 bpp) or 16 bytes (32+ bpp) at tiled offset T is stored at
+  // T * kScaleX * kScaleY as kScaleX * kScaleY units of host pixels, unit (sub_x, sub_y) at
+  // index sub_x * kScaleY + sub_y holding a horizontal run of host pixels.
+  var unit_offset = 0u;
+  if (kResolveScaledDest) {
+    let epu = select(16u >> bpp_log2, 8u, bpp_log2 == 0u);
+    let hx = xe_resolve.dest_offset_x * kScaleX + x0;
+    let hy = xe_resolve.dest_offset_y * kScaleY + y;
+    let g = hx / epu;
+    dx = i32((g / kScaleX) * epu);
+    dy = i32(hy / kScaleY);
+    unit_offset = ((g % kScaleX) * kScaleY + hy % kScaleY) * (epu << bpp_log2) +
+                  ((hx % epu) << bpp_log2);
+  }
+  var tiled : i32;
   if (xe_resolve.dest_array != 0u) {
-    address = xe_resolve.dest_base +
-              xe_tiled_offset_3d(dx, dy, i32(xe_resolve.dest_slice), xe_resolve.dest_pitch,
-                                 xe_resolve.dest_height, bpp_log2);
+    tiled = xe_tiled_offset_3d(dx, dy, i32(xe_resolve.dest_slice), xe_resolve.dest_pitch,
+                               xe_resolve.dest_height, bpp_log2);
   } else {
-    address = xe_resolve.dest_base + xe_tiled_offset_2d(dx, dy, xe_resolve.dest_pitch, bpp_log2);
+    tiled = xe_tiled_offset_2d(dx, dy, xe_resolve.dest_pitch, bpp_log2);
+  }
+  var address : i32;
+  if (kResolveScaledDest) {
+    address = xe_resolve.dest_base + tiled * i32(kScaleX * kScaleY) + i32(unit_offset);
+  } else {
+    address = xe_resolve.dest_base + tiled;
   }
   if (address < 0) {
     return;

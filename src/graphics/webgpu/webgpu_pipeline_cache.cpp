@@ -304,7 +304,8 @@ bool WebGPUPipelineCache::Initialize() {
   features.tessellation_shader = false;
   translator_ = std::make_unique<SpirvShaderTranslator>(
       features, WebGPURenderTargetCache::IsMsaa2xSupported(),
-      WebGPURenderTargetCache::IsMsaa2xSupported(), false);
+      WebGPURenderTargetCache::IsMsaa2xSupported(), false,
+      command_processor_.draw_resolution_scale_x(), command_processor_.draw_resolution_scale_y());
 
   // Shared bind group layouts (see the header).
   uint32_t shared_memory_bindings =
@@ -543,12 +544,19 @@ void WebGPUPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     REXGPU_WARN("WebGPU shader storage: no storage directory, WGSL is not persisted");
     return;
   }
+  // The resolution scale changes the translated shaders (pixel position, scaled texture
+  // coordinates), so scaled storage gets its own directory ("-s2x2").
+  uint32_t scale_x = command_processor_.draw_resolution_scale_x();
+  uint32_t scale_y = command_processor_.draw_resolution_scale_y();
   storage_dir_ = root / "shaders" / fmt::format("{:08X}", title_id) / "webgpu" /
-                 fmt::format("{}-t{}-r{}", GetTintRevision(),
+                 fmt::format("{}-t{}-r{}{}", GetTintRevision(),
                              SpirvShaderTranslator::Modification::kVersion,
                              SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
                                  max_storage_buffer_range_) |
-                                 (clip_distances_ ? 4 : 0));
+                                 (clip_distances_ ? 4 : 0),
+                             (scale_x > 1 || scale_y > 1)
+                                 ? fmt::format("-s{}x{}", scale_x, scale_y)
+                                 : std::string());
   std::error_code ec;
   std::filesystem::create_directories(storage_dir_, ec);
   if (ec) {
@@ -1059,7 +1067,11 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
       if (std::isfinite(polygon_offset)) {
         desc.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(bias_format, polygon_offset);
       }
-      float slope = polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+      // With resolution scaling, the slope in host pixels is smaller (as Vulkan: the worst
+      // case of non-square scaling, max).
+      float slope = polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit *
+                    float(std::max(command_processor_.draw_resolution_scale_x(),
+                                   command_processor_.draw_resolution_scale_y()));
       desc.depth_bias_slope_scale = std::isfinite(slope) ? slope : 0.0f;
       if (desc.depth_bias_slope_scale == 0.0f) {
         desc.depth_bias_slope_scale = 0.0f;  // -0 -> +0 for the memcmp key

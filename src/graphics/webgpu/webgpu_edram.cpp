@@ -233,15 +233,17 @@ bool WebGPUEdram::Initialize() {
   // After the prelude: its diagnostic() directive must come first.
   const std::string prelude = std::string(edram_wgsl::kPrelude) +
                               "const kGammaRtLinear : bool = " +
-                              (gamma_as_unorm16_ ? "true" : "false") + ";\n";
+                              (gamma_as_unorm16_ ? "true" : "false") + ";\n" +
+                              "const kScaleX : u32 = " + std::to_string(scale_x_) + "u;\n" +
+                              "const kScaleY : u32 = " + std::to_string(scale_y_) + "u;\n";
 
   WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
   buffer_desc.label = MakeStringView("EDRAM");
   buffer_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
-  buffer_desc.size = kBufferSize;
+  buffer_desc.size = buffer_size();
   buffer_ = wgpuDeviceCreateBuffer(device, &buffer_desc);
   if (!buffer_) {
-    REXWGPU_ERROR("WebGPU EDRAM: failed to create the {} MiB buffer", kBufferSize >> 20);
+    REXWGPU_ERROR("WebGPU EDRAM: failed to create the {} MiB buffer", buffer_size() >> 20);
     return false;
   }
 
@@ -389,11 +391,17 @@ bool WebGPUEdram::Initialize() {
     entries[2] = BufferEntry(2, WGPUShaderStage_Compute, WGPUBufferBindingType_Uniform,
                              sizeof(WebGPUResolveConstants));
     resolve_layout_ = CreateLayout(device, entries, 3);
-    const char* sources[] = {prelude.c_str(), edram_wgsl::kResolveMain};
-    resolve_pipeline_ = CreateComputePipeline("EDRAM resolve", sources, 2, resolve_layout_);
+    const char* sources[] = {prelude.c_str(), "const kResolveScaledDest : bool = false;\n",
+                             edram_wgsl::kResolveMain};
+    resolve_pipeline_ = CreateComputePipeline("EDRAM resolve", sources, 3, resolve_layout_);
+    if (is_scaled()) {
+      sources[1] = "const kResolveScaledDest : bool = true;\n";
+      resolve_scaled_pipeline_ =
+          CreateComputePipeline("EDRAM resolve scaled", sources, 3, resolve_layout_);
+    }
   }
 
-  bool ok = resolve_pipeline_ && load_module_;
+  bool ok = resolve_pipeline_ && load_module_ && (!is_scaled() || resolve_scaled_pipeline_);
   for (uint32_t i = 0; i < 4; ++i) {
     ok = ok && dump_pipelines_[i];
   }
@@ -410,8 +418,9 @@ bool WebGPUEdram::Initialize() {
     REXWGPU_ERROR("WebGPU EDRAM: failed to create the EDRAM pipelines");
     return false;
   }
-  REXWGPU_INFO("WebGPU EDRAM: {} MiB buffer, depth32float-stencil8 {}, 8_8_8_8_GAMMA {}",
-               kBufferSize >> 20,
+  REXWGPU_INFO("WebGPU EDRAM: {} MiB buffer ({}x{} scale), depth32float-stencil8 {}, "
+               "8_8_8_8_GAMMA {}",
+               buffer_size() >> 20, scale_x_, scale_y_,
                has_depth32float_stencil8_ ? "available (D24FS8 exact)"
                                           : "unavailable (D24FS8 in depth24plus)",
                gamma_as_unorm16_ ? "linear rgba16unorm (blending in linear space)"
@@ -420,6 +429,10 @@ bool WebGPUEdram::Initialize() {
 }
 
 void WebGPUEdram::Shutdown() {
+  if (resolve_scaled_pipeline_) {
+    wgpuComputePipelineRelease(resolve_scaled_pipeline_);
+    resolve_scaled_pipeline_ = nullptr;
+  }
   if (resolve_pipeline_) {
     wgpuComputePipelineRelease(resolve_pipeline_);
     resolve_pipeline_ = nullptr;
@@ -492,19 +505,19 @@ void WebGPUEdram::RecordDump(WebGPUCommandStream& stream, const WebGPUEdramSurfa
   params->source_pitch_tiles = source.pitch_tiles;
   params->format = source.format;
   params->msaa_samples = source.msaa_samples;
-  params->width_samples = width_tiles * (is_64bpp ? 40 : 80);
-  params->height_samples = height_tiles * 16;
+  params->width_samples = width_tiles * (is_64bpp ? 40 : 80) * scale_x_;
+  params->height_samples = height_tiles * 16 * scale_y_;
 
   WGPUBindGroupEntry entries[4];
-  entries[0] = BufferBinding(0, buffer_, 0, kBufferSize);
+  entries[0] = BufferBinding(0, buffer_, 0, buffer_size());
   entries[1] = BufferBinding(1, StreamConstantsBuffer(), 0, sizeof(DumpParams));
   entries[2] = TextureBinding(2, source.sample_view);
   entries[3] = TextureBinding(3, source.stencil_view);
   stream.CmdSetComputePipelineObject(dump_pipelines_[variant]);
   stream.CmdSetBindGroup(0, dump_layouts_[variant], entries, source.is_depth ? 4 : 3, 1,
                          &constants_offset);
-  // 8x16 samples per group; tiles are 80 or 40 samples wide and 16 high.
-  stream.CmdDispatch(params->width_samples / 8, height_tiles);
+  // 8x16 samples per group; tiles are 80 or 40 samples wide and 16 high (times the scale).
+  stream.CmdDispatch(params->width_samples / 8, height_tiles * scale_y_);
   ++statistics_.dumps;
 }
 
@@ -550,7 +563,7 @@ void WebGPUEdram::DrawRectangles(WebGPUCommandStream& stream, const WebGPUEdramS
   }
 
   WGPUBindGroupEntry entries[2];
-  entries[0] = BufferBinding(0, buffer_, 0, kBufferSize);
+  entries[0] = BufferBinding(0, buffer_, 0, buffer_size());
   entries[1] = BufferBinding(1, StreamConstantsBuffer(), 0, sizeof(LoadParams));
   stream.CmdSetViewport(0.0f, 0.0f, float(dest.width), float(dest.height));
   for (uint32_t p = 0; p < pipeline_count; ++p) {
@@ -611,8 +624,12 @@ void WebGPUEdram::RecordLoad(WebGPUCommandStream& stream, const WebGPUEdramSurfa
 
 void WebGPUEdram::RecordResolve(WebGPUCommandStream& stream,
                                 const WebGPUResolveConstants& constants, WGPUBuffer dest_buffer,
-                                uint64_t dest_offset, uint64_t dest_size) {
+                                uint64_t dest_offset, uint64_t dest_size, bool scaled_dest) {
   if (!constants.width || !constants.height || constants.dest_bpp_log2 > 4 || !dest_size) {
+    return;
+  }
+  WGPUComputePipeline pipeline = scaled_dest ? resolve_scaled_pipeline_ : resolve_pipeline_;
+  if (!pipeline) {
     return;
   }
   uint32_t constants_offset;
@@ -622,14 +639,16 @@ void WebGPUEdram::RecordResolve(WebGPUCommandStream& stream,
   }
   std::memcpy(params, &constants, sizeof(constants));
   WGPUBindGroupEntry entries[3];
-  entries[0] = BufferBinding(0, buffer_, 0, kBufferSize);
+  entries[0] = BufferBinding(0, buffer_, 0, buffer_size());
   entries[1] = BufferBinding(1, dest_buffer, dest_offset, (dest_size + 3) & ~uint64_t(3));
   entries[2] = BufferBinding(2, StreamConstantsBuffer(), 0, sizeof(WebGPUResolveConstants));
-  stream.CmdSetComputePipelineObject(resolve_pipeline_);
+  stream.CmdSetComputePipelineObject(pipeline);
   stream.CmdSetBindGroup(0, resolve_layout_, entries, 3, 1, &constants_offset);
   uint32_t ppi_log2 = constants.dest_bpp_log2 < 2 ? 2 - constants.dest_bpp_log2 : 0;
-  uint32_t invocations_x = constants.width >> ppi_log2;
-  stream.CmdDispatch((invocations_x + 7) / 8, (constants.height + 7) / 8);
+  uint32_t width = constants.width * (scaled_dest ? scale_x_ : 1);
+  uint32_t height = constants.height * (scaled_dest ? scale_y_ : 1);
+  uint32_t invocations_x = width >> ppi_log2;
+  stream.CmdDispatch((invocations_x + 7) / 8, (height + 7) / 8);
   ++statistics_.resolves;
 }
 
