@@ -51,6 +51,8 @@
       ' [' + String(what) + ']';
   }
 
+  var OOM_TAG = '[rex] fatal: ';
+
   if (isPthread || inWorker) {
     // ---- Worker: collect on the crashing thread ----
     var sent = false;
@@ -67,7 +69,18 @@
     // Defined here, so Emscripten does not install its proxy of the page's onAbort in this Worker:
     // the page side calls the page's own onAbort when it has no rexOnFatal.
     Module['onAbort'] = function (what) {
-      collect(1, isOom(what) ? oomText(what) : what, new Error().stack);
+      if (isOom(what)) {
+        // Out of memory aborts inside malloc (sbrk -> emscripten_resize_heap) with the malloc lock
+        // held: calling into wasm for the C++ report would deadlock this thread and then every
+        // other thread that allocates (a silent hang). Report through the page's printErr proxy
+        // (plain JS postMessage); the page side turns the line into an 'oom' crash report.
+        sent = true;
+        try {
+          err(OOM_TAG + oomText(what));
+        } catch (e) {}
+        return;
+      }
+      collect(1, what, new Error().stack);
     };
     self.addEventListener('error', function (ev) {
       collect(2, ev.message || (ev.error && ev.error.message) || 'error', ev.error && ev.error.stack);
@@ -161,6 +174,16 @@
       r = { kind: 'fatal', message: '(unreadable crash report: ' + e + ')' };
     }
     deliver(r);
+  };
+  // Out-of-memory reports of Workers arrive as printErr lines (see the Worker onAbort above).
+  var pagePrintErr = Module['printErr'];
+  Module['printErr'] = function (text) {
+    var s = String(text);
+    if (s.indexOf(OOM_TAG) === 0) {
+      deliver({ kind: 'oom', message: s.slice(OOM_TAG.length), stack: '' });
+    }
+    if (typeof pagePrintErr == 'function') pagePrintErr(text);
+    else console.error(text);
   };
   // An abort on the page thread itself (rare: the runtime runs main() on a pthread).
   Module['onAbort'] = function (what) {
