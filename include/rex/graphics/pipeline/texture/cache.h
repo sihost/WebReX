@@ -80,7 +80,10 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // scaled: whether the resolve also wrote the scaled resolve memory (with resolution scaling,
+  // false clears the scaled marks of the range, so textures there are loaded unscaled from the
+  // shared memory instead of from stale scaled data).
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled, bool scaled = true);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
