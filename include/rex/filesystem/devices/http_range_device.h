@@ -125,6 +125,9 @@ class HttpRangeDevice : public Device {
     uint64_t evicted_files = 0;     // persistent cache files deleted (size cap / quota)
     uint64_t evicted_bytes = 0;
     uint64_t skipped_writes = 0;    // blocks not persisted (no room left for them)
+    uint64_t reopened_files = 0;    // cache files reopened after their descriptor was closed
+    uint64_t failed_writes = 0;     // block cache writes the storage refused (out of space)
+    uint64_t space_limit_bytes = 0; // cache size that fit when a write last failed (0 = none)
   };
   Stats stats() const;
 
@@ -205,6 +208,11 @@ class HttpRangeDevice : public Device {
   uint64_t stat_evicted_files_ = 0;
   uint64_t stat_evicted_bytes_ = 0;
   uint64_t stat_skipped_writes_ = 0;
+  uint64_t stat_reopened_files_ = 0;
+  uint64_t stat_failed_writes_ = 0;
+  // Size of the persistent cache when a write last failed for lack of space (0 = never): from
+  // then on the cache evicts down to it instead of failing writes (guarded by cache_mutex_).
+  uint64_t space_limit_bytes_ = 0;
   // Blocks some thread is downloading right now (guarded by cache_mutex_); inflight_cv_ is
   // notified whenever claims are released.
   std::unordered_set<BlockKey, BlockKeyHash> inflight_;

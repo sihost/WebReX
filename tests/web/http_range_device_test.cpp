@@ -12,6 +12,8 @@
  */
 
 #include <emscripten/em_js.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdio>
@@ -346,6 +348,56 @@ int main() {
     }
     for (auto& th : threads) th.join();
     CHECK(bad == 0);
+  }
+
+  // 12. Block cache descriptors closed behind the device's back (and the numbers reused by a
+  //     read-only file): the next write must not fail with EBADF forever (W5: "block cache write
+  //     of 1024 KiB failed (8); evicting"), it reopens the cache file and persists the blocks.
+  {
+    auto o = Options();
+    o.persistent_cache_dir = "/rex-cache-stale";
+    HttpRangeDevice stale("\\Device\\Web\\Game8", o);
+    CHECK(stale.Initialize());
+    FILE* probe_file = std::fopen("/stale-probe", "wb");
+    if (probe_file) std::fclose(probe_file);
+    int first_free = ::open("/stale-probe", O_RDONLY);
+    if (first_free >= 0) ::close(first_free);
+    Entry* e = stale.ResolvePath("maps\\Test.map");
+    File* f = nullptr;
+    CHECK(e && e->Open(rex::filesystem::FileAccess::kGenericRead, &f) == X_STATUS_SUCCESS);
+    if (f && first_free >= 0) {
+      std::string d = ReadAll(f, 0, 1000, &got, &st);  // opens <key>.data, <key>.map
+      CHECK(st == X_STATUS_SUCCESS && Matches(d, 0));
+      // Somebody else closes both descriptors; the numbers go to read-only files.
+      CHECK(::close(first_free) == 0);
+      CHECK(::close(first_free + 1) == 0);
+      int hijack0 = ::open("/stale-probe", O_RDONLY);
+      int hijack1 = ::open("/stale-probe", O_RDONLY);
+      CHECK(hijack0 == first_free && hijack1 == first_free + 1);
+      d = ReadAll(f, 20 * 64 * 1024, 1000, &got, &st);
+      CHECK(st == X_STATUS_SUCCESS && Matches(d, 20 * 64 * 1024));
+      auto s = stale.stats();
+      CHECK(s.reopened_files == 1);
+      CHECK(s.skipped_writes == 0);
+      // The hijacked descriptors still work for their owner (they were neither written nor closed).
+      char c = 0;
+      CHECK(::pread(hijack0, &c, 1, 0) == 0 && ::pread(hijack1, &c, 1, 0) == 0);
+      ::close(hijack0);
+      ::close(hijack1);
+      f->Destroy();
+    }
+    // The block written after the reopen persisted: a new device reads it without a request.
+    HttpRangeDevice after("\\Device\\Web\\Game9", o);
+    CHECK(after.Initialize());
+    Entry* e2 = after.ResolvePath("maps\\Test.map");
+    File* f2 = nullptr;
+    CHECK(e2 && e2->Open(rex::filesystem::FileAccess::kGenericRead, &f2) == X_STATUS_SUCCESS);
+    if (f2) {
+      std::string d = ReadAll(f2, 20 * 64 * 1024, 1000, &got, &st);
+      CHECK(st == X_STATUS_SUCCESS && Matches(d, 20 * 64 * 1024));
+      f2->Destroy();
+    }
+    CHECK(after.stats().requests == 0);
   }
 
   std::printf("transport requests: %.0f\n", test_request_count());

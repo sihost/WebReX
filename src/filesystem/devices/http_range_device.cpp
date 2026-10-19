@@ -390,12 +390,25 @@ struct HttpRangeDevice::PersistentFile {
   std::string base;  // <dir>/<key>
   int data_fd = -1;
   int map_fd = -1;
+  // WasmFS inode numbers of the files behind data_fd / map_fd when they were opened, to tell
+  // whether a descriptor still refers to them (see DescriptorStale).
+  uint64_t data_ino = 0;
+  uint64_t map_ino = 0;
   bool complete = false;
   std::vector<uint8_t> bitmap;
 
   ~PersistentFile() {
     if (data_fd >= 0) close(data_fd);
     if (map_fd >= 0) close(map_fd);
+  }
+  static uint64_t InodeOf(int fd) {
+    struct stat st {};
+    return (fd >= 0 && ::fstat(fd, &st) == 0) ? uint64_t(st.st_ino) : 0;
+  }
+  // A descriptor no longer open, or open on another file: it was closed behind our back and its
+  // number possibly reused. Such a number must not be written or closed.
+  static bool DescriptorStale(int fd, uint64_t ino) {
+    return fd >= 0 && ino != 0 && InodeOf(fd) != ino;
   }
   bool Has(uint32_t block) const {
     return complete || (block / 8 < bitmap.size() && (bitmap[block / 8] >> (block % 8)) & 1);
@@ -690,6 +703,8 @@ HttpRangeDevice::PersistentFile* HttpRangeDevice::GetPersistentFile(uint32_t fil
       (void)got;  // a short/new map file leaves the remaining bits zero
     }
   }
+  pf->data_ino = PersistentFile::InodeOf(pf->data_fd);
+  pf->map_ino = PersistentFile::InodeOf(pf->map_fd);
   if (pf->data_fd < 0 || (!pf->complete && pf->map_fd < 0)) {
     REXFS_WARN("HttpRangeDevice: cannot open persistent cache for {} ({})", info.path, errno);
     pf.reset();
@@ -728,11 +743,58 @@ void HttpRangeDevice::WritePersistentBlocks(uint32_t file, uint32_t first_block,
     return;  // no room: these blocks stay memory-only
   }
   // Eviction never closes the file being written, so pf is still valid.
-  if (::pwrite(pf->data_fd, data, length, offset) != ssize_t(length)) {
-    // Quota or I/O error: don't mark the blocks, and make room for the next writes (saves
-    // included) right away.
-    REXFS_WARN("HttpRangeDevice: block cache write of {} KiB failed ({}); evicting", length >> 10,
-               errno);
+  errno = 0;
+  ssize_t written = ::pwrite(pf->data_fd, data, length, offset);
+  int write_errno = errno;
+  if (written != ssize_t(length) && write_errno == EBADF &&
+      (PersistentFile::DescriptorStale(pf->data_fd, pf->data_ino) ||
+       PersistentFile::DescriptorStale(pf->map_fd, pf->map_ino))) {
+    // Someone closed one of our descriptors: forget the numbers (they may belong to another
+    // file now), reopen and retry once.
+    REXFS_WARN("HttpRangeDevice: block cache descriptors of {} were closed elsewhere (data fd {} "
+               "ino {} now {}, map fd {} ino {} now {}); reopening",
+               base, pf->data_fd, pf->data_ino, PersistentFile::InodeOf(pf->data_fd), pf->map_fd,
+               pf->map_ino, PersistentFile::InodeOf(pf->map_fd));
+    ++stat_reopened_files_;
+    if (PersistentFile::DescriptorStale(pf->data_fd, pf->data_ino)) pf->data_fd = -1;
+    if (PersistentFile::DescriptorStale(pf->map_fd, pf->map_ino)) pf->map_fd = -1;
+    persistent_.erase(file);
+    pf = GetPersistentFile(file);
+    if (!pf || pf->complete) {
+      ++stat_skipped_writes_;
+      return;
+    }
+    errno = 0;
+    written = ::pwrite(pf->data_fd, data, length, offset);
+    write_errno = errno;
+  }
+  if (written != ssize_t(length)) {
+    // Out of space or I/O error: don't mark the blocks, remember how much the storage held
+    // (later writes evict down to that instead of failing), and make room for the next writes
+    // (saves included) right away. errno is only meaningful for written < 0 (0 = short write).
+    //
+    // When the origin's storage is full, Chrome's FileSystemSyncAccessHandle.write() returns
+    // base::File::FILE_ERROR_NO_SPACE (-8) as a byte count (4294967288) instead of throwing,
+    // and WasmFS passes the -8 on as an error code: errno 8, which is EBADF, on a perfectly
+    // valid descriptor. Seen in Playwright's default (off-the-record) browser contexts, which
+    // keep OPFS in memory with a limit far below the quota navigator.storage.estimate() reports.
+    const bool no_space = written < 0 && write_errno == EBADF;
+    const uint64_t held = cache_bytes_;
+    const uint64_t old_limit = space_limit_bytes_;
+    if (written < 0 && (space_limit_bytes_ == 0 || held < space_limit_bytes_)) {
+      space_limit_bytes_ = held;
+    }
+    ++stat_failed_writes_;
+    if (stat_failed_writes_ <= 3 || old_limit == 0 ||
+        old_limit > space_limit_bytes_ + (uint64_t(64) << 20)) {
+      int flags = ::fcntl(pf->data_fd, F_GETFL);
+      REXFS_WARN(
+          "HttpRangeDevice: block cache write of {} KiB at {} MiB to {}.data failed (returned {}, "
+          "errno {}{}; fd {} flags {:#x}); the cache now stays below {:.1f} MiB (failure {})",
+          length >> 10, uint64_t(offset) >> 20, base, written, written < 0 ? write_errno : 0,
+          no_space ? ": out of storage space (Chrome FILE_ERROR_NO_SPACE)" : "", pf->data_fd,
+          uint32_t(flags), double(space_limit_bytes_) / 1048576.0, stat_failed_writes_);
+    }
     EvictPersistentLocked(uint64_t(length) * 4, base);
     ++stat_skipped_writes_;
     return;
@@ -1154,6 +1216,9 @@ HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   s.evicted_files = stat_evicted_files_;
   s.evicted_bytes = stat_evicted_bytes_;
   s.skipped_writes = stat_skipped_writes_;
+  s.reopened_files = stat_reopened_files_;
+  s.failed_writes = stat_failed_writes_;
+  s.space_limit_bytes = space_limit_bytes_;
   return s;
 }
 
@@ -1238,6 +1303,10 @@ bool HttpRangeDevice::ReservePersistentLocked(uint64_t bytes, const std::string&
   int64_t cap = options_.persistent_cache_max_bytes >= 0
                     ? options_.persistent_cache_max_bytes
                     : int64_t(REXCVAR_GET(vfs_cache_max_mb)) << 20;
+  // What the storage actually held when a write last failed (WritePersistentBlocks).
+  if (space_limit_bytes_ && (cap <= 0 || space_limit_bytes_ < uint64_t(cap))) {
+    cap = int64_t(space_limit_bytes_);
+  }
   if (cap > 0) {
     if (bytes > uint64_t(cap)) return false;
     if (cache_bytes_ + bytes > uint64_t(cap)) {
