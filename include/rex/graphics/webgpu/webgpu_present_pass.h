@@ -47,6 +47,15 @@ class WebGPUPresentPass {
     GammaRamp gamma_ramp = GammaRamp::kNone;
     const uint32_t* gamma_ramp_data = nullptr;
     bool gamma_rb_swap = false;
+    // Optional replacement of the source blit (WebGPUPresenter's CAS / FSR guest
+    // output effect chains): pre_pass is encoded before the canvas render pass
+    // (intermediate effect passes), final_draw inside it after the clear instead
+    // of the bilinear source blit (viewport and scissor are the whole target).
+    // source / dest_* are then only informational.
+    std::function<void(WGPUCommandEncoder encoder)> pre_pass;
+    std::function<void(WGPURenderPassEncoder pass, WGPUTextureFormat target_format,
+                       uint32_t target_width, uint32_t target_height)>
+        final_draw;
     // Optional: PresentToSurface encodes this after the blit into the same canvas
     // texture (in its own render passes, loading the blit result), before the
     // readback copy. The UI overlay (WebGPUImmediateDrawer recordings).

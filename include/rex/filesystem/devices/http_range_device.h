@@ -47,6 +47,13 @@ struct HttpRangeDeviceOptions {
   std::string manifest_url = "/manifest.json";
   // Directory for the persistent block cache (e.g. "/opfs/rex-cache"); empty = memory only.
   std::string persistent_cache_dir;
+  // Size cap of the persistent block cache in bytes (least recently used cache files are
+  // deleted to stay below it); -1 = cvar vfs_cache_max_mb, 0 = no fixed cap.
+  int64_t persistent_cache_max_bytes = -1;
+  // Origin storage kept free for saves (cache:, xstorage:, profiles): the block cache stops
+  // growing and evicts its least recently used files when navigator.storage.estimate() says
+  // less than this is left of the quota. -1 = cvar vfs_cache_reserve_mb.
+  int64_t persistent_cache_reserve_bytes = -1;
   // Fetch/cache granularity. Reads are rounded out to whole blocks.
   uint32_t block_size = 1u << 20;
   // In-memory LRU capacity, in blocks.
@@ -114,6 +121,10 @@ class HttpRangeDevice : public Device {
     uint64_t pool_requests = 0;     // requests issued on the fetch threads (subset of requests)
     uint64_t read_ahead_blocks = 0; // blocks downloaded by read-ahead
     uint64_t inflight_waits = 0;    // blocks a read waited for (already being downloaded)
+    uint64_t persistent_bytes = 0;  // size of the persistent cache files
+    uint64_t evicted_files = 0;     // persistent cache files deleted (size cap / quota)
+    uint64_t evicted_bytes = 0;
+    uint64_t skipped_writes = 0;    // blocks not persisted (no room left for them)
   };
   Stats stats() const;
 
@@ -149,6 +160,15 @@ class HttpRangeDevice : public Device {
   void WritePersistentBlocks(uint32_t file, uint32_t first_block, const uint8_t* data,
                              size_t length);
   PersistentFile* GetPersistentFile(uint32_t file);
+  // Persistent cache size accounting and least-recently-used eviction by cache file (all
+  // cache_mutex_ held). Scan builds the table from the directory at initialization.
+  void ScanPersistentCacheLocked();
+  void TouchPersistentLocked(const std::string& base, uint64_t file_bytes);
+  // Deletes least recently used cache files (never `keep_base`) until `bytes` are freed.
+  uint64_t EvictPersistentLocked(uint64_t bytes, const std::string& keep_base);
+  // Makes room for `bytes` more cache data under the size cap and the quota reserve;
+  // false = don't write them.
+  bool ReservePersistentLocked(uint64_t bytes, const std::string& keep_base);
   // Downloads blocks [first, last] in one Range request into `out`.
   bool FetchBlocks(uint32_t file, uint32_t first, uint32_t last, std::vector<uint8_t>& out);
   // FetchBlocks for blocks the caller claimed in inflight_, then stores them in both caches,
@@ -170,6 +190,21 @@ class HttpRangeDevice : public Device {
   std::unordered_map<BlockKey, std::list<CachedBlock>::iterator, BlockKeyHash> lru_index_;
   std::unordered_map<uint32_t, std::unique_ptr<PersistentFile>> persistent_;
   bool persistent_enabled_ = false;
+  struct CacheFileUse {
+    uint64_t bytes = 0;     // .data + .map
+    uint64_t last_use = 0;  // use_clock_ value
+  };
+  std::unordered_map<std::string, CacheFileUse> cache_files_;  // by <dir>/<key>
+  uint64_t cache_bytes_ = 0;
+  uint64_t use_clock_ = 0;
+  // Quota reserve: the estimate the last decision used, and the bytes written (+) or
+  // evicted (-) since it.
+  uint64_t estimate_sequence_ = 0;
+  int64_t bytes_since_estimate_ = 0;
+  uint32_t evictor_id_ = 0;  // web::RegisterStorageEvictor
+  uint64_t stat_evicted_files_ = 0;
+  uint64_t stat_evicted_bytes_ = 0;
+  uint64_t stat_skipped_writes_ = 0;
   // Blocks some thread is downloading right now (guarded by cache_mutex_); inflight_cv_ is
   // notified whenever claims are released.
   std::unordered_set<BlockKey, BlockKeyHash> inflight_;

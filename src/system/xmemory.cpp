@@ -21,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/memory/host_write_web.h>
 #include <rex/stream.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
@@ -209,6 +210,9 @@ Memory::~Memory() {
 
   virtual_membase_ = nullptr;
   physical_membase_ = nullptr;
+#if REX_PLATFORM_WEB
+  rex::memory::g_web_physical_host_base = nullptr;
+#endif
 }
 
 bool Memory::Initialize() {
@@ -242,6 +246,12 @@ bool Memory::Initialize() {
     virtual_membase_ = mapping_base_;
     physical_membase_ = mapping_base_ + fold::kPhysOffset;
     fold::ClearAllDirty();
+    // Host-pointer writers (memory::store_and_swap, copy_and_swap) mark through these.
+    static_assert(rex::memory::kWebPhysicalHostSize ==
+                  uint64_t(fold::kDirtyPageCount) << fold::kDirtyPageShift);
+    static_assert(rex::memory::kWebDirtyPageShift == fold::kDirtyPageShift);
+    rex::memory::g_web_physical_dirty_map = fold::g_phys_dirty;
+    rex::memory::g_web_physical_host_base = physical_membase_;
     REXSYS_INFO("Guest window (layout B) at {} size {:X}, physical at +{:X}",
                 fmt::ptr(virtual_membase_), window_bytes, fold::kPhysOffset);
   }

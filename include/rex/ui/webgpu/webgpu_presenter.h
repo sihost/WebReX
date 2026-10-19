@@ -105,6 +105,11 @@ class WebGPUPresenter final : public Presenter {
     // Recordings / draws in the last presented frame.
     uint32_t ui_recordings = 0;
     uint32_t ui_draws = 0;
+    // Guest output effect passes of the last presented frame (--present_effect:
+    // 1 = plain bilinear stretch, more with CAS / FSR) and the effects used, bit
+    // i = Presenter::GuestOutputPaintEffect i.
+    uint32_t guest_output_effect_count = 0;
+    uint32_t guest_output_effect_mask = 0;
     bool device_lost = false;
   };
 
@@ -165,6 +170,48 @@ class WebGPUPresenter final : public Presenter {
 
   class RefreshContext;
 
+  // Device thread: the native presenter's guest output effects (bilinear, CAS,
+  // FSR EASU + RCAS, dithered variants) as WGSL converted from the Vulkan
+  // SPIR-V at build time (src/ui/shaders/webgpu_wgsl). One uniform buffer per
+  // effect pass, laid out as the Vulkan push constants: rectangle (NDC) at 0,
+  // effect constants from 16.
+  struct EffectChain {
+    static constexpr uint32_t kUniformSlotSize = 256;
+    static constexpr uint32_t kUniformSlotCount = 2 * kMaxGuestOutputPaintEffects;
+    struct Pipeline {
+      GuestOutputPaintEffect effect;
+      WGPUTextureFormat format;
+      WGPURenderPipeline pipeline;
+    };
+    struct Intermediate {
+      WGPUTexture texture = nullptr;
+      WGPUTextureView view = nullptr;
+      uint32_t width = 0;
+      uint32_t height = 0;
+    };
+    bool initialized = false;
+    bool failed = false;
+    WGPUShaderModule vertex_module = nullptr;
+    std::array<WGPUShaderModule, size_t(GuestOutputPaintEffect::kCount)> pixel_modules = {};
+    WGPUBindGroupLayout source_layout = nullptr;
+    WGPUBindGroupLayout constants_layout = nullptr;
+    WGPUPipelineLayout pipeline_layout = nullptr;
+    WGPUSampler sampler = nullptr;
+    WGPUBuffer uniform_buffer = nullptr;
+    uint32_t uniform_slot = 0;
+    std::vector<Pipeline> pipelines;
+    std::array<Intermediate, kMaxGuestOutputPaintEffects - 1> intermediates;
+  };
+  bool InitializeEffectChain();
+  void ReleaseEffectChain();
+  WGPURenderPipeline GetEffectPipeline(GuestOutputPaintEffect effect, WGPUTextureFormat format);
+  // Encodes effect effect_index of the flow (draw of a 4-vertex strip) into a
+  // pass whose target is target_width x target_height.
+  bool EncodeEffect(WGPURenderPassEncoder pass, const GuestOutputPaintFlow& flow,
+                    size_t effect_index, const GuestOutputPaintConfig& config,
+                    WGPUTextureView source, WGPUTextureFormat target_format,
+                    uint32_t target_width, uint32_t target_height);
+
   WebGPUPresenter(HostGpuLossCallback host_gpu_loss_callback,
                   graphics::webgpu::WebGPUDevice& device)
       : Presenter(host_gpu_loss_callback), device_(device) {}
@@ -192,6 +239,7 @@ class WebGPUPresenter final : public Presenter {
   uint32_t last_painted_height_ = 0;
   bool loss_reported_ = false;
   uint64_t resize_pending_presentation_frame_ = 0;
+  EffectChain effect_chain_;
 
   // Guest output thread (the only producer): its copy of the mailbox image
   // handles, so an unchanged size needs no device-thread round trip.

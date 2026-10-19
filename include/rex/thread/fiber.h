@@ -19,8 +19,50 @@
 #include <cstdint>
 #include <vector>
 #endif
+#if REX_PLATFORM_WEB
+#include <cstdint>
+#include <type_traits>
+#endif
 
 namespace rex::thread {
+
+#if REX_PLATFORM_WEB
+/// Web only. A fiber runs on its own parked pthread (fiber_web.cpp), so thread_local state that
+/// belongs to the logical (guest) thread has to follow every SwitchTo: the values of all
+/// registered slots are read on the switching pthread and written on the resumed one. Register
+/// with REX_FIBER_INHERITED_TLS(var) at namespace scope in the TU that defines `var` (pointer or
+/// integer thread_locals). Natively fibers share the thread, so the macro expands to nothing.
+bool RegisterFiberInheritedTls(uint64_t (*get)(), void (*set)(uint64_t));
+
+namespace detail {
+template <typename T>
+uint64_t FiberTlsToBits(T value) {
+  if constexpr (std::is_pointer_v<T>) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(value));
+  } else {
+    return static_cast<uint64_t>(value);
+  }
+}
+template <typename T>
+void FiberTlsFromBits(T& slot, uint64_t bits) {
+  if constexpr (std::is_pointer_v<T>) {
+    slot = reinterpret_cast<T>(static_cast<uintptr_t>(bits));
+  } else {
+    slot = static_cast<T>(bits);
+  }
+}
+}  // namespace detail
+
+#define REX_FIBER_TLS_CAT2(a, b) a##b
+#define REX_FIBER_TLS_CAT(a, b) REX_FIBER_TLS_CAT2(a, b)
+#define REX_FIBER_INHERITED_TLS(var)                                                     \
+  [[maybe_unused]] static const bool REX_FIBER_TLS_CAT(rex_fiber_tls_, __COUNTER__) =    \
+      ::rex::thread::RegisterFiberInheritedTls(                                          \
+          []() -> uint64_t { return ::rex::thread::detail::FiberTlsToBits(var); },       \
+          [](uint64_t bits) { ::rex::thread::detail::FiberTlsFromBits(var, bits); })
+#else
+#define REX_FIBER_INHERITED_TLS(var) static_assert(true)
+#endif
 
 /// Host OS fiber primitive.
 /// Each guest fiber gets one Fiber. Switching preserves the entire C++ call
@@ -60,8 +102,10 @@ struct Fiber {
 
   static void Trampoline();
 #elif REX_PLATFORM_WEB
-  // Only thread fibers exist on web (fiber_web.cpp): the handle stands for the
-  // thread's own execution context; switching to another fiber is unsupported.
+  // fiber_web.cpp: a thread fiber stands for the converted pthread itself; a created fiber owns
+  // a pthread (started on the first switch) that is parked whenever the fiber is not running.
+  struct WebState;
+  WebState* web_ = nullptr;
   bool is_thread_fiber_ = false;
 #endif
 };

@@ -123,6 +123,17 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+  // Whether the last Update() returned false only because the draw has no
+  // render target at all (WebGPU render passes need at least one attachment).
+  bool last_update_without_attachments() const { return last_update_without_attachments_; }
+  // After such an Update(): makes the last update's pass a dummy color
+  // attachment (format key: color 0 as k_8_8_8_8, rgba8unorm, the size of a
+  // render target at the current surface pitch and MSAA; cleared, discarded),
+  // for draws that still have effects when rasterized into nothing (pixel
+  // shader memory export, host occlusion queries). The pipeline gets a zero
+  // write mask for it (the guest color mask is zero). Returns false if the
+  // texture can't be created.
+  bool UpdateDummyAttachment();
   const WebGPUCommandStream::RenderPassDesc& last_update_render_pass() const {
     return last_update_render_pass_;
   }
@@ -168,6 +179,10 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
     uint64_t resolve_clears = 0;
     uint64_t readbacks = 0;
     uint64_t updates_without_attachments = 0;
+    // UpdateDummyAttachment calls that bound the dummy attachment, and dummy
+    // textures created (one per host sample count, recreated larger).
+    uint64_t dummy_attachment_updates = 0;
+    uint64_t dummy_attachments_created = 0;
   };
   const Statistics& statistics() const { return statistics_; }
   const WebGPUEdram::Statistics* edram_statistics() const {
@@ -242,6 +257,19 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   // Attachments of the last update, to give a changed set a new pass key.
   RenderTarget* last_update_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   uint32_t attachments_generation_ = 0;
+  bool last_update_without_attachments_ = false;
+
+  // UpdateDummyAttachment: [0] 1 sample, [1] 4 samples.
+  struct DummyAttachment {
+    WGPUTexture texture = nullptr;
+    WGPUTextureView view = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  DummyAttachment dummy_attachments_[2];
+  // The dummy texture the last update bound (null after a real update), so
+  // consecutive dummy updates share a pass key and real ones get a new one.
+  WGPUTexture last_update_dummy_texture_ = nullptr;
 
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<WebGPUEdramRectangle> load_rectangles_;

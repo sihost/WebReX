@@ -17,10 +17,12 @@
 #include <rex/logging.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
+#include <rex/thread/fiber.h>
 
 namespace rex::runtime {
 
 thread_local ThreadState* thread_state_ = nullptr;
+REX_FIBER_INHERITED_TLS(thread_state_);  // web fibers: core/fiber_web.cpp
 
 ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_address,
                          memory::Memory* memory)

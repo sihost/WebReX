@@ -170,6 +170,8 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
           ParsedAllocInstruction instr;
           ParseControlFlowAlloc(cf.alloc, cf_index, type() == xenos::ShaderType::kVertex, instr);
           instr.Disassemble(&ucode_disasm_buffer);
+          // Any `alloc` ends the previous memory export (and its eA).
+          memexport_address_unresolved_ = false;
         } break;
         case ControlFlowOpcode::kMarkVsFetchDone:
           break;
@@ -479,6 +481,30 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
                   (ucode::GetAluScalarOpcodeInfo(op.scalar_opcode()).changed_state &
                    ucode::kAluOpChangedStatePixelKill);
 
+  // Store used memexport constants because CPU code needs addresses and sizes.
+  // eA is (hopefully) always written to using:
+  // mad eA, r#, const0100, c#
+  // There are exceptions that set eA without exporting anything: shaders in
+  // 4D5307E6 set eA to zeros, and Halo 3's memexporting vertex shaders end with
+  // address-only exports, `alloc export = 1` + `mad eA, c#.yyyy, c#.yyyy,
+  // c#.yyyy` (then .zzzz) with no eM# written before the next `alloc`. Such an
+  // eA is not stored by the translators (StoreResult), and with no eM# write
+  // nothing is exported to it on the host either, so it only needs attention
+  // (and an error) if an eM# is actually written while it is the export address.
+  // Checked before the results are gathered: a paired scalar operation of the
+  // same instruction may write eM#.
+  // Export is done to vector_dest of the ucode instruction for both vector and
+  // scalar operations - no need to check separately.
+  if (instr.vector_and_constant_result.storage_target == InstructionStorageTarget::kExportAddress) {
+    uint32_t memexport_stream_constant = instr.GetMemExportStreamConstant();
+    if (memexport_stream_constant != UINT32_MAX) {
+      memexport_stream_constants_.insert(memexport_stream_constant);
+      memexport_address_unresolved_ = false;
+    } else {
+      memexport_address_unresolved_ = true;
+    }
+  }
+
   GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index);
   GatherAluResultInformation(instr.scalar_result, exec_cf_index);
   for (size_t i = 0; i < instr.vector_operand_count; ++i) {
@@ -486,25 +512,6 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
   }
   for (size_t i = 0; i < instr.scalar_operand_count; ++i) {
     GatherOperandInformation(instr.scalar_operands[i]);
-  }
-
-  // Store used memexport constants because CPU code needs addresses and sizes.
-  // eA is (hopefully) always written to using:
-  // mad eA, r#, const0100, c#
-  // (though there are some exceptions, shaders in 4D5307E6 for some reason set
-  // eA to zeros, but the swizzle of the constant is not .xyzw in this case, and
-  // they don't write to eM#).
-  // Export is done to vector_dest of the ucode instruction for both vector and
-  // scalar operations - no need to check separately.
-  if (instr.vector_and_constant_result.storage_target == InstructionStorageTarget::kExportAddress) {
-    uint32_t memexport_stream_constant = instr.GetMemExportStreamConstant();
-    if (memexport_stream_constant != UINT32_MAX) {
-      memexport_stream_constants_.insert(memexport_stream_constant);
-    } else {
-      REXGPU_ERROR(
-          "ShaderTranslator::GatherAluInstructionInformation: Couldn't extract "
-          "memexport stream constant index");
-    }
   }
 }
 
@@ -574,6 +581,16 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
       writes_point_size_edge_flag_kill_vertex_ |= used_write_mask;
       break;
     case InstructionStorageTarget::kExportData:
+      if (memexport_address_unresolved_) {
+        // Data exported through an eA not written in the `mad eA, r#,
+        // const0100, c#` form: the translators don't store that eA, and the
+        // CPU doesn't know which memory the export writes.
+        REXGPU_ERROR(
+            "Shader {:016X}: eM{} written after an eA write the stream constant can't be "
+            "extracted from (not mad eA, r#, const0100, c#); this export is dropped",
+            ucode_data_hash(), result.storage_index);
+        memexport_address_unresolved_ = false;
+      }
       memexport_eM_written_ |= uint8_t(1) << result.storage_index;
       if (cf_memexport_info_.empty()) {
         cf_memexport_info_.resize(2 * cf_pair_index_bound_);

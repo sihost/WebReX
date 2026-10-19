@@ -147,19 +147,27 @@ struct WebGPUPipelineDescription {
   uint32_t blend_control[4];
   uint32_t color_write_masks;  // 4 bits per target
   uint32_t depth_control;      // normalized RB_DEPTHCONTROL
+  // WebGPU has one stencil read / write mask for both faces: RB_STENCILREFMASK,
+  // or RB_STENCILREFMASK_BF when only back faces are drawn (as D3D12).
   uint8_t stencil_read_mask;
   uint8_t stencil_write_mask;
-  uint8_t stencil_read_mask_back;
-  uint8_t stencil_write_mask_back;
   uint8_t primitive_topology;  // WGPUPrimitiveTopology
   uint8_t cull_mode;           // WGPUCullMode
   uint8_t front_face_cw;
   uint8_t alpha_to_coverage;
   uint8_t sample_count;
   uint8_t strip_index_format;  // WGPUIndexFormat, strips only
-  uint8_t pad[6];
+  // PA_CL_CLIP_CNTL.clip_disable on a device with depth-clip-control.
+  uint8_t unclipped_depth;
+  uint8_t pad[3];
+  // Polygon offset of the face drawn (draw_util::GetPreferredFacePolygonOffset):
+  // D3D10 integer units for the host depth format, slope in pixels. 0 for
+  // point / line topologies (WebGPU validation) and without depth.
+  int32_t depth_bias;
+  float depth_bias_slope_scale;
+  uint8_t pad_end[4];
 };
-static_assert(sizeof(WebGPUPipelineDescription) == 80);
+static_assert(sizeof(WebGPUPipelineDescription) == 88);
 
 class WebGPUPipelineCache {
  public:
@@ -247,6 +255,11 @@ class WebGPUPipelineCache {
     uint64_t draws_refused_tessellation = 0;
     // Front and back faces culled (WebGPU has no cull-both mode); nothing drawn.
     uint64_t draws_refused_cull_both = 0;
+    // Draws given a pipeline with a polygon offset (depth bias or slope scale
+    // non-zero), with depth clipping off, and with the back face stencil masks.
+    uint64_t draws_depth_bias = 0;
+    uint64_t draws_unclipped_depth = 0;
+    uint64_t draws_stencil_back_masks = 0;
     // Shader translation failed (cached kInvalidPipelineId) or the
     // webgpu_draw_with_pipelines diagnostic is off.
     uint64_t draws_refused_no_pipeline = 0;
@@ -353,6 +366,8 @@ class WebGPUPipelineCache {
                                  const std::array<WGPUBindGroupLayout, 4>& layouts);
   std::shared_ptr<const std::string> GetDepthOnlyFragmentWgsl(uint32_t depth_stencil_mode);
   std::filesystem::path StoragePath(uint64_t hash, uint64_t modification, bool vertex) const;
+  // CP thread, from InitializeShaderStorage: --webgpu_wgsl_bundle_url.
+  void ImportWgslBundle();
   // Bindings of `shader` (translating `modification` if no modification of it
   // is translated yet, as on a WGSL storage hit). Null if the shader can't be
   // bound (translation failure, over the per-stage texture / sampler limits).
@@ -367,6 +382,7 @@ class WebGPUPipelineCache {
   std::unique_ptr<SpirvShaderTranslator> translator_;
   uint32_t max_storage_buffer_range_ = 128 * 1024 * 1024;
   bool clip_distances_ = false;
+  bool depth_clip_control_ = false;
 
   bool storage_initialized_ = false;
   std::filesystem::path storage_dir_;

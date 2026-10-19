@@ -15,6 +15,16 @@
 
 #include <fmt/format.h>
 
+#include <rex/platform.h>
+#if REX_PLATFORM_WEB
+#include <emscripten/stack.h>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#endif
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -41,11 +51,153 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+// Native: a big host stack. Web: the pthread stack is malloc'd from the wasm memory, and it
+// only holds what does not fit wasm locals (address-taken locals, large arrays, setjmp
+// buffers); wasm call frames live on the engine's own stack. Halo 3 (riverworld film and
+// game, cold shader storage; --xthread_host_stack_watermark) peaks at 194 KiB on the GPU
+// command thread (an XHostThread that translates shaders) and under 16 KiB on every other
+// guest thread, so 1 MiB keeps 5x headroom and saves 15 MiB of wasm heap per guest thread.
+#if REX_PLATFORM_WEB
+constexpr int32_t kDefaultXThreadHostStackKiB = 1024;
+#else
+constexpr int32_t kDefaultXThreadHostStackKiB = 16 * 1024;
+#endif
+REXCVAR_DEFINE_INT32(xthread_host_stack_kb, kDefaultXThreadHostStackKiB, "Kernel",
+                     "Host stack size of guest threads (XThreads) in KiB (minimum 64). Default "
+                     "16384 natively, 1024 on the web, where the pthread stack is taken from "
+                     "the wasm memory and only holds the linear (address-taken) part of the "
+                     "stack; measure with --xthread_host_stack_watermark before lowering it");
+REXCVAR_DEFINE_BOOL(xthread_host_stack_watermark, false, "Kernel",
+                    "Web: fill each guest thread's host stack with a pattern when it starts and "
+                    "log its deepest use (high-water mark) when it grows (checked every 10 s) and "
+                    "when the thread exits; reaching the end of the stack is logged as an "
+                    "overflow (wasm has no guard page: an overflow silently overwrites the heap "
+                    "below the stack). Touches the whole stack (resident memory)");
+
 namespace rex {
 extern thread_local PPCContext* g_current_ppc_context;
 }
 
 namespace rex::system {
+
+namespace {
+
+uint32_t XThreadHostStackSize() {
+  return uint32_t(std::max<int32_t>(REXCVAR_GET(xthread_host_stack_kb), 64)) * 1024u;
+}
+
+#if REX_PLATFORM_WEB
+// --xthread_host_stack_watermark: the linear-memory stacks of the guest threads, filled with
+// kStackFill below the frame of the thread's start routine; the deepest overwritten word is
+// the high-water mark (a frame that reserves but never writes its lowest bytes is missed).
+constexpr uint64_t kStackFill = 0x5AC4F1115AC4F111ull;
+
+struct HostStackRecord {
+  uint32_t thread_id;
+  std::string name;
+  uintptr_t end;   // lowest address
+  uintptr_t base;  // highest address
+  size_t high_water;
+  size_t logged;
+};
+
+std::mutex g_host_stacks_mutex;
+std::vector<HostStackRecord*> g_host_stacks;
+size_t g_host_stack_peak = 0;
+
+// Under g_host_stacks_mutex. Only the part below the known high-water mark is read.
+void ScanHostStack(HostStackRecord& r) {
+  uintptr_t limit = r.base - r.high_water;
+  uintptr_t p = r.end;
+  while (p < limit && __atomic_load_n(reinterpret_cast<const uint64_t*>(p), __ATOMIC_RELAXED) ==
+                          kStackFill) {
+    p += sizeof(uint64_t);
+  }
+  if (p < limit) {
+    r.high_water = r.base - p;
+  }
+}
+
+void LogHostStack(HostStackRecord& r, const char* when) {
+  size_t size = r.base - r.end;
+  g_host_stack_peak = std::max(g_host_stack_peak, r.high_water);
+  if (r.high_water + sizeof(uint64_t) >= size) {
+    REXSYS_ERROR(
+        "XThread {:08X} ({}) host stack OVERFLOW: all {} KiB used ({}), raise "
+        "--xthread_host_stack_kb",
+        r.thread_id, r.name, size >> 10, when);
+  } else {
+    REXSYS_INFO(
+        "XThread {:08X} ({}) host stack high-water {} KiB of {} KiB ({}); peak of all guest "
+        "threads {} KiB",
+        r.thread_id, r.name, (r.high_water + 1023) >> 10, size >> 10, when,
+        (g_host_stack_peak + 1023) >> 10);
+  }
+  r.logged = r.high_water;
+}
+
+void HostStackMonitor() {
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::lock_guard<std::mutex> lock(g_host_stacks_mutex);
+    for (HostStackRecord* r : g_host_stacks) {
+      ScanHostStack(*r);
+      if (r->high_water >= r->logged + 4096) {
+        LogHostStack(*r, "running");
+      }
+    }
+  }
+}
+
+// Lives in the start routine's frame: unregisters (and logs the final mark) when the thread
+// returns or unwinds (XThread::Exit), before its stack is freed.
+class HostStackWatch {
+ public:
+  HostStackWatch(uint32_t thread_id, const std::string& name) {
+    if (!REXCVAR_GET(xthread_host_stack_watermark)) {
+      return;
+    }
+    record_ = new HostStackRecord();
+    record_->thread_id = thread_id;
+    record_->name = name;
+    record_->end = (emscripten_stack_get_end() + 7) & ~uintptr_t(7);
+    record_->base = emscripten_stack_get_base();
+    // Leave this frame and the next callee's prologue some room.
+    uintptr_t fill_top = (emscripten_stack_get_current() - 1024) & ~uintptr_t(7);
+    for (uintptr_t p = record_->end; p < fill_top; p += sizeof(uint64_t)) {
+      __atomic_store_n(reinterpret_cast<uint64_t*>(p), kStackFill, __ATOMIC_RELAXED);
+    }
+    record_->high_water = record_->base - fill_top;
+    record_->logged = 0;
+    static std::once_flag monitor_once;
+    std::call_once(monitor_once, []() { std::thread(HostStackMonitor).detach(); });
+    std::lock_guard<std::mutex> lock(g_host_stacks_mutex);
+    g_host_stacks.push_back(record_);
+  }
+  ~HostStackWatch() {
+    if (!record_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_host_stacks_mutex);
+    ScanHostStack(*record_);
+    LogHostStack(*record_, "thread exit");
+    g_host_stacks.erase(std::find(g_host_stacks.begin(), g_host_stacks.end(), record_));
+    delete record_;
+  }
+  HostStackWatch(const HostStackWatch&) = delete;
+  HostStackWatch& operator=(const HostStackWatch&) = delete;
+
+ private:
+  HostStackRecord* record_ = nullptr;
+};
+#else
+class HostStackWatch {
+ public:
+  HostStackWatch(uint32_t, const std::string&) {}
+};
+#endif
+
+}  // namespace
 
 const uint32_t XAPC::kSize;
 const uint32_t XAPC::kDummyKernelRoutine;
@@ -112,6 +264,8 @@ XThread::~XThread() {
 }
 
 thread_local XThread* current_xthread_tls_ = nullptr;
+// Web: a fiber (KeSetCurrentStackPointers) runs on its own pthread; it is still this XThread.
+REX_FIBER_INHERITED_TLS(current_xthread_tls_);
 
 bool XThread::IsInThread() {
   return current_xthread_tls_ != nullptr;
@@ -418,9 +572,10 @@ X_STATUS XThread::Create() {
   RetainHandle();
 
   rex::thread::Thread::CreationParameters params;
-  params.stack_size = 16_MiB;  // Allocate a big host stack.
+  params.stack_size = XThreadHostStackSize();  // 16 MiB natively, see xthread_host_stack_kb.
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
+    HostStackWatch stack_watch(handle(), thread_name_);
     rex::initialize_seh_thread();
 
     // Set thread ID override. This is used by logging.
@@ -1594,7 +1749,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
-    params.stack_size = 16_MiB;
+    params.stack_size = XThreadHostStackSize();
     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());

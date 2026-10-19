@@ -99,6 +99,17 @@ void WebGPURenderTargetCache::Shutdown(bool from_destructor) {
   // objects can be released right away.
   shutting_down_ = true;
   DestroyAllRenderTargets(true);
+  for (DummyAttachment& dummy : dummy_attachments_) {
+    if (dummy.texture) {
+      PendingRelease objects = {};
+      objects.texture = dummy.texture;
+      objects.views[0] = dummy.view;
+      ReleaseRenderTargetObjects(objects);
+      dummy = {};
+    }
+  }
+  last_update_dummy_texture_ = nullptr;
+  last_update_without_attachments_ = false;
   if (edram_ || readback_buffer_) {
     WebGPUDevice& device = command_processor_.device();
     device.RunSync([this]() {
@@ -325,6 +336,7 @@ void WebGPURenderTargetCache::PerformTransfersAndResolveClears(
 bool WebGPURenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  last_update_without_attachments_ = false;
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
     last_update_render_pass_key_ = 0;
@@ -387,12 +399,16 @@ bool WebGPURenderTargetCache::Update(bool is_rasterization_done,
     desc.SetColor(i, color->surface().attachment_view, false);
   }
   if (!format_key.depth_and_color_used) {
-    // WebGPU render passes need at least one attachment.
-    // TODO(WP4): a dummy attachment for draws without render targets.
+    // WebGPU render passes need at least one attachment: the command processor
+    // drops the draw if it has no effect, or calls UpdateDummyAttachment.
     ++statistics_.updates_without_attachments;
+    last_update_without_attachments_ = true;
     last_update_render_pass_key_ = 0;
     return false;
   }
+  // After a dummy pass, last_update_attachments_ is all null, so a real set
+  // always gets a new generation.
+  last_update_dummy_texture_ = nullptr;
   if (std::memcmp(last_update_attachments_, render_targets, sizeof(last_update_attachments_))) {
     std::memcpy(last_update_attachments_, render_targets, sizeof(last_update_attachments_));
     if (++attachments_generation_ == 0) {
@@ -403,6 +419,97 @@ bool WebGPURenderTargetCache::Update(bool is_rasterization_done,
   last_update_render_pass_key_ = (uint64_t(attachments_generation_) << 32) | format_key.key;
   last_update_render_pass_width_ = pass_width;
   last_update_render_pass_height_ = pass_height;
+  return true;
+}
+
+bool WebGPURenderTargetCache::UpdateDummyAttachment() {
+  if (!last_update_without_attachments_ || !edram_) {
+    return false;
+  }
+  // The size a render target at the current pitch would have (CreateRenderTarget),
+  // so viewport and scissor are bounded as with a real target.
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+  uint32_t msaa_x_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp =
+      std::max(((uint32_t(rb_surface_info.surface_pitch) << msaa_x_log2) +
+                (xenos::kEdramTileWidthSamples - 1)) /
+                   xenos::kEdramTileWidthSamples,
+               uint32_t(1));
+  uint32_t max_dimension = std::max(GetMaxRenderTargetWidth(), uint32_t(1));
+  uint32_t width = std::min(
+      RenderTargetKey::GetWidth(pitch_tiles_at_32bpp, msaa_samples) * draw_resolution_scale_x(),
+      max_dimension);
+  uint32_t height =
+      std::min(std::max(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples), uint32_t(1)) *
+                   draw_resolution_scale_y(),
+               max_dimension);
+  uint32_t sample_count = GetHostSampleCount(msaa_samples);
+  DummyAttachment& dummy = dummy_attachments_[sample_count > 1];
+  if (dummy.width < width || dummy.height < height) {
+    uint32_t new_width = std::max(width, dummy.width);
+    uint32_t new_height = std::max(height, dummy.height);
+    if (dummy.texture) {
+      PendingRelease objects = {};
+      objects.texture = dummy.texture;
+      objects.views[0] = dummy.view;
+      ReleaseRenderTargetObjects(objects);
+      dummy = {};
+    }
+    WGPUTextureFormat format = GetColorTextureFormat(xenos::ColorRenderTargetFormat::k_8_8_8_8);
+    WebGPUDevice& device = command_processor_.device();
+    device.RunSync([&]() {
+      WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      desc.label = MakeStringView("dummy render target");
+      desc.usage = WGPUTextureUsage_RenderAttachment;
+      desc.size = {new_width, new_height, 1};
+      desc.format = format;
+      desc.sampleCount = sample_count;
+      dummy.texture = wgpuDeviceCreateTexture(device.device(), &desc);
+      if (dummy.texture) {
+        dummy.view = wgpuTextureCreateView(dummy.texture, nullptr);
+      }
+    });
+    if (!dummy.texture || !dummy.view) {
+      REXGPU_ERROR("WebGPU render target cache: failed to create a {}x{} dummy render target",
+                   new_width, new_height);
+      if (dummy.texture) {
+        PendingRelease objects = {};
+        objects.texture = dummy.texture;
+        ReleaseRenderTargetObjects(objects);
+      }
+      dummy = {};
+      return false;
+    }
+    dummy.width = new_width;
+    dummy.height = new_height;
+    ++statistics_.dummy_attachments_created;
+    REXGPU_INFO(
+        "WebGPU render target cache: dummy render target {}x{}, {} samples, for draws without "
+        "render targets that have effects",
+        new_width, new_height, sample_count);
+  }
+
+  RenderPassFormatKey format_key;
+  format_key.msaa_samples = msaa_samples;
+  format_key.depth_and_color_used = uint32_t(1) << 1;
+  format_key.color_0_format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  WebGPUCommandStream::RenderPassDesc desc;
+  desc.SetColor(0, dummy.view, true);
+  desc.color_attachments[0].storeOp = WGPUStoreOp_Discard;
+  if (last_update_dummy_texture_ != dummy.texture) {
+    // A pass key of its own; the next real update gets a new one too.
+    last_update_dummy_texture_ = dummy.texture;
+    std::memset(last_update_attachments_, 0, sizeof(last_update_attachments_));
+    if (++attachments_generation_ == 0) {
+      attachments_generation_ = 1;
+    }
+  }
+  last_update_render_pass_ = desc;
+  last_update_render_pass_key_ = (uint64_t(attachments_generation_) << 32) | format_key.key;
+  last_update_render_pass_width_ = width;
+  last_update_render_pass_height_ = height;
+  ++statistics_.dummy_attachment_updates;
   return true;
 }
 

@@ -12,6 +12,7 @@
 #include <thread>
 
 #include <rex/thread.h>
+#include <rex/thread/fiber.h>
 
 namespace rex::thread {
 
@@ -28,6 +29,7 @@ uint32_t logical_processor_count() {
 }
 
 thread_local uint32_t current_thread_id_ = UINT_MAX;
+REX_FIBER_INHERITED_TLS(current_thread_id_);  // web fibers: fiber_web.cpp
 
 uint32_t current_thread_id() {
   return current_thread_id_ == UINT_MAX ? current_thread_system_id() : current_thread_id_;
