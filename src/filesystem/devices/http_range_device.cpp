@@ -43,6 +43,7 @@ static_assert(REX_PLATFORM_WEB, "HttpRangeDevice is web-only (Emscripten)");
 
 #include <rex/cvar.h>
 #include <rex/filesystem/entry.h>
+#include <rex/filesystem/web_storage.h>
 #include <rex/filesystem/file.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -68,6 +69,16 @@ REXCVAR_DEFINE_INT32(vfs_http_read_ahead_blocks, 8, "Filesystem",
                      "Web HttpRangeDevice: blocks fetched ahead of a file read sequentially "
                      "(needs vfs_http_fetch_threads > 0; capped at half the memory cache). 0 = off")
     .range(0, 64);
+REXCVAR_DEFINE_INT32(vfs_cache_max_mb, 0, "Filesystem",
+                     "Web HttpRangeDevice: size cap of the persistent (OPFS) block cache in MiB; "
+                     "its least recently used files are deleted to stay below it. 0 = no fixed "
+                     "cap (still bounded by vfs_cache_reserve_mb)")
+    .range(0, 1 << 20);
+REXCVAR_DEFINE_INT32(vfs_cache_reserve_mb, 256, "Filesystem",
+                     "Web HttpRangeDevice: MiB of the origin's storage quota kept free for saves: "
+                     "the block cache stops growing and evicts its least recently used files when "
+                     "navigator.storage.estimate() reports less than this left")
+    .range(0, 1 << 20);
 
 // -------------------------------------------------------------------------------------------
 // JS transport. All pointers and 64-bit integers are passed as doubles (exact below 2^53), which
@@ -376,6 +387,7 @@ class HttpRangeEntry final : public Entry {
 // -------------------------------------------------------------------------------------------
 
 struct HttpRangeDevice::PersistentFile {
+  std::string base;  // <dir>/<key>
   int data_fd = -1;
   int map_fd = -1;
   bool complete = false;
@@ -432,6 +444,10 @@ HttpRangeDevice::HttpRangeDevice(const std::string_view mount_path,
 }
 
 HttpRangeDevice::~HttpRangeDevice() {
+  if (evictor_id_) {
+    web::UnregisterStorageEvictor(evictor_id_);
+    evictor_id_ = 0;
+  }
   StopPool();
 }
 
@@ -540,6 +556,19 @@ bool HttpRangeDevice::InitializeFromManifest(const std::string& manifest_json) {
     if (!persistent_enabled_) {
       REXFS_WARN("HttpRangeDevice: persistent cache dir {} unusable; memory cache only",
                  options_.persistent_cache_dir);
+    } else {
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        ScanPersistentCacheLocked();
+      }
+      // Saves come first: a failing save write frees block cache files (web_storage.h).
+      if (!evictor_id_) {
+        evictor_id_ = web::RegisterStorageEvictor(
+            "game data block cache " + options_.persistent_cache_dir, [this](uint64_t bytes) {
+              std::lock_guard<std::mutex> lock(cache_mutex_);
+              return EvictPersistentLocked(bytes, std::string());
+            });
+      }
     }
   }
 
@@ -645,6 +674,8 @@ HttpRangeDevice::PersistentFile* HttpRangeDevice::GetPersistentFile(uint32_t fil
   }
   std::string base = options_.persistent_cache_dir + "/" + key;
   auto pf = std::make_unique<PersistentFile>();
+  pf->base = base;
+  TouchPersistentLocked(base, 0);
   struct stat st {};
   if (::stat((base + ".complete").c_str(), &st) == 0 && ::stat((base + ".data").c_str(), &st) == 0 &&
       uint64_t(st.st_size) == info.size) {
@@ -673,6 +704,7 @@ bool HttpRangeDevice::ReadPersistentBlock(uint32_t file, uint32_t block,
   // cache_mutex_ held.
   PersistentFile* pf = GetPersistentFile(file);
   if (!pf || !pf->Has(block)) return false;
+  TouchPersistentLocked(pf->base, 0);
   size_t bytes = BlockBytes(files_[file], block);
   out.resize(bytes);
   ssize_t got = ::pread(pf->data_fd, out.data(), bytes, off_t(uint64_t(block) * options_.block_size));
@@ -685,9 +717,27 @@ void HttpRangeDevice::WritePersistentBlocks(uint32_t file, uint32_t first_block,
   PersistentFile* pf = GetPersistentFile(file);
   if (!pf || pf->complete) return;
   off_t offset = off_t(uint64_t(first_block) * options_.block_size);
-  if (::pwrite(pf->data_fd, data, length, offset) != ssize_t(length)) {
-    return;  // quota or I/O error: just don't mark the blocks
+  // The .data file grows to the end of the furthest block written (OPFS files are not
+  // sparse), plus the bitmap.
+  struct stat st {};
+  uint64_t old_size = ::fstat(pf->data_fd, &st) == 0 ? uint64_t(st.st_size) : 0;
+  uint64_t new_size = std::max<uint64_t>(old_size, uint64_t(offset) + length);
+  const std::string base = pf->base;
+  if (new_size > old_size && !ReservePersistentLocked(new_size - old_size, base)) {
+    ++stat_skipped_writes_;
+    return;  // no room: these blocks stay memory-only
   }
+  // Eviction never closes the file being written, so pf is still valid.
+  if (::pwrite(pf->data_fd, data, length, offset) != ssize_t(length)) {
+    // Quota or I/O error: don't mark the blocks, and make room for the next writes (saves
+    // included) right away.
+    REXFS_WARN("HttpRangeDevice: block cache write of {} KiB failed ({}); evicting", length >> 10,
+               errno);
+    EvictPersistentLocked(uint64_t(length) * 4, base);
+    ++stat_skipped_writes_;
+    return;
+  }
+  TouchPersistentLocked(base, new_size + pf->bitmap.size());
   uint32_t last_block = first_block + uint32_t((length + options_.block_size - 1) / options_.block_size) - 1;
   for (uint32_t b = first_block; b <= last_block; ++b) {
     pf->bitmap[b / 8] |= uint8_t(1u << (b % 8));
@@ -1099,7 +1149,120 @@ HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   s.pool_requests = stat_pool_requests_.load(std::memory_order_relaxed);
   s.read_ahead_blocks = stat_read_ahead_blocks_.load(std::memory_order_relaxed);
   s.inflight_waits = stat_inflight_waits_.load(std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  s.persistent_bytes = cache_bytes_;
+  s.evicted_files = stat_evicted_files_;
+  s.evicted_bytes = stat_evicted_bytes_;
+  s.skipped_writes = stat_skipped_writes_;
   return s;
+}
+
+void HttpRangeDevice::ScanPersistentCacheLocked() {
+  cache_files_.clear();
+  cache_bytes_ = 0;
+  std::error_code ec;
+  std::vector<std::pair<std::filesystem::file_time_type, std::string>> order;
+  for (const auto& entry : std::filesystem::directory_iterator(options_.persistent_cache_dir, ec)) {
+    std::error_code entry_ec;
+    if (!entry.is_regular_file(entry_ec)) continue;
+    std::string path = entry.path().string();
+    std::string base = path.substr(0, path.size() - entry.path().extension().string().size());
+    uint64_t size = entry.file_size(entry_ec);
+    CacheFileUse& use = cache_files_[base];
+    use.bytes += entry_ec ? 0 : size;
+    cache_bytes_ += entry_ec ? 0 : size;
+    if (entry.path().extension() == ".data") {
+      order.emplace_back(entry.last_write_time(entry_ec), base);
+    }
+  }
+  // Recency from the modification times (older files are evicted first).
+  std::sort(order.begin(), order.end());
+  for (const auto& [time, base] : order) {
+    cache_files_[base].last_use = ++use_clock_;
+  }
+  REXFS_INFO("HttpRangeDevice: persistent cache {}: {} files, {:.1f} MiB (cap {} MiB, reserve {} MiB)",
+             options_.persistent_cache_dir, order.size(), double(cache_bytes_) / 1048576.0,
+             options_.persistent_cache_max_bytes >= 0 ? options_.persistent_cache_max_bytes >> 20
+                                                      : int64_t(REXCVAR_GET(vfs_cache_max_mb)),
+             options_.persistent_cache_reserve_bytes >= 0
+                 ? options_.persistent_cache_reserve_bytes >> 20
+                 : int64_t(REXCVAR_GET(vfs_cache_reserve_mb)));
+}
+
+void HttpRangeDevice::TouchPersistentLocked(const std::string& base, uint64_t file_bytes) {
+  CacheFileUse& use = cache_files_[base];
+  use.last_use = ++use_clock_;
+  if (file_bytes > use.bytes) {
+    cache_bytes_ += file_bytes - use.bytes;
+    use.bytes = file_bytes;
+  }
+}
+
+uint64_t HttpRangeDevice::EvictPersistentLocked(uint64_t bytes, const std::string& keep_base) {
+  uint64_t freed = 0;
+  while (freed < bytes) {
+    auto victim = cache_files_.end();
+    for (auto it = cache_files_.begin(); it != cache_files_.end(); ++it) {
+      if (it->first != keep_base && it->second.bytes &&
+          (victim == cache_files_.end() || it->second.last_use < victim->second.last_use)) {
+        victim = it;
+      }
+    }
+    if (victim == cache_files_.end()) break;
+    const std::string base = victim->first;
+    // Close it first (WasmFS holds an exclusive OPFS access handle per open file); the next
+    // access reopens it empty.
+    for (auto it = persistent_.begin(); it != persistent_.end();) {
+      if (it->second && it->second->base == base) {
+        it = persistent_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (const char* ext : {".data", ".map", ".complete"}) {
+      ::unlink((base + ext).c_str());
+    }
+    freed += victim->second.bytes;
+    cache_bytes_ -= std::min(cache_bytes_, victim->second.bytes);
+    bytes_since_estimate_ -= int64_t(victim->second.bytes);
+    ++stat_evicted_files_;
+    stat_evicted_bytes_ += victim->second.bytes;
+    REXFS_INFO("HttpRangeDevice: evicted cache file {} ({:.1f} MiB)", base,
+               double(victim->second.bytes) / 1048576.0);
+    cache_files_.erase(victim);
+  }
+  return freed;
+}
+
+bool HttpRangeDevice::ReservePersistentLocked(uint64_t bytes, const std::string& keep_base) {
+  int64_t cap = options_.persistent_cache_max_bytes >= 0
+                    ? options_.persistent_cache_max_bytes
+                    : int64_t(REXCVAR_GET(vfs_cache_max_mb)) << 20;
+  if (cap > 0) {
+    if (bytes > uint64_t(cap)) return false;
+    if (cache_bytes_ + bytes > uint64_t(cap)) {
+      EvictPersistentLocked(cache_bytes_ + bytes - uint64_t(cap), keep_base);
+      if (cache_bytes_ + bytes > uint64_t(cap)) return false;
+    }
+  }
+  web::StorageEstimate estimate = web::GetStorageEstimate();
+  if (estimate.valid && estimate.quota > 0) {
+    if (estimate.sequence != estimate_sequence_) {
+      estimate_sequence_ = estimate.sequence;
+      bytes_since_estimate_ = 0;
+    }
+    double reserve = double(options_.persistent_cache_reserve_bytes >= 0
+                                ? options_.persistent_cache_reserve_bytes
+                                : int64_t(REXCVAR_GET(vfs_cache_reserve_mb)) << 20);
+    double left = estimate.quota - estimate.usage - double(bytes_since_estimate_) - double(bytes);
+    if (left < reserve) {
+      uint64_t want = uint64_t(reserve - left) + 1;
+      uint64_t freed = EvictPersistentLocked(want, keep_base);
+      if (freed < want) return false;
+    }
+  }
+  bytes_since_estimate_ += int64_t(bytes);
+  return true;
 }
 
 }  // namespace rex::filesystem

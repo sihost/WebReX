@@ -18,9 +18,14 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/memory.h>
 #include <rex/stream.h>
 #include <rex/system/xtypes.h>
+
+// The signed-in profile's gamertag and XUID offset (read when the profile is created).
+REXCVAR_DECLARE(std::string, user_profile_gamertag);
+REXCVAR_DECLARE(int32_t, user_profile_xuid_offset);
 
 namespace rex {
 namespace system {

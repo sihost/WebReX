@@ -14,6 +14,14 @@
 
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
+
+#if REX_PLATFORM_WEB
+#include <cerrno>
+#include <cstring>
+
+#include <rex/filesystem/web_storage.h>
+#endif
 
 namespace rex::filesystem {
 
@@ -67,11 +75,46 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
     return X_STATUS_ACCESS_DENIED;
   }
 
+#if REX_PLATFORM_WEB
+  // OPFS: a write past the origin's quota fails (WasmFS: EIO / ENOSPC) or comes up short.
+  // Free evictable caches (web_storage.h) and retry the rest once; still failing, report a
+  // full disk to the guest (saves fail cleanly instead of reading back truncated files).
+  size_t written = 0;
+  bool ok = file_handle_->Write(byte_offset, buffer.data(), buffer.size(), &written);
+  if (!ok || written < buffer.size()) {
+    int error = ok ? ENOSPC : errno;
+    size_t done = ok ? written : 0;
+    size_t remaining = buffer.size() - done;
+    uint64_t freed = web::RelieveStoragePressure(uint64_t(remaining) + (uint64_t(1) << 20));
+    size_t retried = 0;
+    bool retry_ok = freed && file_handle_->Write(byte_offset + done, buffer.data() + done,
+                                                 remaining, &retried);
+    if (retry_ok && retried == remaining) {
+      REXFS_WARN("HostPathFile: write of {} bytes to {} succeeded after freeing {} KiB ({})",
+                 buffer.size(), entry()->path(), freed >> 10, std::strerror(error));
+      if (out_bytes_written) {
+        *out_bytes_written = buffer.size();
+      }
+      return X_STATUS_SUCCESS;
+    }
+    REXFS_ERROR("HostPathFile: write of {} bytes at {} to {} failed ({}; {} KiB freed): disk full",
+                buffer.size(), byte_offset, entry()->path(), std::strerror(error), freed >> 10);
+    if (out_bytes_written) {
+      *out_bytes_written = done + (retry_ok ? retried : 0);
+    }
+    return X_STATUS_DISK_FULL;
+  }
+  if (out_bytes_written) {
+    *out_bytes_written = written;
+  }
+  return X_STATUS_SUCCESS;
+#else
   if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
     return X_STATUS_SUCCESS;
   } else {
     return X_STATUS_END_OF_FILE;
   }
+#endif
 }
 
 X_STATUS HostPathFile::SetLength(size_t length) {

@@ -13,9 +13,19 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DEFINE_STRING(user_profile_gamertag, "User", "Kernel",
+                      "Gamertag of the signed-in profile (also its content folder name). On the "
+                      "web, apps give a second tab its own (rex/filesystem/web_storage.h "
+                      "AcquireTabRole)");
+REXCVAR_DEFINE_INT32(user_profile_xuid_offset, 0, "Kernel",
+                     "Added to the profile's XUID (low byte), so the profiles of several "
+                     "instances (tabs, system link) differ")
+    .range(0, 255);
 
 namespace rex {
 namespace system {
@@ -25,8 +35,11 @@ UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  xuid_ = 0xB13EBABEBABEBABE + uint64_t(REXCVAR_GET(user_profile_xuid_offset) & 0xFF);
+  name_ = REXCVAR_GET(user_profile_gamertag);
+  if (name_.empty() || name_.size() > 15) {
+    name_ = "User";
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
