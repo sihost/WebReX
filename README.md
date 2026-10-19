@@ -60,6 +60,7 @@ they begin it get the same fixed results natively.
 | Browsers | Chromium is the target. Firefox loads games with 0 WebGPU errors but creates render pipelines very slowly (about one frame per 10 s in game); Safari is untested |
 | Memory | A large game needs about 8 GB of wasm memory per tab (Halo 3: ~3.5 GB heap break in play) |
 | GPU | First boot with an empty shader cache: a precompiled WGSL bundle covers most pipelines, but frames right after the first map load (tick ~150) can still differ from native until the rest are created |
+| GPU | Memexport results stay on the GPU by default; `--webgpu_readback_memexport_delayed` copies them back into guest memory about a frame late without waiting (the native `readback_memexport_fast` path). Off by default: one of three film runs had a wrong frame at the first map load with it on |
 | GPU | 16-bit normalized textures are stored as float16 so they stay filterable (precision differs from native) |
 | GPU | WebGPU limits: MSAA 2x runs as 4x, no ROV/FSI, no fill mode, no cull distance (see [`docs/web_limitations.md`](docs/web_limitations.md)) |
 | Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only); suspend/terminate are cooperative (kernel exports are safe points) |
