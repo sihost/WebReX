@@ -155,10 +155,11 @@ function(rexglue_configure_target target_name)
                 "SHELL:-s MAXIMUM_MEMORY=${web_maximum_bytes}"
                 # Abort with a report (not a NULL malloc) when the memory can not grow.
                 "SHELL:-s ABORTING_MALLOC=1"
-                # Length-tracking views of a growable SharedArrayBuffer where the browser has
-                # WebAssembly.Memory.toResizableBuffer (Chrome 136+, Firefox 154+): no per-access
-                # view refresh in JS; older browsers fall back to refreshing the views.
-                "SHELL:-s GROWABLE_ARRAYBUFFERS=1"
+                # Plain SharedArrayBuffer views, refreshed in JS after a growth (one compare per
+                # heap access). NOT -sGROWABLE_ARRAYBUFFERS: views of a growable SharedArrayBuffer
+                # are rejected by FileSystemSyncAccessHandle.read/write (WasmFS OPFS: every write
+                # failed with EINVAL/ENOSPC, "disk full", in Chrome 155), while WebGPU accepts them.
+                "SHELL:-s GROWABLE_ARRAYBUFFERS=0"
                 -Wno-pthreads-mem-growth)
             message(STATUS "rexglue: ${target_name}: web memory ${web_initial} initial, grows to ${web_maximum}")
         else()

@@ -145,9 +145,10 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   small initial memory that grows on demand: `REXGLUE_WEB_INITIAL_MEMORY` (default `3GB`) and
   `REXGLUE_WEB_MAXIMUM_MEMORY` (default `8GB`; equal sizes = fixed memory, no growth), per title with
   `-D` on the configure line, `set()` before `rexglue_setup_target()`, or the `WEB_INITIAL_MEMORY` /
-  `WEB_MAXIMUM_MEMORY` arguments. The maximum is address space only. Growth uses length-tracking views
-  (`-sGROWABLE_ARRAYBUFFERS=1`, WebAssembly.Memory.toResizableBuffer: Chrome 136+, Firefox 154+; older
-  browsers refresh the JS views on access). The log says `Wasm memory: N MiB now, growable (max M MiB)`
+  `WEB_MAXIMUM_MEMORY` arguments. The maximum is address space only. After a grow the JS heap views are
+  refreshed on their next use. Length-tracking views (`-sGROWABLE_ARRAYBUFFERS`) are not used: Chrome's
+  `FileSystemSyncAccessHandle.read/write` rejects views of a growable SharedArrayBuffer, so every WasmFS
+  OPFS write failed ("disk full"). The log says `Wasm memory: N MiB now, growable (max M MiB)`
   at startup, and every swap-stats line has the heap break and the current size.
 - **Out of memory is reported.** When the memory can not grow (the maximum is reached, or the browser
   refuses to commit more) or the initial memory can not be created, `src/ui/rex_web_pre.js` turns the
