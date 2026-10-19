@@ -138,6 +138,9 @@ void MarkGuestRangeDirty(uint32_t guest_address, uint32_t length) noexcept;
 // fn(context, run_first_page, run_page_count) for each maximal run that was dirty.
 // Returns the number of dirty pages found.
 using DirtyRunFn = void (*)(void* context, uint32_t first_page, uint32_t page_count);
+// True if any page of [first_page, last_page] is dirty (lock-free, 8 pages per load). A page
+// that becomes dirty concurrently may be missed, as if written just after the check.
+bool AnyDirtyPages(uint32_t first_page, uint32_t last_page) noexcept;
 uint32_t ConsumeDirtyPages(uint32_t first_page, uint32_t last_page, DirtyRunFn fn,
                            void* context) noexcept;
 
