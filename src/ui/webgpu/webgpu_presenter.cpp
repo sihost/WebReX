@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 #include <emscripten/html5.h>
@@ -21,6 +22,18 @@
 #include <rex/graphics/webgpu/webgpu_log.h>
 #include <rex/ui/surface_web.h>
 #include <rex/ui/webgpu/webgpu_immediate_drawer.h>
+
+// WGSL converted from ../shaders/vulkan_spirv at build time (see the headers).
+#include "../shaders/webgpu_wgsl/guest_output_bilinear_dither_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_bilinear_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_cas_resample_dither_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_cas_resample_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_cas_sharpen_dither_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_cas_sharpen_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_fsr_easu_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_fsr_rcas_dither_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_ffx_fsr_rcas_ps.h"
+#include "../shaders/webgpu_wgsl/guest_output_triangle_strip_rect_vs.h"
 
 namespace rex {
 namespace ui {
@@ -141,6 +154,7 @@ WebGPUPresenter::~WebGPUPresenter() {
       ReleaseGuestOutputImage(image);
     }
     present_pass_.reset();
+    ReleaseEffectChain();
     // The recordings' resources are released here (on the device thread).
     std::lock_guard<std::mutex> lock(ui_mutex_);
     ui_recordings_.reset();
@@ -553,18 +567,79 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
   }
 
   WebGPUPresentPass::Frame frame;
+  // Effect chain state referenced by frame.pre_pass / final_draw.
+  GuestOutputPaintConfig effect_config;
+  GuestOutputPaintFlow effect_flow = {};
+  bool use_effect_chain = false;
+  uint32_t effect_count = 0;
+  uint32_t effect_mask = 0;
   uint32_t background = background_color_rgb_.load(std::memory_order_relaxed);
   frame.clear_color = {double(background & 0xFF) / 255.0, double((background >> 8) & 0xFF) / 255.0,
                        double((background >> 16) & 0xFF) / 255.0, 1.0};
   if (mailbox_index != UINT32_MAX && properties.IsActive() &&
       guest_output_images_[mailbox_index].view) {
-    // Only bilinear stretching for now (no CAS/FSR on WebGPU), so the flow has
-    // a single effect writing the final letterboxed rectangle.
-    GuestOutputPaintConfig bilinear_config = paint_config;
-    bilinear_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+    // --present_effect: bilinear, CAS or FSR (EASU passes + RCAS), as natively.
+    // The temporal fsr2 / fsr3 need the FidelityFX runtime: spatial FSR here.
+    effect_config = paint_config;
+    if (effect_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+        effect_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+      effect_config.SetEffect(GuestOutputPaintConfig::Effect::kFsr);
+    }
     uint32_t max_dimension = device_.limits().maxTextureDimension2D;
     GuestOutputPaintFlow flow = GetGuestOutputPaintFlow(
-        properties, canvas_width, canvas_height, max_dimension, max_dimension, bilinear_config);
+        properties, canvas_width, canvas_height, max_dimension, max_dimension, effect_config);
+    if (flow.effect_count &&
+        (flow.effect_count > 1 || flow.effects[0] != GuestOutputPaintEffect::kBilinear)) {
+      // Effect passes (anything but the plain bilinear stretch, which the
+      // present pass draws itself).
+      bool chain_ready = InitializeEffectChain();
+      for (size_t i = 0; chain_ready && i + 1 < flow.effect_count; ++i) {
+        EffectChain::Intermediate& intermediate = effect_chain_.intermediates[i];
+        const std::pair<uint32_t, uint32_t>& size = flow.effect_output_sizes[i];
+        if (intermediate.texture && intermediate.width == size.first &&
+            intermediate.height == size.second) {
+          continue;
+        }
+        if (intermediate.view) {
+          wgpuTextureViewRelease(intermediate.view);
+        }
+        if (intermediate.texture) {
+          wgpuTextureRelease(intermediate.texture);
+        }
+        intermediate = EffectChain::Intermediate();
+        WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        desc.label = MakeStringView("rex guest output effect intermediate");
+        desc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+        desc.dimension = WGPUTextureDimension_2D;
+        desc.size = {size.first, size.second, 1};
+        desc.format = graphics::webgpu::kGuestOutputFormat;
+        desc.mipLevelCount = 1;
+        desc.sampleCount = 1;
+        intermediate.texture = wgpuDeviceCreateTexture(device_.device(), &desc);
+        if (intermediate.texture) {
+          intermediate.view = wgpuTextureCreateView(intermediate.texture, nullptr);
+        }
+        if (!intermediate.view) {
+          REXWGPU_ERROR("WebGPUPresenter: failed to create a {}x{} effect intermediate texture",
+                        size.first, size.second);
+          chain_ready = false;
+          break;
+        }
+        intermediate.width = size.first;
+        intermediate.height = size.second;
+      }
+      if (chain_ready) {
+        effect_flow = flow;
+        use_effect_chain = true;
+      } else {
+        // Fall back to the bilinear stretch.
+        GuestOutputPaintConfig bilinear_config = effect_config;
+        bilinear_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+        bilinear_config.SetDither(false);
+        flow = GetGuestOutputPaintFlow(properties, canvas_width, canvas_height, max_dimension,
+                                       max_dimension, bilinear_config);
+      }
+    }
     if (flow.effect_count) {
       const std::pair<uint32_t, uint32_t>& output_size =
           flow.effect_output_sizes[flow.effect_count - 1];
@@ -573,7 +648,43 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
       frame.dest_y = flow.output_y;
       frame.dest_width = output_size.first;
       frame.dest_height = output_size.second;
+      effect_count = uint32_t(flow.effect_count);
+      for (size_t i = 0; i < flow.effect_count; ++i) {
+        effect_mask |= uint32_t(1) << uint32_t(flow.effects[i]);
+      }
     }
+  }
+  if (use_effect_chain) {
+    WGPUTextureView guest_output_view = guest_output_images_[mailbox_index].view;
+    frame.pre_pass = [this, &effect_flow, &effect_config,
+                      guest_output_view](WGPUCommandEncoder encoder) {
+      for (size_t i = 0; i + 1 < effect_flow.effect_count; ++i) {
+        const EffectChain::Intermediate& target = effect_chain_.intermediates[i];
+        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+        color.view = target.view;
+        color.loadOp = WGPULoadOp_Clear;
+        color.storeOp = WGPUStoreOp_Store;
+        color.clearValue = {0.0, 0.0, 0.0, 1.0};
+        WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        pass_desc.label = MakeStringView("rex guest output effect");
+        pass_desc.colorAttachmentCount = 1;
+        pass_desc.colorAttachments = &color;
+        WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+        EncodeEffect(pass, effect_flow, i, effect_config,
+                     i ? effect_chain_.intermediates[i - 1].view : guest_output_view,
+                     graphics::webgpu::kGuestOutputFormat, target.width, target.height);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+      }
+    };
+    frame.final_draw = [this, &effect_flow, &effect_config, guest_output_view](
+                           WGPURenderPassEncoder pass, WGPUTextureFormat target_format,
+                           uint32_t target_width, uint32_t target_height) {
+      size_t i = effect_flow.effect_count - 1;
+      EncodeEffect(pass, effect_flow, i, effect_config,
+                   i ? effect_chain_.intermediates[i - 1].view : guest_output_view, target_format,
+                   target_width, target_height);
+    };
   }
 
   std::shared_ptr<const UIRecordingList> ui_recordings;
@@ -646,6 +757,8 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
       stats_.ui_recordings = 0;
     }
     stats_.ui_draws = ui_draws;
+    stats_.guest_output_effect_count = effect_count;
+    stats_.guest_output_effect_mask = effect_mask;
     stats_.width = presented_width;
     stats_.height = presented_height;
     if (frame.source) {
@@ -687,6 +800,301 @@ void WebGPUPresenter::PaintOnDeviceThread(uint32_t canvas_width, uint32_t canvas
     callback_info.userdata1 = readback.release();
     wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, size_t(size), callback_info);
   }
+}
+
+bool WebGPUPresenter::InitializeEffectChain() {
+  EffectChain& chain = effect_chain_;
+  if (chain.initialized) {
+    return !chain.failed;
+  }
+  chain.initialized = true;
+  chain.failed = true;
+  WGPUDevice device = device_.device();
+
+  WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+  wgsl.code = MakeStringView(guest_output_triangle_strip_rect_vs_wgsl);
+  WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+  module_desc.nextInChain = &wgsl.chain;
+  module_desc.label = MakeStringView("rex guest output rectangle");
+  chain.vertex_module = wgpuDeviceCreateShaderModule(device, &module_desc);
+
+  WGPUBindGroupLayoutEntry source_entries[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+                                                WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+  source_entries[0].binding = 0;
+  source_entries[0].visibility = WGPUShaderStage_Fragment;
+  source_entries[0].texture.sampleType = WGPUTextureSampleType_Float;
+  source_entries[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+  source_entries[1].binding = 1;
+  source_entries[1].visibility = WGPUShaderStage_Fragment;
+  source_entries[1].sampler.type = WGPUSamplerBindingType_Filtering;
+  WGPUBindGroupLayoutDescriptor source_layout_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+  source_layout_desc.label = MakeStringView("rex guest output effect source");
+  source_layout_desc.entryCount = 2;
+  source_layout_desc.entries = source_entries;
+  chain.source_layout = wgpuDeviceCreateBindGroupLayout(device, &source_layout_desc);
+
+  WGPUBindGroupLayoutEntry constants_entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+  constants_entry.binding = 0;
+  constants_entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+  constants_entry.buffer.type = WGPUBufferBindingType_Uniform;
+  WGPUBindGroupLayoutDescriptor constants_layout_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+  constants_layout_desc.label = MakeStringView("rex guest output effect constants");
+  constants_layout_desc.entryCount = 1;
+  constants_layout_desc.entries = &constants_entry;
+  chain.constants_layout = wgpuDeviceCreateBindGroupLayout(device, &constants_layout_desc);
+
+  if (chain.source_layout && chain.constants_layout) {
+    WGPUBindGroupLayout layouts[2] = {chain.source_layout, chain.constants_layout};
+    WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    layout_desc.label = MakeStringView("rex guest output effect");
+    layout_desc.bindGroupLayoutCount = 2;
+    layout_desc.bindGroupLayouts = layouts;
+    chain.pipeline_layout = wgpuDeviceCreatePipelineLayout(device, &layout_desc);
+  }
+
+  // As the native presenters' guest output sampler: bilinear, clamped.
+  WGPUSamplerDescriptor sampler_desc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+  sampler_desc.label = MakeStringView("rex guest output effect");
+  sampler_desc.addressModeU = WGPUAddressMode_ClampToEdge;
+  sampler_desc.addressModeV = WGPUAddressMode_ClampToEdge;
+  sampler_desc.addressModeW = WGPUAddressMode_ClampToEdge;
+  sampler_desc.magFilter = WGPUFilterMode_Linear;
+  sampler_desc.minFilter = WGPUFilterMode_Linear;
+  sampler_desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+  chain.sampler = wgpuDeviceCreateSampler(device, &sampler_desc);
+
+  WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+  buffer_desc.label = MakeStringView("rex guest output effect constants");
+  buffer_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+  buffer_desc.size = uint64_t(EffectChain::kUniformSlotSize) * EffectChain::kUniformSlotCount;
+  chain.uniform_buffer = wgpuDeviceCreateBuffer(device, &buffer_desc);
+
+  if (!chain.vertex_module || !chain.pipeline_layout || !chain.sampler || !chain.uniform_buffer) {
+    REXWGPU_ERROR(
+        "WebGPUPresenter: guest output effect initialization failed; using bilinear stretching");
+    return false;
+  }
+  chain.failed = false;
+  REXWGPU_INFO("WebGPUPresenter: guest output effects (CAS / FSR) initialized");
+  return true;
+}
+
+void WebGPUPresenter::ReleaseEffectChain() {
+  EffectChain& chain = effect_chain_;
+  for (EffectChain::Pipeline& pipeline : chain.pipelines) {
+    wgpuRenderPipelineRelease(pipeline.pipeline);
+  }
+  chain.pipelines.clear();
+  for (EffectChain::Intermediate& intermediate : chain.intermediates) {
+    if (intermediate.view) {
+      wgpuTextureViewRelease(intermediate.view);
+    }
+    if (intermediate.texture) {
+      wgpuTextureRelease(intermediate.texture);
+    }
+    intermediate = EffectChain::Intermediate();
+  }
+  for (WGPUShaderModule& module : chain.pixel_modules) {
+    if (module) {
+      wgpuShaderModuleRelease(module);
+      module = nullptr;
+    }
+  }
+  if (chain.vertex_module) {
+    wgpuShaderModuleRelease(chain.vertex_module);
+  }
+  if (chain.pipeline_layout) {
+    wgpuPipelineLayoutRelease(chain.pipeline_layout);
+  }
+  if (chain.constants_layout) {
+    wgpuBindGroupLayoutRelease(chain.constants_layout);
+  }
+  if (chain.source_layout) {
+    wgpuBindGroupLayoutRelease(chain.source_layout);
+  }
+  if (chain.sampler) {
+    wgpuSamplerRelease(chain.sampler);
+  }
+  if (chain.uniform_buffer) {
+    wgpuBufferRelease(chain.uniform_buffer);
+  }
+  chain = EffectChain();
+}
+
+WGPURenderPipeline WebGPUPresenter::GetEffectPipeline(GuestOutputPaintEffect effect,
+                                                      WGPUTextureFormat format) {
+  EffectChain& chain = effect_chain_;
+  for (const EffectChain::Pipeline& pipeline : chain.pipelines) {
+    if (pipeline.effect == effect && pipeline.format == format) {
+      return pipeline.pipeline;
+    }
+  }
+  // In GuestOutputPaintEffect order.
+  static const char* const kPixelShaders[] = {
+      guest_output_bilinear_ps_wgsl,
+      guest_output_bilinear_dither_ps_wgsl,
+      guest_output_ffx_cas_sharpen_ps_wgsl,
+      guest_output_ffx_cas_sharpen_dither_ps_wgsl,
+      guest_output_ffx_cas_resample_ps_wgsl,
+      guest_output_ffx_cas_resample_dither_ps_wgsl,
+      guest_output_ffx_fsr_easu_ps_wgsl,
+      guest_output_ffx_fsr_rcas_ps_wgsl,
+      guest_output_ffx_fsr_rcas_dither_ps_wgsl,
+  };
+  static_assert(std::size(kPixelShaders) == size_t(GuestOutputPaintEffect::kCount));
+  size_t effect_index = size_t(effect);
+  if (effect_index >= std::size(kPixelShaders)) {
+    return nullptr;
+  }
+  WGPUShaderModule& pixel_module = chain.pixel_modules[effect_index];
+  if (!pixel_module) {
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = MakeStringView(kPixelShaders[effect_index]);
+    WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    module_desc.nextInChain = &wgsl.chain;
+    module_desc.label = MakeStringView("rex guest output effect");
+    pixel_module = wgpuDeviceCreateShaderModule(device_.device(), &module_desc);
+    if (!pixel_module) {
+      return nullptr;
+    }
+  }
+  WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+  target.format = format;
+  target.writeMask = WGPUColorWriteMask_All;
+  WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+  fragment.module = pixel_module;
+  fragment.entryPoint = MakeStringView("main");
+  fragment.targetCount = 1;
+  fragment.targets = &target;
+  WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+  desc.label = MakeStringView("rex guest output effect");
+  desc.layout = chain.pipeline_layout;
+  desc.vertex.module = chain.vertex_module;
+  desc.vertex.entryPoint = MakeStringView("main");
+  desc.primitive.topology = WGPUPrimitiveTopology_TriangleStrip;
+  desc.primitive.cullMode = WGPUCullMode_None;
+  desc.multisample.count = 1;
+  desc.fragment = &fragment;
+  WGPURenderPipeline render_pipeline = wgpuDeviceCreateRenderPipeline(device_.device(), &desc);
+  if (!render_pipeline) {
+    REXWGPU_ERROR("WebGPUPresenter: guest output effect {} pipeline creation failed (format {})",
+                  uint32_t(effect), uint32_t(format));
+    return nullptr;
+  }
+  chain.pipelines.push_back({effect, format, render_pipeline});
+  return render_pipeline;
+}
+
+bool WebGPUPresenter::EncodeEffect(WGPURenderPassEncoder pass, const GuestOutputPaintFlow& flow,
+                                   size_t effect_index, const GuestOutputPaintConfig& config,
+                                   WGPUTextureView source, WGPUTextureFormat target_format,
+                                   uint32_t target_width, uint32_t target_height) {
+  EffectChain& chain = effect_chain_;
+  GuestOutputPaintEffect effect = flow.effects[effect_index];
+  WGPURenderPipeline pipeline = GetEffectPipeline(effect, target_format);
+  if (!pipeline || !source || !target_width || !target_height) {
+    return false;
+  }
+
+  // The Vulkan push constants: the rectangle (vertex shader) at 0, the effect
+  // constants (pixel shader) from 16.
+  struct Constants {
+    float rect[4];
+    uint8_t effect[32];
+  } constants = {};
+  int32_t rect_x, rect_y;
+  flow.GetEffectOutputOffset(effect_index, rect_x, rect_y);
+  const std::pair<uint32_t, uint32_t>& rect_size = flow.effect_output_sizes[effect_index];
+  float x_to_ndc = 2.0f / float(target_width);
+  float y_to_ndc = 2.0f / float(target_height);
+  // WebGPU NDC Y points up (Vulkan: down), so the strip goes from the top edge
+  // downwards. The pixel shaders work from the pixel position, not from
+  // interpolants, so only the covered pixels matter.
+  constants.rect[0] = -1.0f + float(rect_x) * x_to_ndc;
+  constants.rect[1] = 1.0f - float(rect_y) * y_to_ndc;
+  constants.rect[2] = float(rect_size.first) * x_to_ndc;
+  constants.rect[3] = -float(rect_size.second) * y_to_ndc;
+  auto put = [&constants](const auto& effect_constants) {
+    static_assert(sizeof(effect_constants) <= sizeof(constants.effect));
+    std::memcpy(constants.effect, &effect_constants, sizeof(effect_constants));
+  };
+  switch (effect) {
+    case GuestOutputPaintEffect::kBilinear:
+    case GuestOutputPaintEffect::kBilinearDither: {
+      BilinearConstants effect_constants;
+      effect_constants.Initialize(flow, effect_index);
+      put(effect_constants);
+    } break;
+    case GuestOutputPaintEffect::kCasSharpen:
+    case GuestOutputPaintEffect::kCasSharpenDither: {
+      CasSharpenConstants effect_constants;
+      effect_constants.Initialize(flow, effect_index, config);
+      put(effect_constants);
+    } break;
+    case GuestOutputPaintEffect::kCasResample:
+    case GuestOutputPaintEffect::kCasResampleDither: {
+      CasResampleConstants effect_constants;
+      effect_constants.Initialize(flow, effect_index, config);
+      put(effect_constants);
+    } break;
+    case GuestOutputPaintEffect::kFsrEasu: {
+      FsrEasuConstants effect_constants;
+      effect_constants.Initialize(flow, effect_index);
+      put(effect_constants);
+    } break;
+    case GuestOutputPaintEffect::kFsrRcas:
+    case GuestOutputPaintEffect::kFsrRcasDither: {
+      FsrRcasConstants effect_constants;
+      effect_constants.Initialize(flow, effect_index, config);
+      put(effect_constants);
+    } break;
+    default:
+      return false;
+  }
+  // Distinct slots for the passes of one submission (at most
+  // kMaxGuestOutputPaintEffects); writes for later submissions are ordered
+  // after the earlier ones by the queue.
+  uint64_t slot_offset = uint64_t(chain.uniform_slot) * EffectChain::kUniformSlotSize;
+  chain.uniform_slot = (chain.uniform_slot + 1) % EffectChain::kUniformSlotCount;
+  wgpuQueueWriteBuffer(device_.queue(), chain.uniform_buffer, slot_offset, &constants,
+                       sizeof(constants));
+
+  WGPUBindGroupEntry source_entries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+  source_entries[0].binding = 0;
+  source_entries[0].textureView = source;
+  source_entries[1].binding = 1;
+  source_entries[1].sampler = chain.sampler;
+  WGPUBindGroupDescriptor source_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+  source_desc.layout = chain.source_layout;
+  source_desc.entryCount = 2;
+  source_desc.entries = source_entries;
+  WGPUBindGroup source_group = wgpuDeviceCreateBindGroup(device_.device(), &source_desc);
+  WGPUBindGroupEntry constants_entry = WGPU_BIND_GROUP_ENTRY_INIT;
+  constants_entry.binding = 0;
+  constants_entry.buffer = chain.uniform_buffer;
+  constants_entry.offset = slot_offset;
+  constants_entry.size = sizeof(constants);
+  WGPUBindGroupDescriptor constants_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+  constants_desc.layout = chain.constants_layout;
+  constants_desc.entryCount = 1;
+  constants_desc.entries = &constants_entry;
+  WGPUBindGroup constants_group = wgpuDeviceCreateBindGroup(device_.device(), &constants_desc);
+  if (source_group && constants_group) {
+    wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, source_group, 0, nullptr);
+    wgpuRenderPassEncoderSetBindGroup(pass, 1, constants_group, 0, nullptr);
+    wgpuRenderPassEncoderSetViewport(pass, 0.0f, 0.0f, float(target_width), float(target_height),
+                                     0.0f, 1.0f);
+    wgpuRenderPassEncoderSetScissorRect(pass, 0, 0, target_width, target_height);
+    wgpuRenderPassEncoderDraw(pass, 4, 1, 0, 0);
+  }
+  if (source_group) {
+    wgpuBindGroupRelease(source_group);
+  }
+  if (constants_group) {
+    wgpuBindGroupRelease(constants_group);
+  }
+  return source_group && constants_group;
 }
 
 void WebGPUPresenter::ReleaseGuestOutputImage(GuestOutputImage& image) {

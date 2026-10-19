@@ -243,7 +243,11 @@ bool WebGPUPresentPass::EncodeClearAndBlit(WGPUCommandEncoder encoder, WGPUTextu
   int64_t y0 = std::max<int64_t>(frame.dest_y, 0);
   int64_t x1 = std::min<int64_t>(int64_t(frame.dest_x) + frame.dest_width, target_width);
   int64_t y1 = std::min<int64_t>(int64_t(frame.dest_y) + frame.dest_height, target_height);
-  bool draw_source = frame.source && frame.dest_width && frame.dest_height && x1 > x0 && y1 > y0;
+  bool draw_source = !frame.final_draw && frame.source && frame.dest_width && frame.dest_height &&
+                     x1 > x0 && y1 > y0;
+  if (frame.pre_pass) {
+    frame.pre_pass(encoder);
+  }
 
   const Pipeline* pipeline = nullptr;
   WGPUBindGroup bind_group = nullptr;
@@ -306,7 +310,9 @@ bool WebGPUPresentPass::EncodeClearAndBlit(WGPUCommandEncoder encoder, WGPUTextu
   pass_desc.colorAttachmentCount = 1;
   pass_desc.colorAttachments = &color;
   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-  if (draw_source) {
+  if (frame.final_draw) {
+    frame.final_draw(pass, target_format, target_width, target_height);
+  } else if (draw_source) {
     wgpuRenderPassEncoderSetPipeline(pass, pipeline->pipeline);
     wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, nullptr);
     wgpuRenderPassEncoderSetViewport(pass, float(x0), float(y0), float(x1 - x0), float(y1 - y0),
