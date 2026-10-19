@@ -147,5 +147,11 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   DLC (STFS packages) on the server the same way, for example with xenia's or extract-xiso's extraction,
   and mount the result as an extra `HttpRangeDevice` root. A block-reader interface over HttpRangeDevice
   blocks (reusing its OPFS cache) would lift this.
-- **Draw resolution scaling** (`draw_resolution_scale_x/y`) is not supported on WebGPU. It runs at 1x
-  only.
+- **Draw resolution scaling** (`draw_resolution_scale_x/y`, URL `arg=--draw_resolution_scale_x=2&arg=--draw_resolution_scale_y=2`)
+  works on WebGPU (tested at 2x2 with the Halo 3 riverworld film: no WebGPU errors, paused film frames within 38-49 dB PSNR of the 1x frames).
+  Limits compared to the desktop backends: resolved data is kept at the scaled resolution in "scaled
+  resolve windows" of guest memory (64 MiB of GPU memory per 8 MiB guest range at 2x2, 144 MiB at 3x3,
+  halved to fit `maxStorageBufferBindingSize`, created on first use); a resolve that does not fit one
+  window falls back to 1x for that range (the texture is then read at guest resolution). Block-compressed
+  textures loaded from guest memory stay 1x (only resolved render targets are scaled), and trace playback
+  does not restore the EDRAM snapshot when scaled. GPU and wasm memory grow with the scale; 3x3 is untested.
