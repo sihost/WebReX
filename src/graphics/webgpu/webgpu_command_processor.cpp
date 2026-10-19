@@ -1474,8 +1474,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     polygon_log_depth_bias = pipelines.draws_depth_bias;
   }
 #ifdef __EMSCRIPTEN__
-  // Running out of a fixed-size wasm memory aborts the tab: warn once when the heap break comes
-  // within 512 MiB of the maximum memory size.
+  // Running out of wasm memory aborts the tab (rex_web_pre.js reports it as out of memory): warn
+  // once when the heap break comes within 512 MiB of the maximum memory size (the growth limit,
+  // or the fixed size).
   static bool heap_headroom_warned = false;
   if (!heap_headroom_warned) {
     uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
@@ -1484,8 +1485,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       heap_headroom_warned = true;
       REXGPU_WARN(
           "WebGPU: swap #{} memory: heap break {} MiB is within 512 MiB of the {} MiB maximum "
-          "wasm memory; an allocation past it aborts the tab (raise INITIAL_MEMORY / "
-          "MAXIMUM_MEMORY)",
+          "wasm memory; an allocation past it aborts the tab (raise rexglue_configure_target "
+          "WEB_MAXIMUM_MEMORY / REXGLUE_WEB_MAXIMUM_MEMORY)",
           swap_index, heap_break >> 20, heap_max >> 20);
     }
   }

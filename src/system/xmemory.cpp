@@ -39,7 +39,8 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
 #if REX_PLATFORM_WEB
-#include <unistd.h>  // sbrk
+#include <emscripten/heap.h>  // emscripten_get_heap_size / _max
+#include <unistd.h>          // sbrk
 #endif
 
 namespace rex::memory {
@@ -254,6 +255,13 @@ bool Memory::Initialize() {
     rex::memory::g_web_physical_host_base = physical_membase_;
     REXSYS_INFO("Guest window (layout B) at {} size {:X}, physical at +{:X}",
                 fmt::ptr(virtual_membase_), window_bytes, fold::kPhysOffset);
+    // The wasm memory configuration (rexglue_configure_target WEB_INITIAL_MEMORY /
+    // WEB_MAXIMUM_MEMORY): current size (grows on demand when below the maximum) and limit.
+    const uint64_t heap_size = uint64_t(emscripten_get_heap_size());
+    const uint64_t heap_max = uint64_t(emscripten_get_heap_max());
+    REXSYS_INFO("Wasm memory: {} MiB now, {} (max {} MiB); heap break {} MiB after the window",
+                heap_size >> 20, heap_max > heap_size ? "growable" : "fixed size", heap_max >> 20,
+                uint64_t(reinterpret_cast<uintptr_t>(sbrk(0))) >> 20);
   }
 #else
   // Create main page file-backed mapping. This is all reserved but
