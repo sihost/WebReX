@@ -13,6 +13,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/heap.h>
+#include <malloc.h>
 #include <unistd.h>
 #endif
 
@@ -1418,11 +1419,35 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         statistics_.pipeline_wait_ms);
 #ifdef __EMSCRIPTEN__
     // The malloc heap's break never moves down, so it is the peak of host heap plus guest window.
+    // mallinfo: bytes in use by malloc now (guest window, thread stacks and host heap) and free
+    // bytes inside the break (fragmentation / freed peaks).
     uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
-    REXGPU_INFO("WebGPU: swap #{} memory: heap break {} MiB of {} MiB wasm memory", swap_index,
-                heap_break >> 20, uint64_t(emscripten_get_heap_size()) >> 20);
+    struct mallinfo heap_info = mallinfo();
+    REXGPU_INFO(
+        "WebGPU: swap #{} memory: heap break {} MiB of {} MiB wasm memory (max {} MiB), malloc "
+        "in use {} MiB, free below the break {} MiB",
+        swap_index, heap_break >> 20, uint64_t(emscripten_get_heap_size()) >> 20,
+        uint64_t(emscripten_get_heap_max()) >> 20, uint64_t(size_t(heap_info.uordblks)) >> 20,
+        uint64_t(size_t(heap_info.fordblks)) >> 20);
 #endif
   }
+#ifdef __EMSCRIPTEN__
+  // Running out of a fixed-size wasm memory aborts the tab: warn once when the heap break comes
+  // within 512 MiB of the maximum memory size.
+  static bool heap_headroom_warned = false;
+  if (!heap_headroom_warned) {
+    uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
+    uint64_t heap_max = uint64_t(emscripten_get_heap_max());
+    if (heap_break + (uint64_t(512) << 20) > heap_max) {
+      heap_headroom_warned = true;
+      REXGPU_WARN(
+          "WebGPU: swap #{} memory: heap break {} MiB is within 512 MiB of the {} MiB maximum "
+          "wasm memory; an allocation past it aborts the tab (raise INITIAL_MEMORY / "
+          "MAXIMUM_MEMORY)",
+          swap_index, heap_break >> 20, heap_max >> 20);
+    }
+  }
+#endif
 }
 
 void WebGPUCommandProcessor::WaitForPipeline(PipelineId pipeline) {
