@@ -118,7 +118,7 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
 | `texture-compression-bc-sliced-3d` | 3D BC textures decompressed | `--webgpu_texture_bc_sliced_3d=false` |
 | `texture-formats-tier1` | 8_8_8_8_GAMMA render targets stored as rgba8 with PWL gamma in the shaders: blending happens in gamma space | `--gamma_render_target_as_unorm16=false` |
 | `float32-filterable` | 32-bit float textures sampled nearest | `--webgpu_float32_filterable=false` |
-| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (so far it changes only the report line; the pipeline cache does not read it yet) |
+| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (the pipeline cache then translates vertex shaders without user clip distances; the WGSL storage directory differs) |
 | `depth-clip-control` | depth clipping cannot be turned off (`clip_disable`) | — |
 | `depth32float-stencil8` | D24FS8 depth stored in depth24plus | — |
 | `texture-component-swizzle` | swizzles applied in shaders (same result) | `--webgpu_texture_component_swizzle=false` |
