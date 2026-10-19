@@ -52,6 +52,18 @@ void WebGamepadInputDriver::LogPadEvents() {
                       e.browser_index, e.id, PadLayoutName(e.layout));
         }
         break;
+      case PadEvent::kMirror:
+        REXLOG_INFO(
+            "web gamepad: navigator pad {} has the same id as pad {} (\"{}\"): treated as the "
+            "same controller listed twice, no XInput user while their input is identical",
+            e.browser_index, e.twin, e.id);
+        break;
+      case PadEvent::kIndependent:
+        REXLOG_INFO(
+            "web gamepad: navigator pad {} differs from pad {} (same id \"{}\"): a separate "
+            "controller, gets an XInput user",
+            e.browser_index, e.twin, e.id);
+        break;
     }
   }
 }
