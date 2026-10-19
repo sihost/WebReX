@@ -8,13 +8,16 @@
  * origin, then open /http_range_bench.html (tests/web/run_in_chrome.mjs --url ... --done
  * "BENCH DONE"). Query: ?file=<manifest path suffix> (default zanzibar.map), ?mib=<MiB per
  * workload> (default 16), ?sw=1 registers /sw.js first (the Halo page's service worker) so
- * the requests go through it. Every (config, workload) pair reads its own region of the file,
- * so no run is served from a cache an earlier one filled. Memory cache only (no OPFS).
+ * the requests go through it, ?config=<index> runs one configuration only. Every (config,
+ * workload) pair reads its own region of the file, so no run is served from a cache an earlier
+ * one filled; with the service worker (it reads up to 16 MiB ahead into its Cache API store) run
+ * each config in a fresh browser profile with ?config=. Memory cache only (no OPFS).
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <emscripten/em_asm.h>
 #include <emscripten/em_js.h>
 
 #include <chrono>
@@ -28,17 +31,26 @@ using rex::filesystem::HttpRangeDevice;
 using rex::filesystem::HttpRangeDeviceOptions;
 using Clock = std::chrono::steady_clock;
 
-// clang-format off
-EM_JS(double, bench_query_number, (double name_ptr, double fallback), {
-  var v = new URLSearchParams(location.search).get(UTF8ToString(name_ptr));
-  return v === null ? fallback : Number(v);
-});
-EM_JS(void, bench_query_string, (double name_ptr, double dst, double cap), {
-  var v = new URLSearchParams(location.search).get(UTF8ToString(name_ptr)) || "";
-  stringToUTF8(v, dst, cap);
-});
-// clang-format on
 EM_JS_DEPS(http_range_bench, "$UTF8ToString,$stringToUTF8");
+
+// main() runs on a pthread (PROXY_TO_PTHREAD), whose `location` is the Worker script's: read
+// the page's query string on the browser main thread.
+double bench_query_number(double name_ptr, double fallback) {
+  return MAIN_THREAD_EM_ASM_DOUBLE(
+      {
+        var v = new URLSearchParams(location.search).get(UTF8ToString($0));
+        return v === null ? $1 : Number(v);
+      },
+      name_ptr, fallback);
+}
+void bench_query_string(double name_ptr, double dst, double cap) {
+  MAIN_THREAD_EM_ASM(
+      {
+        var v = new URLSearchParams(location.search).get(UTF8ToString($0)) || "";
+        stringToUTF8(v, $1, $2);
+      },
+      name_ptr, dst, cap);
+}
 
 namespace {
 
@@ -64,6 +76,7 @@ struct Config {
 int main() {
   const std::string want = ArgString("file", "zanzibar.map");
   const uint64_t region = uint64_t(Arg("mib", 16)) << 20;
+  const int only = int(Arg("config", -1));
   const Config configs[] = {
       {"serial (before)", 0, 0},
       {"pool 2, ahead 4", 2, 4},
@@ -79,6 +92,7 @@ int main() {
 
   uint64_t next_region = 0;
   for (const Config& c : configs) {
+    if (only >= 0 && &c != &configs[only]) continue;
     HttpRangeDeviceOptions o;
     o.fetch_threads = c.threads;
     o.read_ahead_blocks = c.ahead;
