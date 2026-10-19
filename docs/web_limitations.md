@@ -149,3 +149,46 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   blocks (reusing its OPFS cache) would lift this.
 - **Draw resolution scaling** (`draw_resolution_scale_x/y`) is not supported on WebGPU. It runs at 1x
   only.
+
+## Origin storage
+
+Everything a title keeps in the browser shares one origin quota: the page's service worker chunk store
+(Cache Storage, `web/sw.js` in the game repos: every 2 MiB chunk of `/data/` it serves), the OPFS block
+cache of `HttpRangeDevice` (`/opfs/rex-cache/<sha256>.data`), the WGSL shader storage
+(`/opfs/rex-cache/shaders`) and the saves (`xstorage:`, profiles). The console line
+`[storage] usage ... (OPFS ..., Cache Storage ..., IndexedDB ... MiB) of ... MiB quota` shows the split.
+
+- **Game data is stored once.** When the service worker answers the data reads (its responses carry
+  `X-<title>-SW: 1`), the OPFS block cache only serves what it already holds and stores nothing new
+  (`--vfs_cache_skip_with_service_worker`, default on). Before, every block was kept twice.
+- **Chrome does not report its real quota.** With the StaticStorageQuota feature (Chrome 155),
+  `navigator.storage.estimate()` reports usage + 10 GiB, whatever the real limit is. The SDK recognizes that
+  (`[storage] ... (Chrome static quota: usage + 10 GiB, real limit unknown)`). The real limit then only shows
+  as a failing write (`out of storage space (Chrome FILE_ERROR_NO_SPACE)`), and the block cache keeps below
+  the size that fit. A real quota, such as DevTools' custom quota or gate1 `--quota`, is respected: the cache
+  budget is the quota minus everything else in the origin minus `--vfs_cache_reserve_mb` (256 MiB for saves).
+- **A full cache does not thrash.** New blocks only evict cache files not used in the last
+  `--vfs_cache_protect_s` (120 s), with some headroom. A write that would take half the budget is skipped.
+  The `.data` files are not sparse, so a block deep in a big file costs everything before it. Skipped
+  blocks stay memory-only and are downloaded again when they are needed. Saves under storage pressure may
+  still evict anything.
+- **Persistent storage.** Titles call `RequestPersistentStorage()`. Chrome decides without a prompt.
+  It usually answers `denied` for a site that has no engagement or install yet, so the origin stays
+  best-effort. Firefox shows a prompt at the first click or key.
+
+## Browsers
+
+Chromium is the target. Firefox (158 on Windows) runs the games with 0 WebGPU errors, but slower.
+
+- **Pipeline creation is serialized in Firefox's GPU process.** `createRenderPipelineAsync` compiles
+  synchronously there. Every later queue operation (`submit`, `onSubmittedWorkDone`, present) waits for all
+  pipelines created before it. Measured with the games' WGSL (`C:\rex\b\wx-stor-ff\bench.html`): 20
+  vertex pipelines take 5.5 s in Firefox and 6.3 s in Chrome. A submit issued after a burst of 10 completes
+  after 890-1610 ms in Firefox, the time of the whole burst, and after 140 ms in Chrome. A map's few
+  hundred pipelines therefore froze Firefox for minutes ("submission N not completed after 10 s").
+  `--webgpu_pipeline_creations_in_flight` (auto = 1 on Firefox) now keeps one creation outstanding, so
+  frames are submitted between compiles. The first minutes of a map still run slowly in Firefox while its
+  pipelines compile one by one, and each costs 0.05-1.3 s depending on its WGSL size. Firefox has no
+  pipeline cache across sessions, so every session pays this again.
+- **`onSubmittedWorkDone` on an idle queue resolves after ~100 ms in Firefox** (its poll interval). It
+  takes about 17 ms when submits keep coming.
