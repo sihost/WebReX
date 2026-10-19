@@ -24,8 +24,18 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
-                    "Execute unclipped draw vertex shader on CPU");
+// Default true, as in Xenia (the original definition is kept below). With false, every unclipped
+// draw with the Direct3D 9 8192x8192 scissor is taken to cover up to the whole EDRAM, so on the host
+// render target path (D3D12/Vulkan RTV, WebGPU) the render target it binds takes ownership of the
+// EDRAM of all others, wrapping around. MW2 issues such a draw (a depth/stencil-only 3-vertex
+// rectangle) right before each resolve: the depth buffer at tile 0x431 claimed the 2x MSAA color
+// buffer at 0x62, its color went through a lossy color -> D24FS8 ownership transfer and the resolve
+// read the depth render target, so the 3D world resolved to black (ROV was unaffected).
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+                    "Execute the vertex shader of unclipped draws without a scissor (such as "
+                    "screen-space clears) on the CPU to estimate the EDRAM extent they use; "
+                    "otherwise the host render target path may consider the whole EDRAM used "
+                    "and corrupt other render targets with ownership transfers");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
                     "Execute unclipped draw VS on CPU with scissor");
