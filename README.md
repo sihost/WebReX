@@ -47,7 +47,7 @@ Tested with a full recompiled retail game in Chrome on Windows:
 - settings and profiles survive a page reload
 - two browser tabs find each other, join one system-link lobby and play the same match
 - a hidden tab keeps running at full speed, with clean audio
-- frames match the native D3D12 build at fixed game ticks (about 36–40 dB PSNR)
+- frames match the native D3D12 build at fixed game ticks of a saved film (about 38–40 dB PSNR for most of the film, 35–37 dB on a cold first boot, 32 dB at the last tick)
 - saved films play back and closely match native (some draws still skipped, see below)
 
 Occlusion queries need no host emulation: titles that end a query at a different address than
@@ -65,6 +65,7 @@ they begin it get the same fixed results natively.
 | Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only); suspend/terminate are cooperative (kernel exports are safe points) |
 | Audio | ~90 ms output latency on a busy CPU (adaptive, lower when idle) |
 | Page | Chrome's Memory Saver can discard an inactive tab that plays no audio; the page is only told on the next load (`rexOnDiscarded`) |
+| Storage | Chrome 155+ (`StaticStorageQuota`) makes `navigator.storage.estimate()` report usage + 10 GiB whatever the real quota is, so the runtime only learns about a small quota when an OPFS write fails; the block cache then evicts and retries. Data outside OPFS counts against the same quota |
 | Network | System link only (no Xbox Live) |
 | Input | Browsers expose a gamepad only after a button press; rumble depends on the browser's `vibrationActuator` |
 
