@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -481,13 +482,16 @@ bool OnMouseDown(int, const EmscriptenMouseEvent* e, void*) {
     CanvasPosition(e, &ev.x, &ev.y);
     Forward(ev);
   }
-  // An ImGui overlay window owning the mouse gets plain clicks (no lock request).
-  if (REXCVAR_GET(web_pointer_lock) && !g_pointer_locked.load(std::memory_order_relaxed) &&
-      !rex::ui::web::UIWantsPointer()) {
-    // Inside a user gesture: the browser allows the lock request here. The click
-    // that acquires the lock is not a game input (it would otherwise fire).
-    rexinput_request_pointer_lock(double(uintptr_t(g_canvas_selector)),
-                                  REXCVAR_GET(web_pointer_lock_raw) ? 1 : 0);
+  if (REXCVAR_GET(web_pointer_lock) && !g_pointer_locked.load(std::memory_order_relaxed)) {
+    // An ImGui overlay window owning the mouse gets plain clicks (no lock request).
+    if (!rex::ui::web::UIWantsPointer()) {
+      // Inside a user gesture: the browser allows the lock request here.
+      rexinput_request_pointer_lock(double(uintptr_t(g_canvas_selector)),
+                                    REXCVAR_GET(web_pointer_lock_raw) ? 1 : 0);
+    }
+    // Mouse buttons are game input only while the pointer is locked (like mouse look):
+    // the click that acquires the lock, clicks on the overlay and clicks synthesized
+    // by controller-to-mouse tools before the lock would otherwise fire.
     if (REXCVAR_GET(web_mouse_look_requires_pointer_lock) && e->button < 32) {
       g_swallowed_buttons |= 1u << e->button;
       return true;
@@ -551,6 +555,13 @@ bool OnPointerLockChange(int, const EmscriptenPointerlockChangeEvent* e, void*) 
   g_pointer_locked.store(e->isActive, std::memory_order_release);
   g_mouse_dx.store(0, std::memory_order_relaxed);  // no spike on lock start/end
   g_mouse_dy.store(0, std::memory_order_relaxed);
+  if (!e->isActive && REXCVAR_GET(web_mouse_look_requires_pointer_lock)) {
+    // Lock lost (Esc, alt-tab): no mouse button stays held in the game; their releases
+    // may land outside the page.
+    for (unsigned short b = 0; b < 5; ++b) {
+      SetKey(MouseButtonVk(b), false);
+    }
+  }
   return false;
 }
 
@@ -648,6 +659,15 @@ struct BrowserPad {
   char id[64] = {};
   uint64_t w0 = 0;
   uint32_t rxry = 0;
+  bool active = false;  // in use at the last poll
+  // Duplicate entries: Chrome can list one physical device twice (e.g. a DualShock 4 at
+  // navigator indexes 0 and 2 with the same id: two HID paths, or a helper driver). A pad
+  // with the same id and layout as a lower-indexed one (its twin) is not given an XInput
+  // user while it mirrors the twin; it becomes independent once the two have differed
+  // for kIndependentMs while one of them was in use (a second identical controller).
+  int8_t twin = -1;
+  bool independent = false;
+  double differ_since = -1.0;
 };
 BrowserPad g_bpads[kMaxBrowserGamepads];
 int8_t g_user_pad[kMaxGamepads] = {-1, -1, -1, -1};  // producer-private
@@ -659,7 +679,7 @@ PadEvent g_pad_events[kPadEventRing];
 std::atomic<uint32_t> g_pad_event_head{0};
 std::atomic<uint32_t> g_pad_event_tail{0};
 
-void PushPadEvent(PadEvent::Kind kind, int browser_index, int user) {
+void PushPadEvent(PadEvent::Kind kind, int browser_index, int user, int twin = -1) {
   uint32_t head = g_pad_event_head.load(std::memory_order_relaxed);
   if (head - g_pad_event_tail.load(std::memory_order_acquire) >= kPadEventRing) {
     return;  // nobody is draining (no guest input calls yet); drop
@@ -669,6 +689,7 @@ void PushPadEvent(PadEvent::Kind kind, int browser_index, int user) {
   e.kind = kind;
   e.browser_index = int8_t(browser_index);
   e.user = int8_t(user);
+  e.twin = int8_t(twin);
   if (browser_index >= 0) {
     const BrowserPad& p = g_bpads[browser_index];
     e.layout = p.layout;
@@ -890,6 +911,64 @@ void PublishPad(uint32_t slot, bool connected, uint64_t w0, uint32_t rxry) {
 
 EmscriptenGamepadEvent g_pad_event;  // ~1.3 KB, main thread only
 
+constexpr double kIndependentMs = 100.0;
+
+// Same controls within noise (two paths of one device can quantize analog values apart).
+bool SamePadState(const BrowserPad& a, const BrowserPad& b) {
+  if (uint16_t(a.w0) != uint16_t(b.w0)) return false;
+  auto near8 = [](uint64_t x, uint64_t y, int shift) {
+    return std::abs(int(uint8_t(x >> shift)) - int(uint8_t(y >> shift))) <= 8;
+  };
+  auto near16 = [](uint64_t x, uint64_t y, int shift) {
+    return std::abs(int(int16_t(uint16_t(x >> shift))) - int(int16_t(uint16_t(y >> shift)))) <=
+           2048;
+  };
+  return near8(a.w0, b.w0, 16) && near8(a.w0, b.w0, 24) && near16(a.w0, b.w0, 32) &&
+         near16(a.w0, b.w0, 48) && near16(a.rxry, b.rxry, 0) && near16(a.rxry, b.rxry, 16);
+}
+
+bool SameDevice(const BrowserPad& a, const BrowserPad& b) {
+  return a.layout == b.layout && a.vendor == b.vendor && a.product == b.product &&
+         std::strcmp(a.id, b.id) == 0;
+}
+
+// Pairs every present pad with its lowest-indexed twin and decides whether it mirrors it.
+void UpdateTwins(const bool (&seen)[kMaxBrowserGamepads], double now) {
+  for (int i = 0; i < kMaxBrowserGamepads; ++i) {
+    if (!seen[i]) continue;
+    BrowserPad& p = g_bpads[i];
+    int twin = -1;
+    for (int j = 0; j < i; ++j) {
+      if (seen[j] && SameDevice(g_bpads[j], p)) {
+        twin = j;
+        break;
+      }
+    }
+    if (twin != p.twin) {
+      p.twin = int8_t(twin);
+      p.independent = false;
+      p.differ_since = -1.0;
+      if (twin >= 0) PushPadEvent(PadEvent::kMirror, i, -1, twin);
+    }
+    if (twin < 0 || p.independent) continue;
+    const BrowserPad& t = g_bpads[twin];
+    if ((p.active || t.active) && !SamePadState(p, t)) {
+      if (p.differ_since < 0.0) {
+        p.differ_since = now;
+      } else if (now - p.differ_since >= kIndependentMs) {
+        p.independent = true;
+        PushPadEvent(PadEvent::kIndependent, i, -1, twin);
+      }
+    } else {
+      p.differ_since = -1.0;
+    }
+  }
+}
+
+bool IsMirror(const BrowserPad& p) {
+  return p.twin >= 0 && !p.independent;
+}
+
 // XInput user order: pads that have been used (in the order they were first used),
 // then the standard-mapped ones, then the rest, by browser index. So an idle or
 // phantom device in navigator.getGamepads()[0] (a second controller, a virtual pad,
@@ -904,7 +983,7 @@ bool PadBefore(int a, int b) {
   return a < b;
 }
 
-bool PollGamepads(double, void*) {
+bool PollGamepads(double now, void*) {
   const uint32_t poll = g_gamepad_polls.fetch_add(1, std::memory_order_relaxed) + 1;
   bool seen[kMaxBrowserGamepads] = {};
   if (emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS) {
@@ -924,12 +1003,14 @@ bool PollGamepads(double, void*) {
         PushPadEvent(PadEvent::kConnected, i, -1);
       }
       seen[i] = true;
-      if (ReadBrowserPad(p, ev) && !p.has_input) {
+      p.active = ReadBrowserPad(p, ev);
+      if (p.active && !p.has_input) {
         p.has_input = true;
         p.first_input = poll;
       }
     }
   }
+  UpdateTwins(seen, now);
   int order[kMaxBrowserGamepads];
   int n = 0;
   for (int i = 0; i < kMaxBrowserGamepads; ++i) {
@@ -937,7 +1018,7 @@ bool PollGamepads(double, void*) {
       PushPadEvent(PadEvent::kDisconnected, i, -1);
       g_bpads[i].present = false;
     }
-    if (g_bpads[i].present) {
+    if (g_bpads[i].present && !IsMirror(g_bpads[i])) {
       int j = n++;
       for (; j > 0 && PadBefore(i, order[j - 1]); --j) order[j] = order[j - 1];
       order[j] = i;

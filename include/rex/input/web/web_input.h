@@ -27,7 +27,10 @@
  * slots: pads that have been used (button, trigger or stick), in the order of their
  * first use, then standard-mapped pads, then by browser index. So an idle second
  * device or virtual pad at navigator index 0 no longer takes user 0 from the pad being
- * played with. Connect/disconnect/assignment events are queued for the consumer to log
+ * played with. A navigator entry with the same id and layout as a lower-indexed one
+ * (Chrome listing one physical controller twice) gets no user while its state mirrors
+ * that twin; it is treated as a separate controller once the two differ for 100 ms
+ * while one of them is in use. Connect/disconnect/assignment events are queued for the consumer to log
  * (PopPadEvent; the web gamepad driver logs them).
  * Browsers expose a gamepad to a page only after one of its buttons is pressed while
  * the page is visible (Firefox: and focused), so a player has to press a button once
@@ -74,10 +77,13 @@ struct PadEvent {
     kConnected = 0,     // browser_index: layout, ids and axes below
     kDisconnected = 1,  // browser_index
     kAssigned = 2,      // XInput user now reads browser_index (-1: none)
+    kMirror = 3,        // browser_index has the same id as twin: no user while it mirrors it
+    kIndependent = 4,   // browser_index differs from its twin: a separate device after all
   };
   Kind kind = kConnected;
   int8_t browser_index = -1;
   int8_t user = -1;
+  int8_t twin = -1;
   uint8_t layout = 0;
   uint16_t vendor = 0, product = 0;
   int8_t lt_axis = -1, rt_axis = -1, rx_axis = -1, ry_axis = -1, hat_axis = -1;
