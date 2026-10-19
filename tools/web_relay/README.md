@@ -123,6 +123,30 @@ WebSockets (Cloudflare after 100 s). The relay sends a WebSocket ping frame to e
 need no code for it. A peer from which nothing at all arrived for `--idle-timeout-ms` (half-open
 TCP: network gone, machine asleep) is closed with 1001 and the others get its `leave`.
 
+## Peer-to-peer (WebRTC data path)
+
+The SDK shim (`net_relay.js`) also tries a direct WebRTC DataChannel (negotiated id 0, unordered,
+`maxRetransmits: 0`) to every peer that runs the same code. The relay carries the signalling as
+ordinary datagrams: `dst` = the peer, `port` 0, shim header src port 0 and proto `0x50`, JSON payload
+(`hello`, `offer`/`answer` with the full SDP, late `ice` candidates, `bye`, RTT probes `pq`/`pr`). Relays
+need no change (this one, Halo 3's and MW2's servers forward them as datagrams), and older clients drop
+them (no socket on port 0). The channel carries the same frames as the WebSocket; the receiver sets
+`src` to the channel's peer, so the guest's virtual LAN is unchanged. Per peer, datagrams use the
+channel while it is open and answers probes, else the relay; a broadcast goes over each open channel
+and as relay unicast to the peers without one. A failed attempt is retried with backoff (2 s doubling to
+60 s); nothing waits for it. `Module.rexNet.stats().p2p` shows per peer the path, the candidate types
+and probe RTT on both paths (p50/p95/p99); the page logs a summary every 30 s.
+
+Options: page `?p2p=0` (off), `?p2p_ice=stun:host:port[,...]`, `?p2p_probe_ms=N`, `?p2p_debug=1`;
+`Module.rexNetOptions = {p2p, iceServers, probeMs, statsLogMs}`; relay `--no-p2p` (welcome `p2p:false`)
+and `--ice-server` (used when the page sets none). Without ICE servers only host candidates exist
+(same LAN). Chrome hides LAN addresses behind mDNS names, and a host firewall without an inbound rule
+for the browser blocks unsolicited UDP; then the channel may not open (seen between two tabs on one
+Windows PC) and the peers stay on the relay.
+
+Test without a game: `node tools/web_relay/test/p2p_browser.mjs [--latency MS[:J]] [--count N]`
+(Playwright; two Chrome contexts on a fake heap plus an old-style client; per-datagram echo RTT).
+
 ## Hardening
 
 For a relay on the public internet:
