@@ -112,6 +112,8 @@ XThread::~XThread() {
 }
 
 thread_local XThread* current_xthread_tls_ = nullptr;
+// Web: a fiber (KeSetCurrentStackPointers) runs on its own pthread; it is still this XThread.
+REX_FIBER_INHERITED_TLS(current_xthread_tls_);
 
 bool XThread::IsInThread() {
   return current_xthread_tls_ != nullptr;

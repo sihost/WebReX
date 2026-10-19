@@ -28,6 +28,7 @@
 #include <rex/ppc/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread/safe_point.h>
 #include <rex/types.h>
 
 namespace rex {
@@ -618,14 +619,27 @@ void StartKernelCallTrace();
 // Hook a PPC function name to a native C++ function
 #define PPC_HOOK(subroutine, function)                     \
   extern "C" PPC_FUNC(subroutine) {                        \
+    PPC_HOOK_BODY(subroutine, function)                    \
+  }
+
+// Kernel (xboxkrnl/xam) export thunk: also a cooperative suspend/terminate safe point on the
+// web (rex/thread/safe_point.h: one relaxed load of a global counter, nothing natively), so a
+// guest thread that only calls the kernel without waiting can still be suspended/terminated.
+// rexcrt hooks (memcpy & co., far more frequent) use the plain PPC_HOOK.
+#define PPC_HOOK_SAFE_POINT(subroutine, function)          \
+  extern "C" PPC_FUNC(subroutine) {                        \
+    rex::thread::SafePoint();                              \
+    PPC_HOOK_BODY(subroutine, function)                    \
+  }
+
+#define PPC_HOOK_BODY(subroutine, function)                \
     if (rex::detail::g_kernel_call_trace) [[unlikely]] {   \
       rex::detail::KernelCallTraceEnter(#subroutine, ctx); \
       rex::HostToGuestFunction<function>(ctx, base);       \
       rex::detail::KernelCallTraceExit();                  \
     } else {                                               \
       rex::HostToGuestFunction<function>(ctx, base);       \
-    }                                                      \
-  }
+    }
 
 // Create a simple stub that does nothing
 #define PPC_STUB(subroutine)              \
@@ -659,7 +673,7 @@ constexpr size_t kExLoadedImageNameSize = 255 + 1;
 // Implemented function export: wraps PPC_HOOK for an xboxkrnl.exe export.
 // Usage: XBOXKRNL_EXPORT(__imp__FunctionName, handler_function)
 #define XBOXKRNL_EXPORT(name, function) \
-  PPC_HOOK(name, function)              \
+  PPC_HOOK_SAFE_POINT(name, function)   \
   static rex::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
 // Stub function export: wraps PPC_STUB for an xboxkrnl.exe export.
@@ -671,7 +685,7 @@ constexpr size_t kExLoadedImageNameSize = 255 + 1;
 // Implemented function export: wraps PPC_HOOK for a xam.xex export.
 // Usage: XAM_EXPORT(__imp__FunctionName, handler_function)
 #define XAM_EXPORT(name, function) \
-  PPC_HOOK(name, function)         \
+  PPC_HOOK_SAFE_POINT(name, function) \
   static rex::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
 // Stub function export: wraps PPC_STUB for a xam.xex export.

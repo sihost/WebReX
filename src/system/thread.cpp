@@ -11,10 +11,19 @@
 
 #include <rex/system/thread.h>
 #include <rex/system/thread_state.h>
+#include <rex/thread/fiber.h>
 
 namespace rex::runtime {
 
 thread_local Thread* Thread::current_thread_ = nullptr;
+
+namespace {
+// Web fibers run on their own pthreads (core/fiber_web.cpp): the current thread follows them.
+struct CurrentThreadSlot : Thread {
+  static Thread*& Get() { return current_thread_; }
+};
+REX_FIBER_INHERITED_TLS(CurrentThreadSlot::Get());
+}  // namespace
 
 Thread::Thread() {}
 Thread::~Thread() {}

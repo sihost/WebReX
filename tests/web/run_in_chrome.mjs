@@ -58,7 +58,11 @@ if (!url) {
   url = `http://127.0.0.1:${server.address().port}/${path.basename(opt.page)}`;
 }
 
-const browser = await chromium.launch({ channel: opt.channel, headless: !opt.headed });
+const browser = await chromium.launch({
+  channel: opt.channel,
+  headless: !opt.headed,
+  args: ['--no-proxy-server', '--no-first-run', '--no-default-browser-check'],
+});
 const page = await browser.newPage();
 const doneRe = new RegExp(opt.done);
 let code = 1;
@@ -78,7 +82,16 @@ const finished = new Promise((resolve) => {
     resolve();
   }, opt.seconds * 1000);
 });
-await page.goto(url);
+// Navigation to a local server occasionally times out on this machine: retry.
+for (let attempt = 1; ; attempt++) {
+  try {
+    await page.goto(url, { timeout: 20000 });
+    break;
+  } catch (e) {
+    if (attempt >= 4) throw e;
+    console.log(`[run_in_chrome] goto failed (${e.message.split('\n')[0]}), retrying`);
+  }
+}
 await finished;
 await browser.close();
 server?.close();

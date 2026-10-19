@@ -26,6 +26,7 @@
 
 #include <rex/platform.h>
 #include <rex/thread.h>
+#include <rex/thread/fiber.h>
 #include <rex/thread/safe_point.h>
 #include <rex/thread/thread_report.h>
 
@@ -122,6 +123,10 @@ struct ThreadControl {
 
 thread_local std::shared_ptr<ThreadControl> tls_control_ref;
 thread_local ThreadControl* tls_control = nullptr;
+// A fiber (fiber_web.cpp) runs on its own pthread but is the same rex::thread thread: waits,
+// suspend/terminate requests and Exit act on the logical thread's control block. Only the raw
+// pointer is carried; the owning reference stays with the thread's own pthread.
+REX_FIBER_INHERITED_TLS(tls_control);
 
 // Every control block ever created (kept alive; a few dozen per process), for the report.
 std::mutex g_registry_mutex;
@@ -1206,6 +1211,15 @@ Thread* Thread::GetCurrentThread() {
   }
   // Threads not created by Thread::Create (main thread etc.), or whose Thread object is gone.
   // Like the POSIX backend this wrapper is intentionally leaked.
+  if (tls_control_ref.get() != c) {
+    // A fiber pthread (fiber_web.cpp) carries only the raw control pointer: find its owner.
+    std::lock_guard<std::mutex> lock(g_registry_mutex);
+    for (const auto& control : *g_registry) {
+      if (control.get() == c) {
+        return new WebThread(control);
+      }
+    }
+  }
   return new WebThread(tls_control_ref);
 }
 

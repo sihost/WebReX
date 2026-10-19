@@ -20,6 +20,7 @@ em++ -std=c++23 %OPT% -m64 -pthread -fwasm-exceptions -fno-char8_t -Wall -Wextra
   -Wno-unsupported-floating-point-opt -I"%SDK%\include" ^
   -sPROXY_TO_PTHREAD -sEXIT_RUNTIME -sPTHREAD_POOL_SIZE=8 -sENVIRONMENT=node -sINITIAL_MEMORY=1GB ^
   "%SDK%\src\core\threading_web.cpp" "%SDK%\src\core\threading.cpp" "%SDK%\src\core\clock_posix.cpp" ^
+  "%SDK%\src\core\fiber_web.cpp" "%SDK%\tests\web\cvar_stub.cpp" ^
   "%SDK%\tests\web\threading_web_test.cpp" -o "%OUT%\threading_web_test_%MODE%.js" || exit /b 1
 
 rem emsdk_env sets EMSDK_NODE (node 24: memory64 without flags).
