@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import { acceptUpgrade, rejectUpgrade } from './ws.mjs';
+import { createStunResponder } from './stun.mjs';
 
 export const HEADER_SIZE = 10; // u32 src, u32 dst, u16 port (big-endian)
 export const BROADCAST = 0xffffffff;
@@ -30,6 +31,10 @@ export const DEFAULTS = Object.freeze({
   // --- WebRTC peer-to-peer data path (net_relay.js) ---
   p2p: true, // false: the welcome tells clients to keep every datagram on the relay
   iceServers: [], // RTCIceServer objects sent in the welcome, e.g. [{urls: 'stun:stun.example:3478'}]
+  // createRelayServer: run a STUN binding responder on UDP (same port number as the listener, or
+  // stunPort) and announce it in the welcome as stun:<host the client connected to>:<port>.
+  stun: false,
+  stunPort: 0,
   maxPeersPerRoom: 16,
   maxRooms: 64,
   maxBuffered: 4 << 20, // drop datagrams to a peer this far behind (UDP semantics)
@@ -132,6 +137,7 @@ export class Relay {
     this.listRooms = o.listRooms !== false;
     this.p2p = o.p2p !== false;
     this.iceServers = Array.isArray(o.iceServers) ? o.iceServers : [];
+    this.stunPort = 0; // set by createRelayServer once its STUN responder listens
     this.peersPerIp = new Map(); // address -> live peers
     this.authFails = new Map(); // address -> {n, since}
     this.defaultRoom = isRoomName(o.defaultRoom) ? o.defaultRoom : 'default';
@@ -388,7 +394,12 @@ export class Relay {
       type: 'welcome', id, room: name, peers: others, maxPayload: this.maxDatagram,
       resume: conn.resumeToken, resumeGraceMs: this.resumeGraceMs, resumed, p2p: this.p2p,
     };
-    if (this.p2p && this.iceServers.length) welcome.iceServers = this.iceServers;
+    if (this.p2p) {
+      const ice = [...this.iceServers];
+      const host = this.stunPort ? requestHost(req) : '';
+      if (host) ice.unshift({ urls: `stun:${host}:${this.stunPort}` });
+      if (ice.length) welcome.iceServers = ice;
+    }
     conn.sendText(JSON.stringify(welcome));
     if (!resumed) for (const p of room.peers.values()) if (p !== conn) p.sendText(JSON.stringify({ type: 'join', id }));
     this.log(`room ${name} ${resumed ? 'resumed' : '+'}peer ${id} (${room.peers.size})`);
@@ -508,6 +519,13 @@ export class Relay {
  * Origin check for WebSocket upgrades. allowOrigins: ['*'] = any; otherwise exact origins
  * ("https://game.example"). Clients that send no Origin (not browsers) are always allowed.
  */
+// Host name (or IP) the client used to reach us, from the Host header; '' if unusable.
+export function requestHost(req) {
+  const h = String(req.headers?.host ?? '');
+  const m = /^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(:\d+)?$/.exec(h);
+  return m ? m[1] : '';
+}
+
 export function originAllowed(origin, allowOrigins) {
   if (!origin) return true;
   if (!allowOrigins || allowOrigins.includes('*')) return true;
@@ -570,8 +588,25 @@ export function createRelayServer(options = {}) {
     }
     relay.handleUpgrade(req, socket, head, url.searchParams);
   });
+  // STUN responder (options.stun): bound once the listener knows its port.
+  let stun = null;
+  if (options.stun) {
+    server.once('listening', () => {
+      const a = server.address();
+      const port = Number(options.stunPort) || a.port;
+      createStunResponder({ port, bind: options.stunBind ?? (a.family === 'IPv6' ? '::' : a.address), log: relay.log })
+        .then((s) => {
+          stun = s;
+          relay.stunPort = s.port;
+          relay.log(`stun responder on udp ${s.port}`);
+        })
+        .catch((e) => relay.log(`stun responder not started (udp ${port}): ${e.message}`));
+    });
+  }
   const shutdown = () => new Promise((resolve) => {
     relay.closeAll();
+    relay.stunPort = 0;
+    stun?.close();
     server.close(() => resolve());
     server.closeAllConnections?.();
     // Peers got a close frame; give them a moment to answer, then drop the sockets.

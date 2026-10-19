@@ -8,7 +8,9 @@
 // `p2p: false` keeps everything on the relay. Measures the round trip of every datagram (page 1
 // sends, page 2 echoes) over the DataChannel and over the relay.
 //   node tools/web_relay/test/p2p_browser.mjs [--latency MS[:JITTER]] [--count 500] [--interval-ms 10]
-//        [--size 200] [--headed] [--channel chrome] [--json out.json]
+//        [--size 200] [--headed] [--channel chrome] [--json out.json] [--no-stun] [--host 127.0.0.1]
+// The relay runs its STUN responder (relay option stun) unless --no-stun; --host is the address the
+// pages use for the relay (and so for its STUN server).
 // Needs Playwright: found via $PLAYWRIGHT_MODULE (path to the package dir), a normal import,
 // or a game repo's web_runner/server/node_modules.
 import fs from 'node:fs';
@@ -21,7 +23,7 @@ import { BROADCAST, createRelayServer } from '../lib/relay.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const shimJs = path.resolve(here, '../../../src/system/web/net_relay.js');
 const argv = process.argv.slice(2);
-const opt = { latency: 0, jitter: 0, count: 500, intervalMs: 10, size: 200, headed: false, channel: 'chrome', json: '' };
+const opt = { latency: 0, jitter: 0, count: 500, intervalMs: 10, size: 200, headed: false, channel: 'chrome', json: '', stun: true, host: '127.0.0.1' };
 for (let i = 0; i < argv.length; i++) {
   const k = argv[i];
   const v = () => argv[++i];
@@ -33,6 +35,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (k === '--channel') opt.channel = v();
   else if (k === '--json') opt.json = v();
   else if (k === '--chrome-arg') (opt.chromeArgs ??= []).push(v());
+  else if (k === '--no-stun') opt.stun = false;
+  else if (k === '--host') opt.host = v();
   else throw new Error(`unknown arg ${k}`);
 }
 
@@ -151,8 +155,9 @@ async function oldClient(port, room) {
 
 async function scenario(chromium, relayOpts, label) {
   const lines = [];
-  const { server, relay, shutdown } = createRelayServer({ log: (l) => lines.push(l), latencyMs: opt.latency, jitterMs: opt.jitter, ...relayOpts });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { server, relay, shutdown } = createRelayServer({ log: (l) => lines.push(l), latencyMs: opt.latency, jitterMs: opt.jitter, stun: opt.stun, stunBind: '0.0.0.0', ...relayOpts });
+  await new Promise((r) => server.listen(0, opt.host === '127.0.0.1' ? '127.0.0.1' : '0.0.0.0', r));
+  for (let i = 0; opt.stun && !relay.stunPort && i < 50; i++) await sleep(20);
   const relayPort = server.address().port;
   const web = http.createServer((req, res) => {
     if (req.url.startsWith('/net_relay.js')) {
@@ -169,7 +174,7 @@ async function scenario(chromium, relayOpts, label) {
   const pages = [];
   const result = { label, relay: relayOpts };
   try {
-    const url = `ws://127.0.0.1:${relayPort}/net?room=p2p`;
+    const url = `ws://${opt.host}:${relayPort}/net?room=p2p`;
     for (let n = 1; n <= 2; n++) {
       const ctx = await browser.newContext();
       const page = await ctx.newPage();

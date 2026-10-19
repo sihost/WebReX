@@ -7,7 +7,7 @@
 //     hardening: [--access-key K]... [--room-pass ROOM=PW]... [--require-room-pass] [--max-datagram 65536]
 //     [--rate-datagrams 2000] [--rate-bytes 8388608] [--rate-burst-ms 1000] [--rate-text 20] [--rate-kick 0]
 //     [--max-peers-per-ip 0] [--auth-fail-limit 10] [--trust-proxy] [--no-room-list]
-//     peer-to-peer: [--no-p2p] [--ice-server URL[|user|credential]]...
+//     peer-to-peer: [--no-p2p] [--ice-server URL[|user|credential]]... [--stun [--stun-port N]]
 import fs from 'node:fs';
 import { createRelayServer } from './lib/relay.mjs';
 
@@ -56,6 +56,8 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--trust-proxy') opt.trustProxy = true;
   else if (a === '--no-room-list') opt.listRooms = false;
   else if (a === '--no-p2p') opt.p2p = false;
+  else if (a === '--stun') opt.stun = true;
+  else if (a === '--stun-port') [opt.stun, opt.stunPort] = [true, Number(v())];
   else if (a === '--ice-server') {
     const [urls, username, credential] = v().split('|');
     opt.iceServers.push(username !== undefined ? { urls, username, credential } : { urls });

@@ -28,6 +28,7 @@ rem relay listening on ws://0.0.0.0:8090/net?room=<name> (origins: *)
 | `--tls-pfx F --tls-pass P` or `--tls-cert F --tls-key F` | off | Serve `wss://` (pages served over https can only open `wss://`). |
 | `--quiet` | | No per-peer log lines. |
 | `--no-p2p` / `--ice-server URL[\|user\|credential]` (repeat) | P2P on, no ICE servers | Peer-to-peer data path, see [Peer-to-peer](#peer-to-peer-webrtc-data-path). |
+| `--stun` / `--stun-port N` | off | STUN binding responder on UDP (same port number as `--port`, or N), announced in the welcome as `stun:<host the client used>:<port>`. |
 
 Public-hosting limits (see [Hardening](#hardening)):
 
@@ -142,9 +143,11 @@ Options: page `?p2p=0` (off), `?p2p_ice=stun:host:port[,...]`, `?p2p_probe_ms=N`
 and `--ice-server` (used when the page sets none). Without ICE servers only host candidates exist
 (same LAN). Chrome hides LAN addresses behind mDNS names, and a host firewall without an inbound rule
 for the browser blocks unsolicited UDP; then the channel may not open (seen between two tabs on one
-Windows PC) and the peers stay on the relay.
+Windows PC) and the peers stay on the relay. `--stun` makes the relay its own STUN server (stateless
+binding responder, `lib/stun.mjs`, open UDP on that port): browsers then also gather server-reflexive
+candidates with real addresses (no mDNS resolution before the checks), and behind a NAT the public one.
 
-Test without a game: `node tools/web_relay/test/p2p_browser.mjs [--latency MS[:J]] [--count N]`
+Test without a game: `node tools/web_relay/test/p2p_browser.mjs [--latency MS[:J]] [--count N] [--no-stun] [--host IP]`
 (Playwright; two Chrome contexts on a fake heap plus an old-style client; per-datagram echo RTT).
 
 ## Hardening
