@@ -1264,6 +1264,7 @@ void WebGPUCommandQueue::ReplayOnDeviceThread(WebGPUCommandStream* stream, uint6
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     last_stats_ = stats;
+    replay_ms_total_ += stats.encode_ms + stats.submit_ms;
   }
   replay_count_.fetch_add(1, std::memory_order_relaxed);
   draws_skipped_total_.fetch_add(stats.draws_skipped, std::memory_order_relaxed);
@@ -1315,6 +1316,11 @@ uint64_t WebGPUCommandQueue::SubmitAndWaitReplayed() {
 WebGPUReplayStats WebGPUCommandQueue::last_replay_stats() const {
   std::lock_guard<std::mutex> lock(stats_mutex_);
   return last_stats_;
+}
+
+double WebGPUCommandQueue::replay_ms_total() const {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  return replay_ms_total_;
 }
 
 }  // namespace rex::graphics::webgpu

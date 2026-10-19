@@ -9,6 +9,7 @@
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #ifdef __EMSCRIPTEN__
@@ -68,6 +69,11 @@ REXCVAR_DEFINE_BOOL(webgpu_dummy_attachment_for_no_output, false, "GPU",
                     "(normally skipped, they have no effect) into the dummy attachment that draws "
                     "without render targets but with effects (pixel shader memexport) get. "
                     "Diagnostics for that path");
+
+REXCVAR_DEFINE_INT32(webgpu_frame_stats_interval_ms, 0, "GPU",
+                     "WebGPU: every N ms of swaps, log frame pacing: swaps/s, the swap-to-swap "
+                     "interval p50/p95/p99/max, the CP thread's wait for the GPU (frame latency "
+                     "bound), device-thread replay time, uploads and draws per frame. 0 = off");
 
 REXCVAR_DEFINE_INT32(webgpu_pipeline_wait_ms, 0, "GPU",
                      "WebGPU: per-frame budget (ms) of the GPU command thread waiting for the "
@@ -1285,6 +1291,56 @@ void WebGPUCommandProcessor::EncodeSwap(void* user, WebGPUReplayState& /*state*/
                                           blit.height, frame);
 }
 
+namespace {
+double SteadyMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+void WebGPUCommandProcessor::UpdateFramePacing(double gpu_wait_ms) {
+  FramePacing& p = frame_pacing_;
+  const double now = SteadyMs();
+  const double replay_ms = command_queue_->replay_ms_total();
+  if (p.interval_start_ms == 0.0) {
+    p.interval_start_ms = p.last_swap_ms = now;
+    p.replay_ms_start = replay_ms;
+    p.upload_bytes_start = shared_memory_->uploaded_bytes();
+    p.constant_bytes_start = statistics_.constant_bytes;
+    p.draws_start = statistics_.draws;
+    return;
+  }
+  p.intervals_ms.push_back(float(now - p.last_swap_ms));
+  p.last_swap_ms = now;
+  p.gpu_wait_ms += gpu_wait_ms;
+  const double elapsed_ms = now - p.interval_start_ms;
+  if (elapsed_ms < double(REXCVAR_GET(webgpu_frame_stats_interval_ms))) {
+    return;
+  }
+  const size_t n = p.intervals_ms.size();
+  std::vector<float> sorted = p.intervals_ms;
+  std::sort(sorted.begin(), sorted.end());
+  auto pct = [&](double q) { return sorted[std::min(n - 1, size_t(q * double(n - 1) + 0.5))]; };
+  const uint64_t upload_bytes = shared_memory_->uploaded_bytes();
+  REXGPU_INFO(
+      "WebGPU: frame pacing: {} swaps in {:.0f} ms = {:.1f}/s | interval ms p50 {:.2f} p95 {:.2f} "
+      "p99 {:.2f} max {:.2f} | per frame: CP wait for GPU {:.2f} ms, device replay {:.2f} ms, "
+      "draws {:.0f}, shared memory uploads {:.2f} MiB, constants {:.2f} MiB",
+      n, elapsed_ms, double(n) * 1000.0 / elapsed_ms, pct(0.5), pct(0.95), pct(0.99), sorted.back(),
+      p.gpu_wait_ms / double(n), (replay_ms - p.replay_ms_start) / double(n),
+      double(statistics_.draws - p.draws_start) / double(n),
+      double(upload_bytes - p.upload_bytes_start) / double(n) / 1048576.0,
+      double(statistics_.constant_bytes - p.constant_bytes_start) / double(n) / 1048576.0);
+  p.intervals_ms.clear();
+  p.interval_start_ms = now;
+  p.gpu_wait_ms = 0.0;
+  p.replay_ms_start = replay_ms;
+  p.upload_bytes_start = upload_bytes;
+  p.constant_bytes_start = statistics_.constant_bytes;
+  p.draws_start = statistics_.draws;
+}
+
 void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   uint64_t swap_index = ++statistics_.swaps;
@@ -1382,11 +1438,16 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   // Bound the GPU latency: wait for the swap kMaxFramesInFlight swaps back.
   uint64_t& slot = swap_submissions_[swap_index % kMaxFramesInFlight];
+  const bool frame_stats = REXCVAR_GET(webgpu_frame_stats_interval_ms) > 0;
+  const double gpu_wait_start_ms = frame_stats ? SteadyMs() : 0.0;
   if (slot && !submission_tracker_.AwaitCompleted(slot)) {
     REXGPU_WARN("WebGPU: submission {} not completed after 10 s (lost: {})", slot,
                 device_.is_lost());
   }
   slot = swap_submission;
+  if (frame_stats) {
+    UpdateFramePacing(SteadyMs() - gpu_wait_start_ms);
+  }
   primitive_processor_->EndFrame();  // WP3: after the latency wait
   // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
   // on by default): pages not written by the GPU become invalid, so vertex and
