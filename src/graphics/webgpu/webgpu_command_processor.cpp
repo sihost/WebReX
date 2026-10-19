@@ -1460,6 +1460,17 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         uint64_t(emscripten_get_heap_max()) >> 20, uint64_t(size_t(heap_info.uordblks)) >> 20,
         uint64_t(size_t(heap_info.fordblks)) >> 20);
 #endif
+    // Pipeline polygon state (cumulative counts of draws given a pipeline).
+    static uint64_t polygon_log_swap = 0, polygon_log_depth_bias = 0;
+    uint64_t frames = swap_index > polygon_log_swap ? swap_index - polygon_log_swap : 1;
+    REXGPU_INFO(
+        "WebGPU: swap #{} polygon state: {} draws with depth bias ({:.1f} per frame since the "
+        "previous line), {} with depth clipping off, {} with the back face stencil masks",
+        swap_index, pipelines.draws_depth_bias,
+        double(pipelines.draws_depth_bias - polygon_log_depth_bias) / double(frames),
+        pipelines.draws_unclipped_depth, pipelines.draws_stencil_back_masks);
+    polygon_log_swap = swap_index;
+    polygon_log_depth_bias = pipelines.draws_depth_bias;
   }
 #ifdef __EMSCRIPTEN__
   // Running out of a fixed-size wasm memory aborts the tab: warn once when the heap break comes

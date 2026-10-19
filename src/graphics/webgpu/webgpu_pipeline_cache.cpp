@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -40,6 +41,15 @@
 REXCVAR_DEFINE_BOOL(webgpu_draw_with_pipelines, true, "GPU",
                     "WebGPU: record draws with the translated pipelines (diagnostics: false still "
                     "translates, stores and creates the pipelines, but drops every draw)");
+
+REXCVAR_DECLARE(bool, webgpu_clip_distances);
+
+REXCVAR_DEFINE_BOOL(webgpu_polygon_offset, true, "GPU",
+                    "WebGPU: apply the guest polygon offset (PA_SU_POLY_OFFSET_*) as the pipeline "
+                    "depth bias, as D3D12 does (false: no depth bias, for A/B comparisons)");
+REXCVAR_DEFINE_BOOL(webgpu_depth_clip_control, true, "GPU",
+                    "WebGPU: disable depth clipping for draws with PA_CL_CLIP_CNTL.clip_disable "
+                    "(unclippedDepth) when the device has depth-clip-control");
 
 REXCVAR_DEFINE_INT32(webgpu_wgsl_threads, 2, "GPU",
                      "WebGPU: threads converting the translated SPIR-V to WGSL (Tint, ~0.1-0.3 s "
@@ -246,8 +256,10 @@ bool WebGPUPipelineCache::Initialize() {
   features.full_draw_index_uint32 = true;
   features.vertex_pipeline_stores_and_atomics = false;
   features.fragment_stores_and_atomics = true;
-  clip_distances_ = device.HasFeature(WGPUFeatureName_ClipDistances);
+  clip_distances_ =
+      REXCVAR_GET(webgpu_clip_distances) && device.HasFeature(WGPUFeatureName_ClipDistances);
   features.clip_distance = clip_distances_;
+  depth_clip_control_ = device.HasFeature(WGPUFeatureName_DepthClipControl);
   features.cull_distance = false;
   features.image_view_format_swizzle = false;
   // Tessellated draws: the guest VS is a vertex shader over the domain points of
@@ -873,31 +885,65 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
           regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]));
     }
   }
+  bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+  auto sc_mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  bool stencil_back_masks = false;
+  WGPUPrimitiveTopology topology = ToTopology(host_primitive);
+  desc.primitive_topology = uint8_t(topology);
   if (has_depth) {
     reg::RB_DEPTHCONTROL dc = state.normalized_depth_control;
     desc.depth_control = dc.value;
     if (dc.stencil_enable) {
-      auto ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+      // One mask pair for both faces: the back face ones only when drawing back
+      // faces only (D3D12PipelineCache; the CP picks the reference the same way).
+      uint32_t ref_mask_register = XE_GPU_REG_RB_STENCILREFMASK;
+      if (primitive_polygonal && dc.backface_enable && sc_mode.cull_front) {
+        ref_mask_register = XE_GPU_REG_RB_STENCILREFMASK_BF;
+        stencil_back_masks = true;
+      }
+      auto ref_mask = regs.Get<reg::RB_STENCILREFMASK>(ref_mask_register);
       desc.stencil_read_mask = uint8_t(ref_mask.stencilmask);
       desc.stencil_write_mask = uint8_t(ref_mask.stencilwritemask);
-      if (dc.backface_enable) {
-        auto ref_mask_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
-        desc.stencil_read_mask_back = uint8_t(ref_mask_bf.stencilmask);
-        desc.stencil_write_mask_back = uint8_t(ref_mask_bf.stencilwritemask);
-      } else {
-        desc.stencil_read_mask_back = desc.stencil_read_mask;
-        desc.stencil_write_mask_back = desc.stencil_write_mask;
+    }
+    // Polygon offset (D3D12PipelineCache::GetCurrentStateDescription). WebGPU
+    // requires 0 for point and line topologies; guest points / rectangles drawn
+    // as host triangle strips use the guest's non-polygonal (para) offset.
+    if (REXCVAR_GET(webgpu_polygon_offset) &&
+        (topology == WGPUPrimitiveTopology_TriangleList ||
+         topology == WGPUPrimitiveTopology_TriangleStrip)) {
+      float polygon_offset, polygon_offset_scale;
+      draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, polygon_offset_scale,
+                                               polygon_offset);
+      // Keep the integer conversion in range (32 = 32x the whole depth range).
+      polygon_offset = std::clamp(polygon_offset, -32.0f, 32.0f);
+      // Units of the host format: float24 in depth32float (exact, the host value
+      // is guest * 0.5, which lowers the exponent the float bias is relative to
+      // by 1 as well, as on Vulkan), unorm24 for D24S8 and for D24FS8 stored as
+      // depth24plus-stencil8 (no depth32float-stencil8).
+      xenos::DepthRenderTargetFormat bias_format =
+          state.depth_texture_format == WGPUTextureFormat_Depth32FloatStencil8
+              ? xenos::DepthRenderTargetFormat::kD24FS8
+              : xenos::DepthRenderTargetFormat::kD24S8;
+      if (std::isfinite(polygon_offset)) {
+        desc.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(bias_format, polygon_offset);
+      }
+      float slope = polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+      desc.depth_bias_slope_scale = std::isfinite(slope) ? slope : 0.0f;
+      if (desc.depth_bias_slope_scale == 0.0f) {
+        desc.depth_bias_slope_scale = 0.0f;  // -0 -> +0 for the memcmp key
       }
     }
   }
-  WGPUPrimitiveTopology topology = ToTopology(host_primitive);
-  desc.primitive_topology = uint8_t(topology);
+  if (depth_clip_control_ && pa_cl_clip_cntl.clip_disable &&
+      REXCVAR_GET(webgpu_depth_clip_control)) {
+    desc.unclipped_depth = 1;
+  }
   if (!domain_as_vertex && (topology == WGPUPrimitiveTopology_TriangleStrip ||
                             topology == WGPUPrimitiveTopology_LineStrip)) {
     desc.strip_index_format = uint8_t(state.index_format);
   }
-  if (draw_util::IsPrimitivePolygonal(regs)) {
-    auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (primitive_polygonal) {
+    auto mode = sc_mode;
     desc.front_face_cw = uint8_t(mode.face);
     if (mode.cull_front && mode.cull_back) {
       // Everything culled; WebGPU has no front-and-back culling.
@@ -915,6 +961,9 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
                                    (desc.color_write_masks & 0xF) &&
                                    regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable);
 
+  statistics_.draws_depth_bias += (desc.depth_bias || desc.depth_bias_slope_scale != 0.0f);
+  statistics_.draws_unclipped_depth += desc.unclipped_depth;
+  statistics_.draws_stencil_back_masks += stencil_back_masks;
   pipeline_out = GetOrCreate(desc);
   if (!REXCVAR_GET(webgpu_draw_with_pipelines)) {
     // Diagnostics: pipelines are created, draws are dropped.
@@ -1221,6 +1270,8 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
     desc.primitive.stripIndexFormat = WGPUIndexFormat(d.strip_index_format);
     desc.primitive.cullMode = WGPUCullMode(d.cull_mode);
     desc.primitive.frontFace = d.front_face_cw ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+    // Only set on a device with depth-clip-control (ConfigurePipeline).
+    desc.primitive.unclippedDepth = d.unclipped_depth ? WGPU_TRUE : WGPU_FALSE;
     desc.multisample.count = d.sample_count ? d.sample_count : 1;
     // Guest 2x is host 4x with samples 0 and 3 (WebGPURenderTargetCache).
     desc.multisample.mask = key.msaa_samples == xenos::MsaaSamples::k2X ? 0b1001u : 0xFFFFFFFFu;
@@ -1251,7 +1302,7 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
             dc.backface_enable
                 ? face(dc.stencilfunc_bf, dc.stencilfail_bf, dc.stencilzfail_bf, dc.stencilzpass_bf)
                 : depth_stencil.stencilFront;
-        // WebGPU has one read / write mask for both faces.
+        // WebGPU has one read / write mask for both faces (see the description).
         depth_stencil.stencilReadMask = d.stencil_read_mask;
         depth_stencil.stencilWriteMask = d.stencil_write_mask;
       } else {
@@ -1261,6 +1312,9 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
         depth_stencil.stencilReadMask = 0xFF;
         depth_stencil.stencilWriteMask = 0;
       }
+      depth_stencil.depthBias = d.depth_bias;
+      depth_stencil.depthBiasSlopeScale = d.depth_bias_slope_scale;
+      depth_stencil.depthBiasClamp = 0.0f;
       desc.depthStencil = &depth_stencil;
     }
 
