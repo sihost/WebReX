@@ -180,7 +180,16 @@ async function scenario(chromium, relayOpts, label) {
       const page = await ctx.newPage();
       page.on('console', (m) => console.log(`  [page${n}] ${m.text()}`));
       page.on('pageerror', (e) => { console.log(`  [page${n}] pageerror ${e}`); failures++; });
-      await page.goto(`http://127.0.0.1:${webPort}/`);
+      // A loaded machine (parallel builds) once timed the local page load out: retry, it's not under test.
+      for (let a = 1; ; a++) {
+        try {
+          await page.goto(`http://127.0.0.1:${webPort}/`, { timeout: 30000 });
+          break;
+        } catch (e) {
+          if (a >= 3) throw e;
+          console.log(`  [page${n}] goto attempt ${a}: ${String(e.message).split('\n')[0]}; retrying`);
+        }
+      }
       await page.evaluate(([u, o]) => window.makeNet(u, o), [url, { statsLogMs: 0, debug: !!process.env.P2P_DEBUG }]);
       pages.push(page);
       await sleep(300);
