@@ -15,6 +15,12 @@
  * asynchronously to the main thread. Nothing here may be called *from* the main thread
  * except Start() (which proxies anyway).
  *
+ * Peer-to-peer: net_relay.js also opens a WebRTC DataChannel (unordered, no retransmits) to
+ * every peer that runs the same code, signalled over the relay, and sends that peer's
+ * datagrams over it while it works (relay fallback per peer; see the comment at the top of
+ * net_relay.js and tools/web_relay/README.md). The frames, ids and addresses are the same on
+ * both paths, so nothing in this API changes. Page options: ?p2p=0 turns it off.
+ *
  * All addresses and ports in this API are host byte order. Errors are Winsock codes
  * (WSAE*), returned through `err`; the caller (guest Winsock hooks) stores them as the
  * thread's last error. The guest-ABI (big-endian) marshalling helpers are in
