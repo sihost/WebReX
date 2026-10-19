@@ -17,8 +17,9 @@ in a web browser, without plugins. The runtime (kernel, threads, memory, filesys
 input and system-link networking) is compiled to **WebAssembly (wasm64)** with Emscripten.
 The Xbox 360 GPU, **Xenos**, is emulated on **WebGPU**.
 
-WebReX was originally built for a browser port of Halo 3. It contains no game code or game
-data: a recompiled game is a separate project that links WebReX and loads its own files.
+WebReX was originally built for a browser port of Halo 3, and also runs Call of Duty: Modern
+Warfare 2 multiplayer. It contains no game code or game data: a recompiled game is a separate
+project that links WebReX and loads its own files.
 
 ## How it works
 
@@ -34,14 +35,16 @@ runtime. WebReX takes the runtime that recompiled code runs on and makes it work
 | **Files** | Game files stream over HTTP Range requests with an OPFS block cache; saves and profiles persist in OPFS across reloads |
 | **Audio** | AudioWorklet output fed from a SharedArrayBuffer ring, with adaptive latency and optional 5.1 |
 | **Input** | Gamepad API, keyboard and mouse with raw pointer lock, and an opt-in on-screen touch gamepad (`Module.rexTouchGamepad`) |
-| **Network** | System link as a virtual UDP LAN over a WebSocket relay. A standalone reference relay is in [`tools/web_relay`](tools/web_relay/README.md) |
+| **Network** | System link as a virtual UDP LAN over a WebSocket relay: guest `NetDll_*` sockets (UDP and VDP, broadcast) run on the relay, and XNet (title address, secure addresses, keys, QoS) and `XSessionCreate` are implemented for System Link. A standalone reference relay is in [`tools/web_relay`](tools/web_relay/README.md) |
+| **Codegen** | Functions that call setjmp go into their own translation unit, compiled at -O0 for the web (`setjmp_separate_tu`), so no wasm function exceeds V8's 7.65 MB limit |
 | **Page** | Crash reports from any thread (`Module.rexOnFatal`) and page lifecycle hooks for hidden tabs and Memory Saver discards (`rexOnLifecycle`, `rexOnDiscardRisk`, `rexOnDiscarded`). See [`docs/web_limitations.md`](docs/web_limitations.md) |
 
 Native builds (Windows/Linux with D3D12/Vulkan) still work from the same tree.
 
 ## Status
 
-Tested with a full recompiled retail game in Chrome on Windows:
+Tested in Chrome on Windows with two recompiled retail games, Halo 3 and Modern Warfare 2
+multiplayer:
 
 - boots to the main menu, loads maps and plays with audio, controller and mouse/keyboard
 - settings and profiles survive a page reload
@@ -67,7 +70,7 @@ they begin it get the same fixed results natively.
 | Audio | ~90 ms output latency on a busy CPU (adaptive, lower when idle) |
 | Page | Chrome's Memory Saver can discard an inactive tab that plays no audio; the page is only told on the next load (`rexOnDiscarded`) |
 | Storage | Chrome 155+ (`StaticStorageQuota`) makes `navigator.storage.estimate()` report usage + 10 GiB whatever the real quota is, so the runtime only learns about a small quota when an OPFS write fails; the block cache then evicts and retries. Data outside OPFS counts against the same quota |
-| Network | System link only (no Xbox Live) |
+| Network | System link only (no Xbox Live). `--xnet_unique_xuid` gives each tab its own player XUID; `--xnet_trace` logs every XNet and socket call |
 | Input | Browsers expose a gamepad only after a button press; rumble depends on the browser's `vibrationActuator` |
 
 ## Example
