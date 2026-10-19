@@ -55,17 +55,14 @@ they begin it get the same fixed results natively.
 
 | Area | Gap |
 |---|---|
-| Browsers | Chromium only. Firefox stops at a WebGPU error (`setBindGroup`: dynamic offsets passed as a view of the >2 GB wasm memory); Safari is untested |
+| Browsers | Chromium is the target. Firefox loads games with 0 WebGPU errors but creates render pipelines very slowly (about one frame per 10 s in game); Safari is untested |
 | Memory | A large game needs about 8 GB of wasm memory per tab (Halo 3: ~3.5 GB heap break in play) |
-| GPU | First boot with an empty shader cache: draws are skipped while their pipelines are created, and render targets sampled for many frames stay wrong (16.7–24.7 dB vs native until the cache is warm) |
-| GPU | Some Xenos shaders do not translate (pixel shaders failing SPIR-V validation; "couldn't extract memexport stream constant index") |
-| GPU | Draws with no render target are dropped (WebGPU needs an attachment; no dummy target yet) |
+| GPU | First boot with an empty shader cache: a precompiled WGSL bundle covers most pipelines, but frames right after the first map load (tick ~150) can still differ from native until the rest are created |
 | GPU | 16-bit normalized textures are stored as float16 so they stay filterable (precision differs from native) |
-| Runtime | Fibers: `Fiber::Create` and switching to another fiber abort (no stack switching on wasm); titles importing `KeSetCurrentStackPointers` will not run |
-| Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only) and cooperative suspend/terminate only |
-| Files | `HttpRangeDevice` reads one synchronous 1 MiB block at a time; parallel download and read-ahead must be done by the page (e.g. a service worker) |
-| Audio | Stereo downmix only (no 5.1); ~90 ms output latency; a hidden tab's audio thread is starved by the browser |
-| Network | System link only (no Xbox Live); the WebSocket relay server is not included |
+| GPU | WebGPU limits: MSAA 2x runs as 4x, no ROV/FSI, no fill mode, no cull distance (see [`docs/web_limitations.md`](docs/web_limitations.md)) |
+| Runtime | No host fault handler (wasm traps cannot be caught; guest SEH is software only); suspend/terminate are cooperative (kernel exports are safe points) |
+| Audio | ~90 ms output latency on a busy CPU (adaptive, lower when idle); a hidden tab's audio thread is starved by the browser |
+| Network | System link only (no Xbox Live) |
 | Input | Browsers expose a gamepad only after a button press; rumble depends on the browser's `vibrationActuator` |
 
 ## Example
