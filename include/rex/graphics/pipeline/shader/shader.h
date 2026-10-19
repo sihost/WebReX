@@ -1027,6 +1027,9 @@ class Shader {
   // multiple predecessor chains exporting to memory).
   uint8_t memexport_eM_potentially_written_before_end_ = 0;
   std::set<uint32_t> memexport_stream_constants_;
+  // Analysis only: the last eA write (since the last `alloc`) is not in the
+  // form the stream constant is extracted from.
+  bool memexport_address_unresolved_ = false;
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;

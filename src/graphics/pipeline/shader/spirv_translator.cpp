@@ -3022,7 +3022,9 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       output_fragment_sample_mask_ = builder_->createVariable(
           spv::NoPrecision, spv::StorageClassOutput,
           builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0), "gl_SampleMask");
-      builder_->addDecoration(output_fragment_sample_mask_, spv::DecorationFlat);
+      // No Flat: interpolation decorations are not allowed on fragment shader
+      // outputs (VUID-StandaloneSpirv-Flat-06201; spirv-val rejected every pixel
+      // shader with alpha to coverage on the desktop Vulkan feature set).
       builder_->addDecoration(output_fragment_sample_mask_, spv::DecorationBuiltIn,
                               spv::BuiltInSampleMask);
       main_interface_.push_back(output_fragment_sample_mask_);
