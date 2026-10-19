@@ -8,6 +8,6 @@
   "bin": { "rexglue-web-relay": "server.mjs" },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.mjs"
   }
 }

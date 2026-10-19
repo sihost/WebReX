@@ -155,7 +155,7 @@ For a relay on the public internet:
 ## Tests
 
 ```bat
-node --test tools/web_relay/test/
+node --test tools/web_relay/test/*.test.mjs
 ```
 
 Welcome/join/leave and id reuse, unicast with src rewrite, echo, broadcast, room isolation,
