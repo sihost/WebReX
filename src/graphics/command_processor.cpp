@@ -1247,7 +1247,11 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  // Host writes into guest physical memory mark the web dirty map
+  // (host_write_web.h; no-op natively).
+  uint8_t* reg_dest = memory_->TranslatePhysical(mem_addr);
+  memory::store(reg_dest, reg_val);
+  memory::NoteHostWrite(reg_dest, sizeof(reg_val));
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
   return true;
@@ -1262,7 +1266,9 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    uint8_t* write_dest = memory_->TranslatePhysical(addr);
+    memory::store(write_dest, write_data);
+    memory::NoteHostWrite(write_dest, sizeof(write_data));
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
   }
@@ -1325,7 +1331,9 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      uint8_t* write_dest = memory_->TranslatePhysical(write_reg_addr);
+      memory::store(write_dest, write_data);
+      memory::NoteHostWrite(write_dest, sizeof(write_data));
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
@@ -1371,7 +1379,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  uint8_t* data_dest = memory_->TranslatePhysical(address);
+  memory::store(data_dest, data_value);
+  memory::NoteHostWrite(data_dest, sizeof(data_value));
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1399,8 +1409,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
-                                     rex::countof(extents));
+  uint8_t* extents_dest = memory_->TranslatePhysical(address);
+  memory::copy_and_swap_16_unaligned(extents_dest, extents, rex::countof(extents));
+  memory::NoteHostWrite(extents_dest, sizeof(extents));
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
   return true;
 }
@@ -1436,6 +1447,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
       pSampleCounts->ZPass_A = fake_sample_count;
       pSampleCounts->Total_A = fake_sample_count;
     }
+    memory::NoteHostWrite(pSampleCounts, sizeof(xe_gpu_depth_sample_counts));
     static uint32_t logged = 0;
     if (logged < uint32_t(std::max(REXCVAR_GET(occlusion_query_log), 0))) {
       ++logged;

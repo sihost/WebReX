@@ -20,6 +20,7 @@
 #include <type_traits>
 
 #include <rex/assert.h>
+#include <rex/memory/host_write_web.h>
 #include <rex/platform.h>
 #include <rex/types.h>
 
@@ -178,8 +179,10 @@ void copy_and_swap_64_unaligned(void* dest, const void* src, size_t count);
 void copy_and_swap_16_in_32_aligned(void* dest, const void* src, size_t count);
 void copy_and_swap_16_in_32_unaligned(void* dest, const void* src, size_t count);
 
+// Also marks the web dirty map when dest is guest physical memory (host_write_web.h).
 template <typename T>
 void copy_and_swap(T* dest, const T* src, size_t count) {
+  NoteHostWrite(dest, count * sizeof(T));
   bool is_aligned =
       reinterpret_cast<uintptr_t>(dest) % 32 == 0 && reinterpret_cast<uintptr_t>(src) % 32 == 0;
   if (sizeof(T) == 1) {
@@ -261,18 +264,22 @@ inline void store(void* mem, const T& value) {
   std::memcpy(mem, &value, sizeof(T));
 }
 
-/// Store a byte-swapped value of type T to memory.
+/// Store a byte-swapped value of type T to memory. On the web, also marks the dirty
+/// map when mem is guest physical memory (host_write_web.h): kernel exports write their
+/// guest outputs with it.
 template <typename T>
 inline void store_and_swap(void* mem, const T& value) {
   store(mem, byte_swap(value));
+  NoteHostWrite(mem, sizeof(T));
 }
 
 // String specializations need custom logic
 template <>
 inline void store_and_swap<std::string_view>(void* mem, const std::string_view& value) {
   for (size_t i = 0; i < value.size(); ++i) {
-    store_and_swap<uint8_t>(reinterpret_cast<uint8_t*>(mem) + i, value[i]);
+    store<uint8_t>(reinterpret_cast<uint8_t*>(mem) + i, uint8_t(value[i]));
   }
+  NoteHostWrite(mem, value.size());
 }
 template <>
 inline void store_and_swap<std::string>(void* mem, const std::string& value) {
@@ -281,8 +288,9 @@ inline void store_and_swap<std::string>(void* mem, const std::string& value) {
 template <>
 inline void store_and_swap<std::u16string_view>(void* mem, const std::u16string_view& value) {
   for (size_t i = 0; i < value.size(); ++i) {
-    store_and_swap<uint16_t>(reinterpret_cast<uint16_t*>(mem) + i, value[i]);
+    store<uint16_t>(reinterpret_cast<uint16_t*>(mem) + i, byte_swap(uint16_t(value[i])));
   }
+  NoteHostWrite(mem, value.size() * sizeof(uint16_t));
 }
 template <>
 inline void store_and_swap<std::u16string>(void* mem, const std::u16string& value) {

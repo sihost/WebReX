@@ -358,6 +358,8 @@ ppc_u32_result_t XamContentGetThumbnail_entry(ppc_u32_t user_index, ppc_pvoid_t 
       } else {
         // Copy data.
         std::memcpy((uint8_t*)buffer_ptr, buffer.data(), buffer.size());
+        // The thumbnail may become a texture: web dirty map (no-op natively).
+        rex::memory::NoteHostWrite((uint8_t*)buffer_ptr, buffer.size());
       }
     }
   }
