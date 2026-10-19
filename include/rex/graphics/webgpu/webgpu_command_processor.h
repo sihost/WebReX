@@ -105,16 +105,25 @@ class WebGPUCommandProcessor : public CommandProcessor {
     uint64_t draws = 0;
     uint64_t draws_dropped = 0;
     // draws_dropped by reason: RenderTargetCache::Update failed (of which
-    // WebGPURenderTargetCache::Statistics::updates_without_attachments had no
-    // attachment at all), ConfigurePipeline refused (WebGPUPipelineCache
+    // WebGPURenderTargetCache::Statistics::updates_without_attachments minus
+    // draws_no_output and draws_dummy_attachment had no attachment at all and
+    // the dummy one couldn't be made), ConfigurePipeline refused (WebGPUPipelineCache
     // draws_refused_*), the constant arena was full, a sampler couldn't be made.
     uint64_t drops_render_targets = 0;
-    // Of drops_render_targets: the vertex shader memexports; rasterization is off;
-    // the draw writes nothing (no color mask, depth, stencil or memexport), which
-    // is also its whole effect natively.
+    // Of drops_render_targets: the vertex shader memexports; rasterization is off.
     uint64_t drops_rt_memexport_vs = 0;
     uint64_t drops_rt_no_rasterization = 0;
-    uint64_t drops_rt_no_output = 0;
+    // Draws without any render target (WebGPURenderTargetCache::
+    // last_update_without_attachments), not counted as dropped: skipped because
+    // they write nothing (no color mask, depth, stencil or pixel memexport;
+    // natively they have no effect either), of which with a vertex memexport
+    // (dispatched as compute before); and drawn into the render target cache's
+    // dummy attachment (they have effects, or
+    // --webgpu_dummy_attachment_for_no_output), of which without output.
+    uint64_t draws_no_output = 0;
+    uint64_t draws_no_output_memexport_vs = 0;
+    uint64_t draws_dummy_attachment = 0;
+    uint64_t draws_dummy_attachment_no_output = 0;
     // Vertex memexport as compute (webgpu_vertex_memexport): dispatches
     // recorded, and memexporting draws whose compute variant isn't available.
     uint64_t memexport_dispatches = 0;

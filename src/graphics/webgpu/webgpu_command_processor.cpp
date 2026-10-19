@@ -63,6 +63,12 @@ REXCVAR_DEFINE_INT32(webgpu_occlusion_query_log, 0, "GPU",
                      "WebGPU: log the first N guest occlusion query events (EVENT_WRITE_ZPD begin / "
                      "end, the sample count address, and the draws since the previous event)");
 
+REXCVAR_DEFINE_BOOL(webgpu_dummy_attachment_for_no_output, false, "GPU",
+                    "WebGPU: also draw the draws without any render target that write nothing "
+                    "(normally skipped, they have no effect) into the dummy attachment that draws "
+                    "without render targets but with effects (pixel shader memexport) get. "
+                    "Diagnostics for that path");
+
 REXCVAR_DEFINE_INT32(webgpu_pipeline_wait_ms, 0, "GPU",
                      "WebGPU: per-frame budget (ms) of the GPU command thread waiting for the "
                      "pipelines of draws whose shaders are still converting or whose pipeline the "
@@ -881,28 +887,47 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   texture_cache_->RequestTexturesForShaders(*vertex_shader, pixel_shader);
 
   // Render targets (WP4), then the pipeline for them (WP2).
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  bool render_targets_bound = render_target_cache_->Update(
+      is_rasterization_done, normalized_depth_control, normalized_color_mask, *vertex_shader);
+  if (!render_targets_bound && render_target_cache_->last_update_without_attachments()) {
+    ++query_draws_.no_attachments;
+    // No render target at all. A WebGPU render pass needs an attachment, so a
+    // draw whose rasterization still has an effect gets a dummy one (zero write
+    // mask): pixel shader memexport (WebGPU has no host occlusion queries: the
+    // guest's ZPD results are query_occlusion_fake_sample_count, as on D3D12 /
+    // Vulkan once a guest query doesn't end at its begin address, and
+    // VIZ_QUERY always reports visible, CommandProcessor::
+    // ExecutePacketType3_VIZ_QUERY). Vertex memexport was dispatched as compute
+    // above, the rasterization adds nothing to it. Draws writing nothing at all
+    // (no color mask, depth, stencil or pixel memexport; for example Halo 3's
+    // point-list draws inside a VIZ_QUERY) rasterize into no attachment
+    // natively too, which has no effect: skipped, not dropped.
+    bool rasterization_has_effect = normalized_color_mask || normalized_depth_control.z_enable ||
+                                    normalized_depth_control.stencil_enable ||
+                                    (pixel_shader && pixel_shader->memexport_eM_written());
+    if (!rasterization_has_effect && !REXCVAR_GET(webgpu_dummy_attachment_for_no_output)) {
+      ++statistics_.draws_no_output;
+      if (memexport_used_vertex) {
+        ++statistics_.draws_no_output_memexport_vs;
+      }
+      return true;
+    }
+    render_targets_bound = render_target_cache_->UpdateDummyAttachment();
+    if (render_targets_bound) {
+      ++statistics_.draws_dummy_attachment;
+      if (!rasterization_has_effect) {
+        ++statistics_.draws_dummy_attachment_no_output;
+      }
+    }
+  }
+  if (!render_targets_bound) {
     ++statistics_.draws_dropped;
     ++statistics_.drops_render_targets;
-    ++query_draws_.no_attachments;
     if (memexport_used_vertex) {
       ++statistics_.drops_rt_memexport_vs;
     }
     if (!is_rasterization_done) {
       ++statistics_.drops_rt_no_rasterization;
-    }
-    // Nothing to write: no color mask, no depth / stencil, no memexport (for
-    // example point-list draws inside a VIZ_QUERY). Natively they rasterize
-    // into no attachment, which has no effect either. The guest's visibility
-    // and occlusion results don't depend on them on any backend: VIZ_QUERY
-    // always reports visible (CommandProcessor::ExecutePacketType3_VIZ_QUERY),
-    // and EVENT_WRITE_ZPD writes query_occlusion_fake_sample_count, as D3D12 /
-    // Vulkan do once a guest query does not end at its begin address.
-    if (!normalized_color_mask && !normalized_depth_control.z_enable &&
-        !normalized_depth_control.stencil_enable && !memexport_used_vertex &&
-        !(pixel_shader && pixel_shader->memexport_eM_written())) {
-      ++statistics_.drops_rt_no_output;
     }
     // The first 8, and with webgpu_occlusion_query_log 8 more once a guest
     // occlusion query was seen (in game, with the query context).
@@ -1378,12 +1403,13 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     const WebGPUTextureCache::Statistics& textures = texture_cache_->statistics();
     REXGPU_INFO(
         "WebGPU: swap #{} front buffer {:08X} {}x{} presented={} swap texture {}x{} fmt {} ({}) | "
-        "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | drops: render "
-        "targets {} (no attachments {}, vs memexport {}, no rasterization {}, no output {}), "
-        "pipeline {} (ps "
-        "memexport {}, bindings {}, tessellation "
-        "{}, cull both {}, no pipeline {}), constants {}, sampler {} | pipelines {} "
-        "requested {} created {} failed | textures {} loads {} failures {} | constants {} KiB | "
+        "draws {} recorded {} dropped {} culled {} unsupported {} | resolves {} | no render "
+        "target: {} skipped (no output, {} with vs memexport), {} on the dummy "
+        "attachment ({} without output) | drops: render targets {} (no attachments {}, vs "
+        "memexport {}, no rasterization {}), pipeline {} (ps memexport {}, bindings {}, "
+        "tessellation {}, cull both {}, no pipeline {}), constants {}, sampler {} | pipelines {} "
+        "requested {} created {} failed, WGSL failures {} | textures {} loads {} failures {} | "
+        "constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
         "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
@@ -1395,15 +1421,19 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         texture_width, texture_height, uint32_t(texture_format), swap_view ? "found" : "none",
         statistics_.draws, statistics_.draws_recorded, statistics_.draws_dropped,
         statistics_.draws_culled, pipelines.draws_unsupported, statistics_.copies,
-        statistics_.drops_render_targets, render_target_cache_->statistics().updates_without_attachments,
+        statistics_.draws_no_output, statistics_.draws_no_output_memexport_vs,
+        statistics_.draws_dummy_attachment, statistics_.draws_dummy_attachment_no_output,
+        statistics_.drops_render_targets,
+        render_target_cache_->statistics().updates_without_attachments -
+            statistics_.draws_no_output - statistics_.draws_dummy_attachment,
         statistics_.drops_rt_memexport_vs, statistics_.drops_rt_no_rasterization,
-        statistics_.drops_rt_no_output,
         statistics_.drops_pipeline, pipelines.draws_refused_ps_memexport,
         pipelines.draws_refused_bindings, pipelines.draws_refused_tessellation,
         pipelines.draws_refused_cull_both, pipelines.draws_refused_no_pipeline,
         statistics_.drops_constants, statistics_.drops_sampler,
         pipelines.pipelines_requested, pipeline_cache_->pipelines_created(),
-        pipeline_cache_->pipelines_failed(), textures.textures_created, textures.loads,
+        pipeline_cache_->pipelines_failed(), pipelines.wgsl_failures, textures.textures_created,
+        textures.loads,
         textures.load_failures, statistics_.constant_bytes >> 10, submission_tracker_.submitted(),
         submission_tracker_.replayed(), submission_tracker_.completed(),
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
