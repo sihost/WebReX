@@ -118,10 +118,10 @@ EM_JS(void, rex_storage_js_refresh_estimate, (), {
               if (caches >= 0) parts.push('Cache Storage ' + mib(caches));
               if (idb >= 0) parts.push('IndexedDB ' + mib(idb));
               console.log('[storage] usage ' + mib(usage) + ' MiB' +
-                          (parts.length ? ' (' + parts.join(', ') + ' MiB)' : '') + ' of ' +
+                          (parts.length ? ' (' + parts.join(', ') + ' MiB)' : "") + ' of ' +
                           (quota / 1048576).toFixed(0) + ' MiB quota' +
                           (padded ? ' (Chrome static quota: usage + 10 GiB, real limit unknown)'
-                                  : '') +
+                                  : "") +
                           ', persisted ' +
                           (persisted < 0 ? 'unknown' : persisted ? 'yes' : 'no'));
             }

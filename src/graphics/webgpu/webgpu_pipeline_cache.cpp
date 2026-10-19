@@ -102,9 +102,9 @@ EM_JS(void, rex_wgsl_bundle_take, (double dst), {
   if (b) HEAPU8.set(b, dst);
   globalThis["__rexWgslBundle"] = undefined;
 });
-// Any thread (navigator exists in workers).
+// Any thread (navigator exists in workers). No regex literal: "\/" + "/" would start a C++ comment.
 EM_JS(int, rex_webgpu_browser_is_firefox, (), {
-  return (typeof navigator != "undefined" && /\bFirefox\//.test(navigator.userAgent || "")) ? 1 : 0;
+  return (typeof navigator != "undefined" && String(navigator.userAgent || "").indexOf("Firefox/") >= 0) ? 1 : 0;
 });
 // clang-format on
 #endif
