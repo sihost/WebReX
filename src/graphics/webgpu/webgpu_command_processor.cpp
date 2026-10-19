@@ -743,11 +743,12 @@ bool WebGPUCommandProcessor::IssueMemExportCompute(
   for (const draw_util::MemExportRange& range : ranges) {
     shared_memory_->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
   }
-  if (REXCVAR_GET(webgpu_readback_memexport)) {
-    for (const draw_util::MemExportRange& range : ranges) {
-      render_target_cache_->ReadbackResolve(*memory_, *shared_memory_,
+  // Guest memory copy: off by default on the web, delayed with
+  // --webgpu_readback_memexport_delayed, immediate with --webgpu_readback_memexport
+  // (WebGPUReadback::GetMemExportMode).
+  for (const draw_util::MemExportRange& range : ranges) {
+    render_target_cache_->ReadbackMemExport(*memory_, *shared_memory_,
                                             range.base_address_dwords << 2, range.size_bytes);
-    }
   }
   return true;
 }

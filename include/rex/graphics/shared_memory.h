@@ -96,6 +96,13 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Whether the page containing guest physical `address` holds GPU-written data
+  // (RangeWrittenByGpu) that no upload of CPU data replaced since (an
+  // invalidation clears the flag). The web's delayed memexport / resolve
+  // readback (WebGPUReadback) writes GPU data back into guest memory only for
+  // such pages.
+  bool IsPageGpuWritten(uint32_t address);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

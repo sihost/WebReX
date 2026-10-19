@@ -98,6 +98,10 @@ void WebGPURenderTargetCache::Shutdown(bool from_destructor) {
   // The command processor drains its stream before this, so render target
   // objects can be released right away.
   shutting_down_ = true;
+  if (delayed_readback_) {
+    delayed_readback_->Shutdown();
+    delayed_readback_.reset();
+  }
   DestroyAllRenderTargets(true);
   for (DummyAttachment& dummy : dummy_attachments_) {
     if (dummy.texture) {
@@ -629,6 +633,9 @@ bool WebGPURenderTargetCache::Resolve(memory::Memory& memory, WebGPUSharedMemory
       written_length_out = extent_length;
       ++statistics_.resolves;
       statistics_.resolve_bytes += extent_length;
+      // No delayed (--readback_resolve=fast) path: the native baseline films run
+      // with readback_resolve=none (its default), and the native fast run stalls in
+      // riverworld (p4/STATUS.md), so a delayed web path could not be verified.
       if (REXCVAR_GET(webgpu_readback_resolve)) {
         ReadbackResolve(memory, shared_memory, extent_start, extent_length);
       }
@@ -652,6 +659,45 @@ bool WebGPURenderTargetCache::Resolve(memory::Memory& memory, WebGPUSharedMemory
     }
   }
   return copied;
+}
+
+WebGPUReadback* WebGPURenderTargetCache::GetDelayedReadback(WebGPUSharedMemory& shared_memory) {
+  if (!delayed_readback_ && !shutting_down_) {
+    delayed_readback_ = std::make_unique<WebGPUReadback>(command_processor_, shared_memory);
+  }
+  return delayed_readback_.get();
+}
+
+void WebGPURenderTargetCache::BeginFrame() {
+  RenderTargetCache::BeginFrame();
+  if (delayed_readback_) {
+    delayed_readback_->EndFrame();
+  }
+#if REX_PLATFORM_WEB
+  // Host writers (kernel exports, CP memory writes) that marked the dirty map through a
+  // host pointer (rex/memory/host_write_web.h), every 600 frames.
+  if (++frames_ % 600 == 0) {
+    REXGPU_INFO("WebGPU: frame {}: {} host writes into guest physical memory marked dirty", frames_,
+                rex::memory::g_web_host_writes_marked.load(std::memory_order_relaxed));
+  }
+#endif
+}
+
+void WebGPURenderTargetCache::ReadbackMemExport(memory::Memory& memory,
+                                                WebGPUSharedMemory& shared_memory,
+                                                uint32_t address, uint32_t length) {
+  switch (WebGPUReadback::GetMemExportMode()) {
+    case WebGPUReadback::Mode::kAsync:
+      if (WebGPUReadback* readback = GetDelayedReadback(shared_memory)) {
+        readback->Enqueue(memory, address, length);
+      }
+      break;
+    case WebGPUReadback::Mode::kSync:
+      ReadbackResolve(memory, shared_memory, address, length);
+      break;
+    default:
+      break;
+  }
 }
 
 bool WebGPURenderTargetCache::ReadbackResolve(memory::Memory& memory,
