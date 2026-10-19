@@ -1715,6 +1715,8 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
   uint32_t output_location = 0;
 
+  Modification shader_modification = GetSpirvShaderModification();
+
   // Create the interpolator outputs.
   {
     uint32_t interpolators_remaining = GetModificationInterpolatorMask();
@@ -1727,12 +1729,16 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
       input_output_interpolators_[interpolator_index] = interpolator;
       builder_->addDecoration(interpolator, spv::DecorationLocation, int(output_location));
       builder_->addDecoration(interpolator, spv::DecorationInvariant);
+      // Same sampling as the linked pixel shader input (WebGPU requires the
+      // inter-stage interpolation qualifiers to match).
+      if (shader_modification.vertex.interpolators_centroid &
+          (UINT32_C(1) << interpolator_index)) {
+        builder_->addDecoration(interpolator, spv::DecorationCentroid);
+      }
       main_interface_.push_back(interpolator);
       ++output_location;
     }
   }
-
-  Modification shader_modification = GetSpirvShaderModification();
 
   if (shader_modification.vertex.output_point_parameters) {
     if (shader_modification.vertex.host_vertex_shader_type ==

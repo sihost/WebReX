@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -22,6 +23,15 @@
 #include <rex/ppc/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_UINT32(mm_physical_min_alignment, 0, "Kernel",
+                      "Minimum alignment of MmAllocatePhysicalMemoryEx blocks of at least "
+                      "mm_physical_min_alignment_size bytes (0 = only the title's alignment and "
+                      "the page size). MW2 needs 0x10000 if its 444 MB block comes back only 4 KB "
+                      "aligned (sub-allocators corrupt the script compiler)");
+REXCVAR_DEFINE_UINT32(mm_physical_min_alignment_size, 0x1000000, "Kernel",
+                      "Smallest block --mm_physical_min_alignment applies to; blocks this large "
+                      "also log their base address");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -381,6 +391,11 @@ ppc_u32_result_t MmAllocatePhysicalMemoryEx_entry(ppc_u32_t flags, ppc_u32_t reg
   // Round up the region size and alignment to the next page.
   uint32_t adjusted_size = rex::round_up(region_size, page_size);
   uint32_t adjusted_alignment = rex::round_up(alignment, page_size);
+  bool large_block = region_size >= REXCVAR_GET(mm_physical_min_alignment_size);
+  uint32_t min_alignment = REXCVAR_GET(mm_physical_min_alignment);
+  if (large_block && min_alignment > adjusted_alignment) {
+    adjusted_alignment = rex::round_up(min_alignment, page_size);
+  }
 
   uint32_t allocation_type = memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit;
   uint32_t protect = FromXdkProtectFlags(protect_bits);
@@ -406,6 +421,13 @@ ppc_u32_result_t MmAllocatePhysicalMemoryEx_entry(ppc_u32_t flags, ppc_u32_t reg
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
+  if (large_block) {
+    REXKRNL_INFO(
+        "MmAllocatePhysicalMemoryEx: {:#x} bytes (title alignment {:#x}, used {:#x}) at {:#x} "
+        "({}64 KB aligned)",
+        uint32_t(region_size), uint32_t(alignment), adjusted_alignment, base_address,
+        (base_address & 0xFFFF) == 0 ? "" : "NOT ");
+  }
 
   return base_address;
 }

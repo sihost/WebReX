@@ -34,6 +34,13 @@ REXCVAR_DEFINE_UINT32(max_file_size_bytes, 2097152, "Codegen",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(65536, 67108864);
 
+REXCVAR_DEFINE_BOOL(setjmp_separate_tu, true, "Codegen",
+                     "Emit the functions that call setjmp into their own TU "
+                     "(<project>_recomp_sjlj.cpp), which sources.cmake compiles at -O0 under "
+                     "Emscripten: with -sSUPPORT_LONGJMP=wasm an optimized setjmp-calling "
+                     "function can exceed the engine's maximum wasm function size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_UINT32(progress_log_frequency, 100, "Codegen",
                       "Log progress every N functions")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)

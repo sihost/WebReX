@@ -308,8 +308,23 @@ bool CodegenWriter::write(bool force) {
   size_t currentFileBytes = 0;
   println("#include \"{}_init.h\"\n", projectName);
 
+  // Functions that call setjmp go to their own TU (setjmp_separate_tu): under
+  // -sSUPPORT_LONGJMP=wasm every call in them is a possible longjmp landing, and optimized
+  // they can grow past V8's 7654321-byte function limit (MW2 sub_822AE0B0: 15.9 MB at -O3,
+  // 1.0 MB at -O0). sources.cmake builds that TU at -O0 under Emscripten. Each function's
+  // code includes its own alias line, so the alias stays with its target.
+  const bool separateSetjmp = REXCVAR_GET(setjmp_separate_tu);
+  std::string sjljCode;
+  size_t sjljFunctions = 0;
+
   for (size_t i = 0; i < functions.size(); i++) {
     std::string code = functions[i]->emitCpp(emitCtx);
+
+    if (separateSetjmp && code.find("ppc_setjmp(") != std::string::npos) {
+      sjljCode += code;
+      ++sjljFunctions;
+      continue;
+    }
 
     if (currentFileBytes > 0 && currentFileBytes + code.size() > REXCVAR_GET(max_file_size_bytes)) {
       SaveCurrentOutData();
@@ -327,6 +342,14 @@ bool CodegenWriter::write(bool force) {
   }
 
   SaveCurrentOutData();
+  const std::string sjljFileName = fmt::format("{}_recomp_sjlj.cpp", projectName);
+  if (!sjljCode.empty()) {
+    println("// Functions that call setjmp (setjmp_separate_tu): compiled at -O0 under Emscripten.");
+    println("#include \"{}_init.h\"\n", projectName);
+    out += sjljCode;
+    SaveCurrentOutData(sjljFileName);
+    REXCODEGEN_INFO("{} setjmp-calling function(s) emitted to {}", sjljFunctions, sjljFileName);
+  }
   REXCODEGEN_INFO("Recompilation complete.");
 
   // Generate sources.cmake
@@ -344,7 +367,19 @@ bool CodegenWriter::write(bool force) {
     for (size_t i = 0; i < cppFileIndex; ++i) {
       println("    ${{CMAKE_CURRENT_LIST_DIR}}/{}_recomp.{}.cpp", projectName, i);
     }
+    if (!sjljCode.empty()) {
+      println("    ${{CMAKE_CURRENT_LIST_DIR}}/{}", sjljFileName);
+    }
     println(")");
+    if (!sjljCode.empty()) {
+      println("");
+      println("# Functions that call setjmp. With -sSUPPORT_LONGJMP=wasm an optimized build of them");
+      println("# can exceed the engine's maximum wasm function size, so they are built at -O0.");
+      println("set(GENERATED_SJLJ_SOURCES ${{CMAKE_CURRENT_LIST_DIR}}/{})", sjljFileName);
+      println("if(EMSCRIPTEN)");
+      println("    set_source_files_properties(${{GENERATED_SJLJ_SOURCES}} PROPERTIES COMPILE_OPTIONS \"-O0\")");
+      println("endif()");
+    }
 
     SaveCurrentOutData("sources.cmake");
   }

@@ -50,6 +50,15 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
       return 0x80151802;  // ERROR_CONNECTION_INVALID
     }
+    case 0x0005800E: {
+      // XUserMuteListQuery(user, xuid, BOOL* muted): arg2 is the out pointer. Nobody is muted
+      // (MW2 queries this for every party member).
+      REXKRNL_DEBUG("XUserMuteListQuery({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (buffer_length >= 0x10000) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(buffer_length), 0);
+      }
+      return X_E_SUCCESS;
+    }
     case 0x00058020: {
       // 0x00058004 is called right before this.
       // We should create a XamEnumerate-able empty list here, but I'm not

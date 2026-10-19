@@ -176,7 +176,8 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
     auto content_dir = kernel_state()->content_manager()->ResolveGameUserContentPath();
-    std::filesystem::create_directories(content_dir);
+    std::error_code ec;  // a full storage (web: OPFS) must not throw into guest code
+    std::filesystem::create_directories(content_dir, ec);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");

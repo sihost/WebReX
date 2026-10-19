@@ -10,8 +10,20 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+
+#include <atomic>
+#include <mutex>
+#include <set>
+
+#include <rex/cvar.h>
+#include <rex/kernel/xam/xnet.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
+
+REXCVAR_DEFINE_BOOL(xgi_unknown_messages_succeed, true, "Kernel",
+                    "Unimplemented XGI messages (sessions, stats, matchmaking) answer success "
+                    "instead of failure (logged once per message). Titles such as MW2 take a "
+                    "failed XSessionStart/Modify/... for a Live error");
 
 namespace rex {
 namespace kernel {
@@ -62,25 +74,51 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0010: {
-      assert_true(!buffer_length || buffer_length == 28);
-      // Sequence:
+      // XSessionCreate. Sequence:
       // - XamSessionCreateHandle
       // - XamSessionRefObjByHandle
       // - [this]
       // - CloseHandle
-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0x0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 0x4);
-      uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 0x8);
-      uint32_t num_slots_private = memory::load_and_swap<uint32_t>(buffer + 0xC);
-      uint32_t user_xuid = memory::load_and_swap<uint32_t>(buffer + 0x10);
-      uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 0x14);
-      uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 0x18);
-
-      REXKRNL_DEBUG(
-          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
-          "{:08X})",
-          session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
-          nonce_ptr);
+      // Buffer (28 bytes): session, flags, public slots, private slots, user,
+      // XSESSION_INFO* (out for a host, in for a client), u64* nonce (rex/kernel/xam/xnet.h).
+      // A host's XSESSION_INFO must be filled (a system-link session id, the title XNADDR and a
+      // key): titles read it back and take an all-zero id for a Live error (MW2:
+      // Com_Error(XBOXLIVE_LIVEERROR)). Without Xbox Live, a session asking for Live features
+      // (presence, stats, matchmaking, arbitration) is refused and the title takes its offline
+      // path.
+      xnet::SessionCreateArgs args;
+      if (!buffer_ptr || !xnet::ParseSessionCreateArgs(buffer, buffer_length, &args)) {
+        REXKRNL_ERROR("XGISessionCreate: bad buffer {:08X} (length {})", buffer_ptr, buffer_length);
+        return X_E_INVALIDARG;
+      }
+      auto action = xnet::DecideSessionCreate(args.flags, /*live_available=*/false);
+      if (action == xnet::SessionCreateAction::kRefuseLive) {
+        REXKRNL_INFO(
+            "XGISessionCreate(session {:08X}, flags {:08X}, slots {}+{}) -> "
+            "X_ONLINE_E_SESSION_NOT_LOGGED_ON (Live features without Xbox Live)",
+            args.session, args.flags, args.public_slots, args.private_slots);
+        return xnet::kXOnlineESessionNotLoggedOn;
+      }
+      uint8_t* info = args.session_info_ptr
+                          ? memory_->TranslateVirtual<uint8_t*>(args.session_info_ptr)
+                          : nullptr;
+      uint8_t* nonce =
+          args.nonce_ptr ? memory_->TranslateVirtual<uint8_t*>(args.nonce_ptr) : nullptr;
+      uint8_t host_xnaddr[xnet::kXnAddrSize];
+      xnet::GetTitleXnAddr(host_xnaddr);
+      xnet::ApplySessionCreate(action, info, nonce, host_xnaddr, xnet::GlobalRandom(),
+                               xnet::DeterministicRandom());
+      uint64_t id = 0;
+      for (uint32_t i = 0; info && i < xnet::kXnKidSize; ++i) {
+        id = (id << 8) | info[i];
+      }
+      uint32_t ina = info ? xnet::XnAddrIna(info + xnet::kXnKidSize) : 0;
+      REXKRNL_INFO(
+          "XGISessionCreate(session {:08X}, flags {:08X}, slots {}+{}, user {}) -> {}: id "
+          "{:016X}, host {}.{}.{}.{}",
+          args.session, args.flags, args.public_slots, args.private_slots, args.user,
+          action == xnet::SessionCreateAction::kHost ? "host" : "join", id, ina >> 24,
+          (ina >> 16) & 255, (ina >> 8) & 255, ina & 255);
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -131,6 +169,22 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XGI 0x000B0071, unimplemented");
       return X_E_SUCCESS;
     }
+  }
+  if (REXCVAR_GET(xgi_unknown_messages_succeed)) {
+    static std::mutex seen_mutex;
+    static std::set<uint32_t> seen;
+    bool first;
+    {
+      std::lock_guard<std::mutex> lock(seen_mutex);
+      first = seen.insert(message).second;
+    }
+    if (first) {
+      REXKRNL_WARN(
+          "Unimplemented XGI message app={:08X}, msg={:08X}, arg1={:08X}, arg2={:08X}: "
+          "answered with success (--xgi_unknown_messages_succeed; logged once)",
+          app_id(), message, buffer_ptr, buffer_length);
+    }
+    return X_E_SUCCESS;
   }
   REXKRNL_ERROR(
       "Unimplemented XGI message app={:08X}, msg={:08X}, arg1={:08X}, "

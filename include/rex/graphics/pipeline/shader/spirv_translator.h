@@ -80,6 +80,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // Interpolators to output with centroid sampling, the
+      // PixelShaderModification::interpolators_centroid of the pixel shader
+      // linked with this vertex shader. Only for backends requiring matching
+      // interpolation qualifiers across stages (WebGPU: Dawn rejects a center
+      // vertex output feeding a centroid fragment input); Vulkan leaves it 0.
+      uint32_t interpolators_centroid : xenos::kMaxInterpolators;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
