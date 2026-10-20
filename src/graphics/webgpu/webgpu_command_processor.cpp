@@ -1474,10 +1474,13 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     UpdateFramePacing(SteadyMs() - gpu_wait_start_ms);
   }
   primitive_processor_->EndFrame();  // WP3: after the latency wait
-  // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
-  // on by default): pages not written by the GPU become invalid, so vertex and
-  // index data are uploaded again on their next request even if a CPU write
-  // escaped the dirty map. Textures still depend on invalidation (watches).
+  // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state):
+  // pages not written by the GPU become invalid, so vertex and index data are
+  // uploaded again on their next request even if a CPU write escaped the dirty
+  // map. OFF by default on web (see command_processor.cpp): the dirty map covers
+  // every CPU write (1355d5f, 621b4c1; --webgpu_verify_shared_memory: 0 stale
+  // pages in 2x300 s MW2 + a Halo film), and it cost MW2 ~15-17 MiB/frame of
+  // uploads vs ~0.8 MiB. --clear_memory_page_state=true restores it.
   if (REXCVAR_GET(clear_memory_page_state)) {
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
@@ -1499,7 +1502,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
-        "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
+        "{:.3f} ms, submit {:.3f} ms, {} redundant state calls skipped | uncaptured errors {} | "
+        "verify: {} pages checked, {} "
         "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
         "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
         "the tessellator | skipped (pipeline not ready) {} in all replays, pipeline waits {} "
@@ -1525,7 +1529,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         submission_tracker_.replayed(), submission_tracker_.completed(),
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
-        replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
+        replay.submit_ms, replay.redundant_state_skipped, device_.uncaptured_error_count(),
+        shared_memory_->verified_pages(),
         shared_memory_->stale_pages(), statistics_.memexport_dispatches,
         statistics_.memexport_unsupported, statistics_.draws_tessellated,
         tessellator_ ? tessellator_->statistics().patches : 0,

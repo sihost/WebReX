@@ -225,6 +225,16 @@ TEST_CASE("Fold inline loads/stores and the 0x7F alias path", "[memory][fold]") 
   CHECK(p == buf.data() + 0x3080);
   CHECK(g_phys_dirty[3] == 1);
   CHECK(g_phys_dirty[4] == 0);
+
+  // RawStoreW (PPC_RAW_ADDR_W on web) marks when the full-expression ends, after the store.
+  bool marked_during_store = true;
+  [&](uint8_t* q) {
+    marked_during_store = g_phys_dirty[5] != 0;
+    *q = 0x77;
+  }(RawStoreW(base, 0xA0005010u).ptr);
+  CHECK_FALSE(marked_during_store);
+  CHECK(buf[0x5010] == 0x77);
+  CHECK(g_phys_dirty[5] == 1);
 }
 
 TEST_CASE("Fold routes registered MMIO windows to MMIOHandler", "[memory][fold]") {

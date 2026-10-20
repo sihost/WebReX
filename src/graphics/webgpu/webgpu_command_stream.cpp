@@ -20,9 +20,20 @@
 
 #include <emscripten/emscripten.h>
 
+#include <rex/cvar.h>
 #include <rex/graphics/webgpu/webgpu_device.h>
 #include <rex/graphics/webgpu/webgpu_log.h>
 #include <rex/graphics/webgpu/webgpu_submission_tracker.h>
+
+REXCVAR_DEFINE_BOOL(webgpu_filter_redundant_state, true, "GPU",
+                    "WebGPU: skip pass state calls (pipeline, vertex/index buffer, viewport, "
+                    "scissor, bind group) that set the value already set in the pass");
+
+REXCVAR_DEFINE_INT32(webgpu_bind_group_cache_replays, 120, "GPU",
+                     "WebGPU: keep bind groups created from recorded descriptors for N stream "
+                     "replays after their last use and reuse them in later replays (the entry "
+                     "holds references to its buffers, samplers and views). 0 = create them "
+                     "again in every replay");
 
 namespace rex::graphics::webgpu {
 
@@ -286,12 +297,51 @@ WebGPUReplayState::WebGPUReplayState(WebGPUDevice& device, WebGPUPipelineTable* 
     : device_(device), pipelines_(pipelines) {}
 
 WebGPUReplayState::~WebGPUReplayState() {
+  ClearBindGroupCache();
   if (staging_buffer_) {
     wgpuBufferRelease(staging_buffer_);
   }
   if (constant_buffer_) {
     wgpuBufferRelease(constant_buffer_);
   }
+}
+
+void WebGPUReplayState::ReleaseCachedBindGroup(CachedBindGroup& cached) {
+  wgpuBindGroupRelease(cached.bind_group);
+  const auto* entries = reinterpret_cast<const WGPUBindGroupEntry*>(
+      cached.key.data() + sizeof(WGPUBindGroupLayout));
+  size_t entry_count = (cached.key.size() - sizeof(WGPUBindGroupLayout)) /
+                       sizeof(WGPUBindGroupEntry);
+  for (size_t i = 0; i < entry_count; ++i) {
+    if (entries[i].buffer && entries[i].buffer != StreamConstantsBuffer()) {
+      wgpuBufferRelease(entries[i].buffer);
+    }
+    if (entries[i].sampler) {
+      wgpuSamplerRelease(entries[i].sampler);
+    }
+    if (entries[i].textureView) {
+      wgpuTextureViewRelease(entries[i].textureView);
+    }
+  }
+}
+
+void WebGPUReplayState::ClearBindGroupCache() {
+  for (auto& it : bind_group_cache_) {
+    ReleaseCachedBindGroup(it.second);
+  }
+  bind_group_cache_.clear();
+}
+
+void WebGPUReplayState::TrimBindGroupCache(uint32_t replay_index, uint32_t max_age) {
+  for (auto it = bind_group_cache_.begin(); it != bind_group_cache_.end();) {
+    if (replay_index - it->second.last_used_replay >= max_age) {
+      ReleaseCachedBindGroup(it->second);
+      it = bind_group_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  bind_group_cache_last_trim_ = replay_index;
 }
 
 bool WebGPUReplayState::EnsureBuffer(WGPUBuffer& buffer, uint64_t& buffer_size, uint64_t needed,
@@ -306,6 +356,12 @@ bool WebGPUReplayState::EnsureBuffer(WGPUBuffer& buffer, uint64_t& buffer_size, 
     REXWGPU_ERROR("WebGPU replay: {} needs {} bytes, above maxBufferSize {}", label, needed,
                   device_.limits().maxBufferSize);
     return false;
+  }
+  if (&buffer == &constant_buffer_) {
+    // Cached bind groups bind the old constant buffer (without a reference of their own), and
+    // the new buffer may get the old handle's address, so comparing handles in Execute is not
+    // enough: flush here (MW2 mp_afghan: "Dynamic Offset ... out of bounds" every frame).
+    ClearBindGroupCache();
   }
   if (buffer) {
     // Already-submitted work keeps the old buffer alive.
@@ -804,6 +860,12 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     // one are skipped (their pipeline id was not ready yet).
     bool pipeline_ready = false;
     state.transient_bind_groups_.clear();
+    const bool cache_bind_groups = REXCVAR_GET(webgpu_bind_group_cache_replays) > 0;
+    if (state.bind_group_cache_constant_buffer_ != state.constant_buffer_) {
+      // Cached groups bound the old constant buffer.
+      state.ClearBindGroupCache();
+      state.bind_group_cache_constant_buffer_ = state.constant_buffer_;
+    }
     // --webgpu_log_skipped_pipelines (WebGPUCommandQueue::set_log_skipped_pipelines).
     const bool log_skips = state.log_skipped_pipelines_;
     const uint32_t replay_index = ++state.replay_index_;
@@ -839,6 +901,49 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     const uint8_t* record = commands_.data;
     const uint8_t* records_end = commands_.data + commands_.size;
     std::vector<WGPUBindGroupEntry> entries_scratch;
+    // Redundant state filter, reset at every pass start: WebGPU pass state (pipeline, vertex /
+    // index buffers, viewport, scissor, bind groups) persists across draws and pipeline changes,
+    // so re-setting an identical value is a no-op that still costs a JS call (with BigInt
+    // offsets on wasm64 and a typed-array view for dynamic offsets).
+    constexpr uint32_t kFilterVertexSlots = 8, kFilterGroups = 4, kFilterOffsets = 8;
+    struct FilterGroup {
+      const void* group;
+      uint32_t offset_count;
+      uint32_t offsets[kFilterOffsets];
+    };
+    struct FilterState {
+      const void* pipeline;
+      bool vertex_valid[kFilterVertexSlots];
+      ArgsSetVertexBuffer vertex[kFilterVertexSlots];
+      bool index_valid, viewport_valid, scissor_valid;
+      ArgsSetIndexBuffer index;
+      ArgsSetViewport viewport;
+      ArgsSetScissorRect scissor;
+      FilterGroup groups[kFilterGroups];
+    } filter;
+    auto reset_filter = [&filter]() { std::memset(&filter, 0, sizeof(filter)); };
+    reset_filter();
+    const bool filter_on = REXCVAR_GET(webgpu_filter_redundant_state);
+    // Returns true if the bind group call is redundant; otherwise records it as bound.
+      auto group_redundant = [&filter, filter_on](uint32_t index, const void* group,
+                                                  uint32_t offset_count, const uint32_t* offsets) {
+      if (!filter_on || index >= kFilterGroups) {
+        return false;
+      }
+      FilterGroup& bound = filter.groups[index];
+      if (offset_count > kFilterOffsets) {
+        bound.group = nullptr;
+        return false;
+      }
+      if (bound.group == group && bound.offset_count == offset_count &&
+          !std::memcmp(bound.offsets, offsets, sizeof(uint32_t) * offset_count)) {
+        return true;
+      }
+      bound.group = group;
+      bound.offset_count = offset_count;
+      std::memcpy(bound.offsets, offsets, sizeof(uint32_t) * offset_count);
+      return false;
+    };
     while (record < records_end) {
       const auto* header = reinterpret_cast<const CommandHeader*>(record);
       const void* args_ptr = header + 1;
@@ -857,6 +962,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                   : nullptr;
           desc.occlusionQuerySet = args->occlusion_query_set;
           render_pass = wgpuCommandEncoderBeginRenderPass(encoder, &desc);
+          reset_filter();
           pipeline_ready = false;
           current_id = kInvalidPipelineId;
           ++stats.render_passes;
@@ -870,6 +976,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
         case Command::kBeginComputePass: {
           WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
           compute_pass = wgpuCommandEncoderBeginComputePass(encoder, &desc);
+          reset_filter();
           pipeline_ready = false;
           current_id = kInvalidPipelineId;
           ++stats.compute_passes;
@@ -887,8 +994,9 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                   : nullptr;
           pipeline_ready = pipeline != nullptr;
           current_id = static_cast<const ArgsId*>(args_ptr)->id;
-          if (pipeline) {
+          if (pipeline && pipeline != filter.pipeline) {
             wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            filter.pipeline = filter_on ? pipeline : nullptr;
           }
           break;
         }
@@ -897,31 +1005,68 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
               const_cast<void*>(static_cast<const ArgsHandle*>(args_ptr)->handle));
           pipeline_ready = pipeline != nullptr;
           current_id = kInvalidPipelineId;
-          if (pipeline) {
+          if (pipeline && pipeline != filter.pipeline) {
             wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            filter.pipeline = filter_on ? pipeline : nullptr;
           }
           break;
         }
         case Command::kSetVertexBuffer: {
           const auto* args = static_cast<const ArgsSetVertexBuffer*>(args_ptr);
+          if (filter_on && args->slot < kFilterVertexSlots) {
+            const ArgsSetVertexBuffer& bound = filter.vertex[args->slot];
+            if (filter.vertex_valid[args->slot] && bound.buffer == args->buffer &&
+                bound.offset == args->offset && bound.size == args->size) {
+              ++stats.redundant_state_skipped;
+              break;
+            }
+            filter.vertex_valid[args->slot] = true;
+            filter.vertex[args->slot] = *args;
+          }
           wgpuRenderPassEncoderSetVertexBuffer(render_pass, args->slot, args->buffer, args->offset,
                                                args->size);
           break;
         }
         case Command::kSetIndexBuffer: {
           const auto* args = static_cast<const ArgsSetIndexBuffer*>(args_ptr);
+          if (filter.index_valid && filter.index.buffer == args->buffer &&
+              filter.index.format == args->format && filter.index.offset == args->offset &&
+              filter.index.size == args->size) {
+            ++stats.redundant_state_skipped;
+            break;
+          }
+          filter.index_valid = filter_on;
+          filter.index = *args;
           wgpuRenderPassEncoderSetIndexBuffer(render_pass, args->buffer, args->format,
                                               args->offset, args->size);
           break;
         }
         case Command::kSetViewport: {
           const auto* args = static_cast<const ArgsSetViewport*>(args_ptr);
+          if (filter.viewport_valid && filter.viewport.x == args->x &&
+              filter.viewport.y == args->y && filter.viewport.width == args->width &&
+              filter.viewport.height == args->height &&
+              filter.viewport.min_depth == args->min_depth &&
+              filter.viewport.max_depth == args->max_depth) {
+            ++stats.redundant_state_skipped;
+            break;
+          }
+          filter.viewport_valid = filter_on;
+          filter.viewport = *args;
           wgpuRenderPassEncoderSetViewport(render_pass, args->x, args->y, args->width,
                                            args->height, args->min_depth, args->max_depth);
           break;
         }
         case Command::kSetScissorRect: {
           const auto* args = static_cast<const ArgsSetScissorRect*>(args_ptr);
+          if (filter.scissor_valid && filter.scissor.x == args->x &&
+              filter.scissor.y == args->y && filter.scissor.width == args->width &&
+              filter.scissor.height == args->height) {
+            ++stats.redundant_state_skipped;
+            break;
+          }
+          filter.scissor_valid = filter_on;
+          filter.scissor = *args;
           wgpuRenderPassEncoderSetScissorRect(render_pass, args->x, args->y, args->width,
                                               args->height);
           break;
@@ -998,7 +1143,10 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
         case Command::kSetBindGroup: {
           const auto* args = static_cast<const ArgsSetBindGroup*>(args_ptr);
           const auto* offsets = reinterpret_cast<const uint32_t*>(args + 1);
-          if (render_pass) {
+          if (group_redundant(args->group_index, args->group, args->dynamic_offset_count,
+                              offsets)) {
+            ++stats.redundant_state_skipped;
+          } else if (render_pass) {
             wgpuRenderPassEncoderSetBindGroup(render_pass, args->group_index, args->group,
                                               args->dynamic_offset_count, offsets);
           } else if (compute_pass) {
@@ -1013,18 +1161,35 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           const auto* offsets = reinterpret_cast<const uint32_t*>(entries + args->entry_count);
           size_t compare_size = sizeof(args->layout) + sizeof(WGPUBindGroupEntry) * args->entry_count;
           WGPUBindGroup group = nullptr;
-          for (const WebGPUReplayState::TransientBindGroup& transient :
-               state.transient_bind_groups_) {
-            if (transient.hash != args->hash) {
-              continue;
+          bool cacheable = cache_bind_groups;
+          for (uint32_t i = 0; cacheable && i < args->entry_count; ++i) {
+            cacheable = entries[i].nextInChain == nullptr;
+          }
+          if (cacheable) {
+            auto range = state.bind_group_cache_.equal_range(args->hash);
+            for (auto it = range.first; it != range.second; ++it) {
+              if (it->second.key.size() == compare_size &&
+                  !std::memcmp(it->second.key.data(), &args->layout, compare_size)) {
+                group = it->second.bind_group;
+                it->second.last_used_replay = replay_index;
+                ++stats.bind_groups_reused;
+                break;
+              }
             }
-            const auto* other = reinterpret_cast<const ArgsSetBindGroupDesc*>(
-                commands_.data + transient.record_offset);
-            if (other->entry_count == args->entry_count &&
-                !std::memcmp(&other->layout, &args->layout, compare_size)) {
-              group = transient.bind_group;
-              ++stats.bind_groups_reused;
-              break;
+          } else {
+            for (const WebGPUReplayState::TransientBindGroup& transient :
+                 state.transient_bind_groups_) {
+              if (transient.hash != args->hash) {
+                continue;
+              }
+              const auto* other = reinterpret_cast<const ArgsSetBindGroupDesc*>(
+                  commands_.data + transient.record_offset);
+              if (other->entry_count == args->entry_count &&
+                  !std::memcmp(&other->layout, &args->layout, compare_size)) {
+                group = transient.bind_group;
+                ++stats.bind_groups_reused;
+                break;
+              }
             }
           }
           if (!group && args->layout) {
@@ -1039,14 +1204,36 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
             desc.entryCount = entries_scratch.size();
             desc.entries = entries_scratch.data();
             group = wgpuDeviceCreateBindGroup(wgpu_device, &desc);
-            if (group) {
+            if (group && cacheable) {
+              WebGPUReplayState::CachedBindGroup cached;
+              const auto* key = reinterpret_cast<const uint8_t*>(&args->layout);
+              cached.key.assign(key, key + compare_size);
+              cached.bind_group = group;
+              cached.last_used_replay = replay_index;
+              for (uint32_t i = 0; i < args->entry_count; ++i) {
+                if (entries[i].buffer && entries[i].buffer != StreamConstantsBuffer()) {
+                  wgpuBufferAddRef(entries[i].buffer);
+                }
+                if (entries[i].sampler) {
+                  wgpuSamplerAddRef(entries[i].sampler);
+                }
+                if (entries[i].textureView) {
+                  wgpuTextureViewAddRef(entries[i].textureView);
+                }
+              }
+              state.bind_group_cache_.emplace(args->hash, std::move(cached));
+              ++stats.bind_groups_created;
+            } else if (group) {
               state.transient_bind_groups_.push_back(
                   {args->hash, size_t(reinterpret_cast<const uint8_t*>(args) - commands_.data),
                    group});
               ++stats.bind_groups_created;
             }
           }
-          if (group) {
+          if (group && group_redundant(args->group_index, group, args->dynamic_offset_count,
+                                       offsets)) {
+            ++stats.redundant_state_skipped;
+          } else if (group) {
             if (render_pass) {
               wgpuRenderPassEncoderSetBindGroup(render_pass, args->group_index, group,
                                                 args->dynamic_offset_count, offsets);
@@ -1146,6 +1333,16 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     wgpuBindGroupRelease(transient.bind_group);
   }
   state.transient_bind_groups_.clear();
+  {
+    // Age out cached bind groups (every 16 replays, or every replay when the
+    // cache is off or large) so destroyed resources are not kept referenced.
+    const int32_t max_age = REXCVAR_GET(webgpu_bind_group_cache_replays);
+    const uint32_t now = state.replay_index_;
+    if (max_age <= 0 || state.bind_group_cache_.size() > 16384 ||
+        now - state.bind_group_cache_last_trim_ >= 16) {
+      state.TrimBindGroupCache(now + 1, max_age > 0 ? uint32_t(max_age) : 1);
+    }
+  }
   double time_submitted = emscripten_get_now();
 
   // Callbacks run even if the device is gone: they release their own objects.

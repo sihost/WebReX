@@ -39,10 +39,21 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/platform.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+// Web default OFF: the wasm build tracks every CPU write to guest physical memory in the dirty
+// map (guest stores incl. stvx/dcbz/dcbz128/stwcx. mark after the data since 1355d5f; VdSwap /
+// VdInitializeScalerCommandBuffer / copy_and_swap mark their writes since 621b4c1), so the
+// per-swap invalidation of all non-GPU-written pages is redundant there and only costs uploads
+// (MW2 mp_afghan ~15-17 MiB/frame -> ~0.8 MiB/frame). Verified with
+// --clear_memory_page_state=false --webgpu_verify_shared_memory=true (hashes every uploaded page
+// and reports pages changed without a dirty mark): two 300 s MW2 runs (menu + match) and a 420 s
+// Halo 3 riverworld film found 0 stale pages and 0 late marks. Re-run that verify mode after
+// adding host code that writes guest memory (it must call memory::NoteHostWrite after the
+// write). Native (D3D12/Vulkan) keeps the upstream default.
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, !REX_PLATFORM_WEB, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
