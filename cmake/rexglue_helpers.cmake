@@ -27,6 +27,26 @@ function(rexglue_configure_target target_name)
     target_sources(${target_name} PRIVATE
         ${REXGLUE_SHARE_DIR}/rex_app.cpp)
 
+    # Guest indirect calls to an address with no generated function (rex/ppc/context.h,
+    # PPC_CHECKED_INDIRECT_CALLS). DEFAULT: checked + fatal in Debug, unchecked otherwise.
+    # FATAL: always checked, log the target and abort. LOG: always checked, log each bad
+    # target once and skip the call (a function codegen missed is reported, the game goes on).
+    # OFF: never checked.
+    set(REXGLUE_CHECKED_INDIRECT_CALLS "DEFAULT" CACHE STRING
+        "Guest indirect calls with no target: DEFAULT, FATAL, LOG or OFF")
+    set_property(CACHE REXGLUE_CHECKED_INDIRECT_CALLS PROPERTY STRINGS DEFAULT FATAL LOG OFF)
+    string(TOUPPER "${REXGLUE_CHECKED_INDIRECT_CALLS}" _rex_checked_calls)
+    if(_rex_checked_calls STREQUAL "FATAL")
+        target_compile_definitions(${target_name} PRIVATE PPC_CHECKED_INDIRECT_CALLS=1)
+    elseif(_rex_checked_calls STREQUAL "LOG")
+        target_compile_definitions(${target_name} PRIVATE PPC_CHECKED_INDIRECT_CALLS=2)
+    elseif(_rex_checked_calls STREQUAL "OFF")
+        target_compile_definitions(${target_name} PRIVATE PPC_CHECKED_INDIRECT_CALLS=0)
+    elseif(NOT _rex_checked_calls STREQUAL "DEFAULT")
+        message(FATAL_ERROR "REXGLUE_CHECKED_INDIRECT_CALLS must be DEFAULT, FATAL, LOG or OFF "
+                            "(got '${REXGLUE_CHECKED_INDIRECT_CALLS}')")
+    endif()
+
     # Web (Emscripten, wasm64) platform settings. No GTK, no code model.
     if(EMSCRIPTEN)
         target_compile_options(${target_name} PRIVATE

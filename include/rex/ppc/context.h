@@ -19,8 +19,10 @@
 #include <csetjmp>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <rex/chrono/clock.h>  // For mftb timebase access
 #include <rex/logging.h>
@@ -154,6 +156,11 @@ void GuestTraceEnter(const char* name, bool is_trigger);
 // Memory::SetFunction accepts - and null slots, with the guest target in the log. Without
 // the check an out-of-range target reads guest data as a function pointer, and a null slot
 // is a segfault natively / an unrecoverable "null function" trap on wasm.
+//   PPC_CHECKED_INDIRECT_CALLS=1: log the target and abort (REX_FATAL).
+//   PPC_CHECKED_INDIRECT_CALLS=2: log each bad target once and skip the call (r3 = 0), so a
+//     function codegen missed shows up in the log instead of ending the session.
+// Games select this with the CMake cache variable REXGLUE_CHECKED_INDIRECT_CALLS
+// (OFF / FATAL / LOG, see rexglue_configure_target).
 #ifndef PPC_CHECKED_INDIRECT_CALLS
 #ifdef NDEBUG
 #define PPC_CHECKED_INDIRECT_CALLS 0
@@ -175,6 +182,13 @@ void GuestTraceEnter(const char* name, bool is_trigger);
       _ppc_fn = PPC_LOOKUP_FUNC(base, _ppc_target);                                         \
     }                                                                                       \
     if (!_ppc_fn) [[unlikely]] {                                                            \
+      if constexpr (PPC_CHECKED_INDIRECT_CALLS == 2) {                                      \
+        ::rex::detail::PPCMissingIndirectCall(                                              \
+            _ppc_target, ctx.lr, uint32_t(PPC_CODE_BASE),                                   \
+            uint32_t(PPC_CODE_SIZE) + PPC_FUNC_TABLE_THUNK_RESERVE);                        \
+        ctx.r3.u64 = 0;                                                                     \
+        break;                                                                              \
+      }                                                                                     \
       ::rex::detail::PPCBadIndirectCall(_ppc_target, ctx.lr, uint32_t(PPC_CODE_BASE),       \
                                         uint32_t(PPC_CODE_SIZE) + PPC_FUNC_TABLE_THUNK_RESERVE); \
     }                                                                                       \
@@ -197,6 +211,32 @@ namespace rex::detail {
   }
   REX_FATAL("indirect call to {:08X} (lr={:08X}): no host function registered", target,
             uint32_t(lr));
+}
+
+// Cold path of PPC_CHECKED_INDIRECT_CALLS=2: logs each bad target once (the first 256
+// distinct ones) and returns; the caller skips the call.
+[[gnu::cold, gnu::noinline]] inline void PPCMissingIndirectCall(uint32_t target, uint64_t lr,
+                                                                uint32_t code_base,
+                                                                uint32_t table_span) {
+  static std::mutex mutex;
+  static std::unordered_set<uint32_t> seen;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.size() >= 256 || !seen.insert(target).second) {
+      return;
+    }
+  }
+  if (target - code_base >= table_span) {
+    REXLOG_ERROR(
+        "indirect call to {:08X} (lr={:08X}) outside the function table [{:08X}, {:08X}); call "
+        "skipped, r3=0",
+        target, uint32_t(lr), code_base, code_base + table_span);
+    return;
+  }
+  REXLOG_ERROR(
+      "indirect call to {:08X} (lr={:08X}): no host function registered; call skipped, r3=0 "
+      "(add the address to the codegen config's [functions] if it is code)",
+      target, uint32_t(lr));
 }
 }  // namespace rex::detail
 
