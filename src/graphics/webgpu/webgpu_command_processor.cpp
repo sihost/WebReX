@@ -1475,9 +1475,10 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   primitive_processor_->EndFrame();  // WP3: after the latency wait
   // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
-  // on by default): pages not written by the GPU become invalid, so vertex and
-  // index data are uploaded again on their next request even if a CPU write
-  // escaped the dirty map. Textures still depend on invalidation (watches).
+  // off by default on web): pages not written by the GPU become invalid, so
+  // vertex and index data are uploaded again on their next request even if a
+  // CPU write escaped the dirty map. Costly (every vertex/index page of the
+  // frame re-uploaded); --webgpu_verify_shared_memory finds escaped writes.
   if (REXCVAR_GET(clear_memory_page_state)) {
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
@@ -1499,7 +1500,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
-        "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
+        "{:.3f} ms, submit {:.3f} ms, {} redundant state calls skipped | uncaptured errors {} | "
+        "verify: {} pages checked, {} "
         "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
         "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
         "the tessellator | skipped (pipeline not ready) {} in all replays, pipeline waits {} "
@@ -1525,7 +1527,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         submission_tracker_.replayed(), submission_tracker_.completed(),
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
-        replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
+        replay.submit_ms, replay.redundant_state_skipped, device_.uncaptured_error_count(),
+        shared_memory_->verified_pages(),
         shared_memory_->stale_pages(), statistics_.memexport_dispatches,
         statistics_.memexport_unsupported, statistics_.draws_tessellated,
         tessellator_ ? tessellator_->statistics().patches : 0,

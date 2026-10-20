@@ -112,6 +112,9 @@ struct WebGPUReplayStats {
   uint32_t copies = 0;
   uint32_t bind_groups_created = 0;
   uint32_t bind_groups_reused = 0;
+  // Pass state calls dropped because the same value was already set in the pass
+  // (--webgpu_filter_redundant_state).
+  uint32_t redundant_state_skipped = 0;
   uint64_t upload_bytes = 0;
   uint64_t constant_bytes = 0;
   // Device-thread wall time of Execute: arena writes + encoding, and the
