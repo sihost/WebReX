@@ -123,6 +123,18 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
 | `depth32float-stencil8` | D24FS8 depth stored in depth24plus | — |
 | `texture-component-swizzle` | swizzles applied in shaders (same result) | `--webgpu_texture_component_swizzle=false` |
 
+## GPU copy of guest memory (dirty map)
+
+- The web build does not re-upload every vertex/index page each frame: `clear_memory_page_state` defaults to
+  `false` on web (native keeps `true`). The GPU copy of guest physical memory is refreshed only from the dirty
+  map, which every guest store marks after its data. This cut MW2's uploads from ~15-17 MiB/frame to ~0.8.
+- Host code (kernel exports, hooks, file reads) that writes guest physical memory must call
+  `memory::NoteHostWrite` / `Memory::MarkPhysicalDirty` AFTER the write, or the GPU keeps a stale copy
+  (symptom: corrupt or flickering geometry/UI).
+- Diagnose with `--webgpu_verify_shared_memory=true` (slow: hashes every uploaded page, logs pages
+  "changed since its upload without a dirty mark" with the changed bytes). `--clear_memory_page_state=true`
+  restores the per-frame invalidation as a fallback.
+
 ## Input
 
 - **`XInputGetKeystroke` `VK_PAD_*` synthesis** is missing in the SDK mouse-and-keyboard and web drivers.
