@@ -357,6 +357,12 @@ bool WebGPUReplayState::EnsureBuffer(WGPUBuffer& buffer, uint64_t& buffer_size, 
                   device_.limits().maxBufferSize);
     return false;
   }
+  if (&buffer == &constant_buffer_) {
+    // Cached bind groups bind the old constant buffer (without a reference of their own), and
+    // the new buffer may get the old handle's address, so comparing handles in Execute is not
+    // enough: flush here (MW2 mp_afghan: "Dynamic Offset ... out of bounds" every frame).
+    ClearBindGroupCache();
+  }
   if (buffer) {
     // Already-submitted work keeps the old buffer alive.
     wgpuBufferRelease(buffer);
