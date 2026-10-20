@@ -28,15 +28,15 @@ runtime. WebReX takes the runtime that recompiled code runs on and makes it work
 
 | Area | What WebReX does in the browser |
 |---|---|
-| **GPU (Xenos)** | Xenos command processor on WebGPU (`src/graphics/webgpu/`): command streams recorded on the game's GPU thread and replayed on a WebGPU device thread, guest memory mirrored with a dirty map, EDRAM emulation with resolves, render-target and texture caches, Xenos texture formats decoded on the GPU, tessellation and vertex memexport as compute passes |
+| **GPU (Xenos)** | Xenos command processor on WebGPU (`src/graphics/webgpu/`): command streams recorded on the game's GPU thread and replayed on a WebGPU device thread (render-pass calls batched into one JS call, bind groups reused across frames), guest memory mirrored with a dirty map (only changed pages are uploaded; `--webgpu_verify_shared_memory` checks it), EDRAM emulation with resolves, render-target and texture caches, Xenos texture formats decoded on the GPU, tessellation and vertex memexport as compute passes. Draw resolution scaling (`--draw_resolution_scale_x/y`, 2x/3x) |
 | **Shaders** | Xenos shader microcode → SPIR-V → WGSL through [Tint](https://dawn.googlesource.com/dawn). Translation runs on worker threads and is cached in browser storage (OPFS). The 93 built-in shaders ship pre-translated |
 | **Display** | `WebGPUPresenter` draws the game's frames to a canvas once per animation frame, letterboxed, and handles resizes and device loss. Same CAS/FSR output effects as native (`--present_effect`), fullscreen with Keyboard Lock (F11). Includes the ImGui settings/debug overlay |
-| **Threads and memory** | Emscripten pthreads with suspend, APCs and timers like the 360 kernel expects; the 4 GB guest address space inside wasm64 memory |
+| **Threads and memory** | Emscripten pthreads with suspend, APCs and timers like the 360 kernel expects; guest vblanks paced by the browser's animation frames; the 4 GB guest address space inside wasm64 memory, which starts at 3 GB and grows as needed (per-title `REXGLUE_WEB_INITIAL_MEMORY` / `REXGLUE_WEB_MAXIMUM_MEMORY`) with a clear out-of-memory report |
 | **Files** | Game files stream over HTTP Range requests with an OPFS block cache; saves and profiles persist in OPFS across reloads |
 | **Audio** | AudioWorklet output fed from a SharedArrayBuffer ring, with adaptive latency and optional 5.1 |
 | **Input** | Gamepad API, keyboard and mouse with raw pointer lock, and an opt-in on-screen touch gamepad (`Module.rexTouchGamepad`) |
-| **Network** | System link as a virtual UDP LAN over a WebSocket relay: guest `NetDll_*` sockets (UDP and VDP, broadcast) run on the relay, and XNet (title address, secure addresses, keys, QoS) and `XSessionCreate` are implemented for System Link. A standalone reference relay is in [`tools/web_relay`](tools/web_relay/README.md) |
-| **Codegen** | Functions that call setjmp go into their own translation unit, compiled at -O0 for the web (`setjmp_separate_tu`), so no wasm function exceeds V8's 7.65 MB limit |
+| **Network** | System link as a virtual UDP LAN over a WebSocket relay: guest `NetDll_*` sockets (UDP and VDP, broadcast) run on the relay, and XNet (title address, secure addresses, keys, QoS) and `XSessionCreate` are implemented for System Link. Tabs connect peer-to-peer over WebRTC DataChannels when they can (signalled through the relay, which also answers STUN), and fall back to the relay. A standalone reference relay with room passwords, access keys and rate limits is in [`tools/web_relay`](tools/web_relay/README.md) |
+| **Codegen** | Finds functions that are only reached through pointers or tail branches by itself (no manual `[functions]` entries); a call to an address with no generated code can log and continue (`REXGLUE_CHECKED_INDIRECT_CALLS`). Functions that call setjmp go into their own translation unit, compiled at -O0 for the web (`setjmp_separate_tu`), so no wasm function exceeds V8's 7.65 MB limit |
 | **Page** | Crash reports from any thread (`Module.rexOnFatal`) and page lifecycle hooks for hidden tabs and Memory Saver discards (`rexOnLifecycle`, `rexOnDiscardRisk`, `rexOnDiscarded`). See [`docs/web_limitations.md`](docs/web_limitations.md) |
 
 Native builds (Windows/Linux with D3D12/Vulkan) still work from the same tree.
@@ -60,8 +60,8 @@ they begin it get the same fixed results natively.
 
 | Area | Gap |
 |---|---|
-| Browsers | Chromium is the target. Firefox loads games with 0 WebGPU errors but creates render pipelines very slowly (about one frame per 10 s in game); Safari is untested |
-| Memory | A large game needs about 8 GB of wasm memory per tab (Halo 3: ~3.5 GB heap break in play) |
+| Browsers | Chromium is the target. Firefox runs games with 0 WebGPU errors but slowly: it compiles pipelines one at a time (about 1.5 frames/s in Halo while a map's pipelines compile, no long stalls); Safari is untested |
+| Memory | A large game needs 3-4 GB of wasm memory per tab in play (MW2 3.4 GB, Halo 3 ~3.5 GB); memory grows up to 8 GB by default |
 | GPU | First boot with an empty shader cache: a precompiled WGSL bundle covers most pipelines, but frames right after the first map load (tick ~150) can still differ from native until the rest are created |
 | GPU | Memexport results stay on the GPU by default; `--webgpu_readback_memexport_delayed` copies them back into guest memory about a frame late without waiting (the native `readback_memexport_fast` path). Off by default: one of three film runs had a wrong frame at the first map load with it on |
 | GPU | 16-bit normalized textures are stored as float16 so they stay filterable (precision differs from native) |
