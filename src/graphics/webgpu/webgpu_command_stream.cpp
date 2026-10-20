@@ -29,6 +29,78 @@ REXCVAR_DEFINE_BOOL(webgpu_filter_redundant_state, true, "GPU",
                     "WebGPU: skip pass state calls (pipeline, vertex/index buffer, viewport, "
                     "scissor, bind group) that set the value already set in the pass");
 
+REXCVAR_DEFINE_BOOL(webgpu_batch_pass_calls, true, "GPU",
+                    "WebGPU: replay render pass state + draw calls through one JS call per run of "
+                    "pass commands (rexwgpu_pass_batch) instead of one emdawnwebgpu call each "
+                    "(saves the wasm64 BigInt pointer conversions and wasm->JS transitions)");
+
+namespace {
+
+// Executes a run of render pass commands encoded by WebGPUCommandStream::Execute as u32 words
+// (handles and 64-bit values as lo, hi words; viewport floats as raw bits). One wasm->JS call
+// per run instead of one emdawnwebgpu wrapper per command: under memory64 every pointer
+// argument of those wrappers is a BigInt converted with bigintToI53Checked, which was the top
+// device-thread self time in the MW2 profile. Ops: 1 pipeline, 2 bind group, 3 draw,
+// 4 draw indexed, 5 vertex buffer, 6 index buffer, 7 viewport, 8 scissor, 9 stencil reference.
+// Dynamic offsets are copied into a small exact-size Uint32Array and passed to the native
+// setBindGroup saved by rexwgpu_install_dynamic_offset_copy (webgpu_device.cpp; Firefox
+// rejects views of the whole 8 GiB memory).
+EM_JS(void, rexwgpu_pass_batch, (double pass_ptr, double words_ptr, int count), {
+  var pass = WebGPU.getJsObject(pass_ptr);
+  var u = HEAPU32, s32 = HEAP32, f32 = HEAPF32;
+  var p = words_ptr / 4, end = p + count, W = 4294967296;
+  var proto = Object.getPrototypeOf(pass);
+  var sbg = proto.__rexSetBindGroupRaw || proto.setBindGroup;
+  var scratch = WebGPU.__rexOffsetScratch || (WebGPU.__rexOffsetScratch = []);
+  while (p < end) {
+    var op = u[p];
+    if (op == 4) {
+      pass.drawIndexed(u[p + 1], u[p + 2], u[p + 3], s32[p + 4], u[p + 5]);
+      p += 6;
+    } else if (op == 2) {
+      var n = u[p + 4];
+      var g = WebGPU.getJsObject(u[p + 2] + u[p + 3] * W);
+      if (n == 0) {
+        sbg.call(pass, u[p + 1], g);
+      } else {
+        var s = scratch[n] || (scratch[n] = new Uint32Array(n));
+        for (var k = 0; k < n; k++) s[k] = u[p + 5 + k];
+        sbg.call(pass, u[p + 1], g, s, 0, n);
+      }
+      p += 5 + n;
+    } else if (op == 1) {
+      pass.setPipeline(WebGPU.getJsObject(u[p + 1] + u[p + 2] * W));
+      p += 3;
+    } else if (op == 3) {
+      pass.draw(u[p + 1], u[p + 2], u[p + 3], u[p + 4]);
+      p += 5;
+    } else if (op == 5 || op == 6) {
+      var b = WebGPU.getJsObject(u[p + 2] + u[p + 3] * W);
+      var o = u[p + 4] + u[p + 5] * W;
+      var z = (u[p + 6] == 0xFFFFFFFF && u[p + 7] == 0xFFFFFFFF) ? undefined : u[p + 6] + u[p + 7] * W;
+      if (op == 5) {
+        pass.setVertexBuffer(u[p + 1], b, o, z);
+      } else {
+        pass.setIndexBuffer(b, WebGPU.IndexFormat[u[p + 1]], o, z);
+      }
+      p += 8;
+    } else if (op == 7) {
+      pass.setViewport(f32[p + 1], f32[p + 2], f32[p + 3], f32[p + 4], f32[p + 5], f32[p + 6]);
+      p += 7;
+    } else if (op == 8) {
+      pass.setScissorRect(u[p + 1], u[p + 2], u[p + 3], u[p + 4]);
+      p += 5;
+    } else if (op == 9) {
+      pass.setStencilReference(u[p + 1]);
+      p += 2;
+    } else {
+      throw new Error('rexwgpu_pass_batch: bad op ' + op);
+    }
+  }
+});
+
+}  // namespace
+
 REXCVAR_DEFINE_INT32(webgpu_bind_group_cache_replays, 120, "GPU",
                      "WebGPU: keep bind groups created from recorded descriptors for N stream "
                      "replays after their last use and reuse them in later replays (the entry "
@@ -901,6 +973,31 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
     const uint8_t* record = commands_.data;
     const uint8_t* records_end = commands_.data + commands_.size;
     std::vector<WGPUBindGroupEntry> entries_scratch;
+    // --webgpu_batch_pass_calls: render pass commands are appended here and run by one
+    // rexwgpu_pass_batch call before any other command (and before the pass ends).
+    static thread_local std::vector<uint32_t> batch;
+    batch.clear();
+    const bool batch_on = REXCVAR_GET(webgpu_batch_pass_calls);
+    auto batch_u64 = [](uint64_t v) {
+      batch.push_back(uint32_t(v));
+      batch.push_back(uint32_t(v >> 32));
+    };
+    auto batch_ptr = [&batch_u64](const void* p) { batch_u64(uint64_t(uintptr_t(p))); };
+    auto flush_batch = [&]() {
+      if (!batch.empty()) {
+        rexwgpu_pass_batch(double(uintptr_t(render_pass)), double(uintptr_t(batch.data())),
+                           int(batch.size()));
+        batch.clear();
+      }
+    };
+    auto batch_bind_group = [&](uint32_t index, const void* group, uint32_t count,
+                                const uint32_t* offsets) {
+      batch.push_back(2);
+      batch.push_back(index);
+      batch_ptr(group);
+      batch.push_back(count);
+      batch.insert(batch.end(), offsets, offsets + count);
+    };
     // Redundant state filter, reset at every pass start: WebGPU pass state (pipeline, vertex /
     // index buffers, viewport, scissor, bind groups) persists across draws and pipeline changes,
     // so re-setting an identical value is a no-op that still costs a JS call (with BigInt
@@ -948,6 +1045,26 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
       const auto* header = reinterpret_cast<const CommandHeader*>(record);
       const void* args_ptr = header + 1;
       ++stats.commands;
+      if (!batch.empty()) {
+        switch (Command(header->command)) {
+          case Command::kSetPipelineId:
+          case Command::kSetRenderPipeline:
+          case Command::kSetVertexBuffer:
+          case Command::kSetIndexBuffer:
+          case Command::kSetViewport:
+          case Command::kSetScissorRect:
+          case Command::kSetStencilReference:
+          case Command::kDraw:
+          case Command::kDrawIndexed:
+          case Command::kSetBindGroup:
+          case Command::kSetBindGroupDesc:
+            break;
+          default:
+            flush_batch();
+            break;
+        }
+      }
+      const bool use_batch = batch_on && render_pass;
       switch (Command(header->command)) {
         case Command::kBeginRenderPass: {
           const auto* args = static_cast<const ArgsBeginRenderPass*>(args_ptr);
@@ -995,7 +1112,12 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           pipeline_ready = pipeline != nullptr;
           current_id = static_cast<const ArgsId*>(args_ptr)->id;
           if (pipeline && pipeline != filter.pipeline) {
-            wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            if (use_batch) {
+              batch.push_back(1);
+              batch_ptr(pipeline);
+            } else {
+              wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            }
             filter.pipeline = filter_on ? pipeline : nullptr;
           }
           break;
@@ -1006,7 +1128,12 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           pipeline_ready = pipeline != nullptr;
           current_id = kInvalidPipelineId;
           if (pipeline && pipeline != filter.pipeline) {
-            wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            if (use_batch) {
+              batch.push_back(1);
+              batch_ptr(pipeline);
+            } else {
+              wgpuRenderPassEncoderSetPipeline(render_pass, pipeline);
+            }
             filter.pipeline = filter_on ? pipeline : nullptr;
           }
           break;
@@ -1023,6 +1150,14 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
             filter.vertex_valid[args->slot] = true;
             filter.vertex[args->slot] = *args;
           }
+          if (use_batch) {
+            batch.push_back(5);
+            batch.push_back(args->slot);
+            batch_ptr(args->buffer);
+            batch_u64(args->offset);
+            batch_u64(args->size);
+            break;
+          }
           wgpuRenderPassEncoderSetVertexBuffer(render_pass, args->slot, args->buffer, args->offset,
                                                args->size);
           break;
@@ -1037,6 +1172,14 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           }
           filter.index_valid = filter_on;
           filter.index = *args;
+          if (use_batch) {
+            batch.push_back(6);
+            batch.push_back(uint32_t(args->format));
+            batch_ptr(args->buffer);
+            batch_u64(args->offset);
+            batch_u64(args->size);
+            break;
+          }
           wgpuRenderPassEncoderSetIndexBuffer(render_pass, args->buffer, args->format,
                                               args->offset, args->size);
           break;
@@ -1053,6 +1196,15 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           }
           filter.viewport_valid = filter_on;
           filter.viewport = *args;
+          if (use_batch) {
+            const float values[6] = {args->x,      args->y,         args->width,
+                                     args->height, args->min_depth, args->max_depth};
+            batch.push_back(7);
+            size_t at = batch.size();
+            batch.resize(at + 6);
+            std::memcpy(batch.data() + at, values, sizeof(values));
+            break;
+          }
           wgpuRenderPassEncoderSetViewport(render_pass, args->x, args->y, args->width,
                                            args->height, args->min_depth, args->max_depth);
           break;
@@ -1067,6 +1219,11 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           }
           filter.scissor_valid = filter_on;
           filter.scissor = *args;
+          if (use_batch) {
+            batch.insert(batch.end(), {8u, uint32_t(args->x), uint32_t(args->y),
+                                       uint32_t(args->width), uint32_t(args->height)});
+            break;
+          }
           wgpuRenderPassEncoderSetScissorRect(render_pass, args->x, args->y, args->width,
                                               args->height);
           break;
@@ -1076,6 +1233,11 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
               render_pass, &static_cast<const ArgsSetBlendConstant*>(args_ptr)->color);
           break;
         case Command::kSetStencilReference:
+          if (use_batch) {
+            batch.push_back(9);
+            batch.push_back(static_cast<const ArgsId*>(args_ptr)->id);
+            break;
+          }
           wgpuRenderPassEncoderSetStencilReference(render_pass,
                                                    static_cast<const ArgsId*>(args_ptr)->id);
           break;
@@ -1086,8 +1248,13 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
             break;
           }
           const auto* args = static_cast<const ArgsDraw*>(args_ptr);
-          wgpuRenderPassEncoderDraw(render_pass, args->vertex_count, args->instance_count,
-                                    args->first_vertex, args->first_instance);
+          if (use_batch) {
+            batch.insert(batch.end(), {3u, args->vertex_count, args->instance_count,
+                                       args->first_vertex, args->first_instance});
+          } else {
+            wgpuRenderPassEncoderDraw(render_pass, args->vertex_count, args->instance_count,
+                                      args->first_vertex, args->first_instance);
+          }
           ++stats.draws;
           note_replayed();
           break;
@@ -1099,9 +1266,15 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
             break;
           }
           const auto* args = static_cast<const ArgsDrawIndexed*>(args_ptr);
-          wgpuRenderPassEncoderDrawIndexed(render_pass, args->index_count, args->instance_count,
-                                           args->first_index, args->base_vertex,
-                                           args->first_instance);
+          if (use_batch) {
+            batch.insert(batch.end(), {4u, args->index_count, args->instance_count,
+                                       args->first_index, uint32_t(args->base_vertex),
+                                       args->first_instance});
+          } else {
+            wgpuRenderPassEncoderDrawIndexed(render_pass, args->index_count,
+                                             args->instance_count, args->first_index,
+                                             args->base_vertex, args->first_instance);
+          }
           ++stats.draws;
           note_replayed();
           break;
@@ -1146,6 +1319,9 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
           if (group_redundant(args->group_index, args->group, args->dynamic_offset_count,
                               offsets)) {
             ++stats.redundant_state_skipped;
+          } else if (use_batch) {
+            batch_bind_group(args->group_index, args->group, args->dynamic_offset_count,
+                             offsets);
           } else if (render_pass) {
             wgpuRenderPassEncoderSetBindGroup(render_pass, args->group_index, args->group,
                                               args->dynamic_offset_count, offsets);
@@ -1234,7 +1410,9 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
                                        offsets)) {
             ++stats.redundant_state_skipped;
           } else if (group) {
-            if (render_pass) {
+            if (use_batch) {
+              batch_bind_group(args->group_index, group, args->dynamic_offset_count, offsets);
+            } else if (render_pass) {
               wgpuRenderPassEncoderSetBindGroup(render_pass, args->group_index, group,
                                                 args->dynamic_offset_count, offsets);
             } else if (compute_pass) {
@@ -1306,6 +1484,7 @@ bool WebGPUCommandStream::Execute(WebGPUReplayState& state, WebGPUReplayStats* s
       }
       record += header->size;
     }
+    flush_batch();
     // Recording closes passes before submission; be safe if it did not.
     if (render_pass) {
       wgpuRenderPassEncoderEnd(render_pass);
