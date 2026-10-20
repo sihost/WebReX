@@ -21,6 +21,38 @@
   var isPthread = typeof ENVIRONMENT_IS_PTHREAD != 'undefined' && ENVIRONMENT_IS_PTHREAD;
   var inWorker = typeof WorkerGlobalScope != 'undefined' && self instanceof WorkerGlobalScope;
 
+  // Out of memory. Emscripten aborts with 'OOM' (release) or 'Cannot enlarge memory ...' (with
+  // ASSERTIONS) when the wasm memory can not grow: either the build's limit is reached
+  // (rexglue_configure_target WEB_MAXIMUM_MEMORY; fixed-size builds: the initial size) or the
+  // browser / OS refused to commit more. Turn that into a message a player can act on.
+  var MiB = function (n) {
+    return Math.round(Number(n) / 1048576);
+  };
+  function isOom(what) {
+    var s = String(what);
+    return s === 'OOM' || /Cannot enlarge memory|^OOM\b|out of memory/i.test(s);
+  }
+  function oomText(what) {
+    var size = 0;
+    var max = 0;
+    try {
+      size = wasmMemory.buffer.byteLength;
+    } catch (e) {}
+    try {
+      if (typeof getHeapMax == 'function') max = getHeapMax();
+    } catch (e) {}
+    var atLimit = max > 0 && size + (128 << 20) >= max;
+    return 'out of memory: the wasm memory could not grow beyond ' + MiB(size) + ' MiB (limit ' +
+      (max ? MiB(max) + ' MiB' : 'unknown') + '). ' +
+      (atLimit
+        ? 'The game needs more than this build allows: raise the limit (rexglue_configure_target ' +
+          'WEB_MAXIMUM_MEMORY / REXGLUE_WEB_MAXIMUM_MEMORY).'
+        : 'The browser refused to commit more memory: close other tabs or programs and reload.') +
+      ' [' + String(what) + ']';
+  }
+
+  var OOM_TAG = '[rex] fatal: ';
+
   if (isPthread || inWorker) {
     // ---- Worker: collect on the crashing thread ----
     var sent = false;
@@ -37,6 +69,17 @@
     // Defined here, so Emscripten does not install its proxy of the page's onAbort in this Worker:
     // the page side calls the page's own onAbort when it has no rexOnFatal.
     Module['onAbort'] = function (what) {
+      if (isOom(what)) {
+        // Out of memory aborts inside malloc (sbrk -> emscripten_resize_heap) with the malloc lock
+        // held: calling into wasm for the C++ report would deadlock this thread and then every
+        // other thread that allocates (a silent hang). Report through the page's printErr proxy
+        // (plain JS postMessage); the page side turns the line into an 'oom' crash report.
+        sent = true;
+        try {
+          err(OOM_TAG + oomText(what));
+        } catch (e) {}
+        return;
+      }
       collect(1, what, new Error().stack);
     };
     self.addEventListener('error', function (ev) {
@@ -132,8 +175,19 @@
     }
     deliver(r);
   };
+  // Out-of-memory reports of Workers arrive as printErr lines (see the Worker onAbort above).
+  var pagePrintErr = Module['printErr'];
+  Module['printErr'] = function (text) {
+    var s = String(text);
+    if (s.indexOf(OOM_TAG) === 0) {
+      deliver({ kind: 'oom', message: s.slice(OOM_TAG.length), stack: '' });
+    }
+    if (typeof pagePrintErr == 'function') pagePrintErr(text);
+    else console.error(text);
+  };
   // An abort on the page thread itself (rare: the runtime runs main() on a pthread).
   Module['onAbort'] = function (what) {
+    if (isOom(what)) what = oomText(what);
     if (typeof pageAbort == 'function') {
       try {
         pageAbort(what);
@@ -160,6 +214,31 @@
       }
     }, 1500);
   });
+  // The page creates the wasm memory before the module starts, and the browser commits all of its
+  // initial size at once. When it can not, the constructor throws a RangeError and nothing would
+  // start; report it as out of memory. One shot: only the module's own memory goes through this.
+  if (typeof WebAssembly == 'object' && typeof WebAssembly.Memory == 'function') {
+    var NativeMemory = WebAssembly.Memory;
+    var CheckedMemory = function Memory(desc) {
+      WebAssembly.Memory = NativeMemory;
+      try {
+        return new NativeMemory(desc);
+      } catch (e) {
+        var bytes = desc && desc.initial !== undefined ? Number(desc.initial) * 65536 : 0;
+        deliver({
+          kind: 'oom',
+          message: 'out of memory: the browser could not allocate the ' + MiB(bytes) +
+            ' MiB initial wasm memory (' + e + '). Close other tabs or programs and reload; ' +
+            'a build with a smaller initial size (rexglue_configure_target WEB_INITIAL_MEMORY) ' +
+            'needs less up front.',
+          stack: (e && e.stack) || '',
+        });
+        throw e;
+      }
+    };
+    CheckedMemory.prototype = NativeMemory.prototype;
+    WebAssembly.Memory = CheckedMemory;
+  }
 
   // ---- Page: lifecycle ----
   var stateAddr = 0;

@@ -59,7 +59,7 @@ renderer's audio thread alive. Measured on Halo 3: 30.0 ticks/s and 60 fps hidde
 ## Page lifecycle and Memory Saver
 
 Chrome's Memory Saver (and tab discarding under memory pressure) can discard an inactive heavy tab. A
-game tab with an 8 GB wasm memory is a prime target. The page is not told beforehand: the session is
+game tab with a 3-4 GB wasm memory is a prime target. The page is not told beforehand: the session is
 simply gone, and the next visit reloads it with `document.wasDiscarded == true`. Mitigations:
 - **An audible tab is not discarded.** The SDK's AudioContext counts once it runs (after the first user
   gesture) and plays sound. A muted tab or a suspended context does not protect the page.
@@ -133,10 +133,29 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   not yet.
 - **IME.** Composition text is not forwarded to `XamShowKeyboardUI`, which only decodes single code
   points.
-- **Touch.** There is no touch input in the SDK yet. wasm64 plus about 8 GB of memory keeps phones out
-  anyway.
+- **Touch.** There is no touch input in the SDK yet. wasm64 plus 4-7 GB of memory per tab keeps phones
+  out anyway.
 
 ## Files and memory
+
+- **Wasm memory is committed, never returned.** The browser commits the whole initial wasm memory when
+  the page starts (Chrome on Windows: an 8 GB initial memory is +7.9 GB of system commit charge, touched
+  or not), and a wasm memory never shrinks. Layout B needs a fixed 2.75 GiB guest window, and a whole
+  session's heap break is 3.1-3.8 GiB (MW2 match, Halo 3 game). So `rexglue_configure_target` links a
+  small initial memory that grows on demand: `REXGLUE_WEB_INITIAL_MEMORY` (default `3GB`) and
+  `REXGLUE_WEB_MAXIMUM_MEMORY` (default `8GB`; equal sizes = fixed memory, no growth), per title with
+  `-D` on the configure line, `set()` before `rexglue_setup_target()`, or the `WEB_INITIAL_MEMORY` /
+  `WEB_MAXIMUM_MEMORY` arguments. The maximum is address space only. After a grow the JS heap views are
+  refreshed on their next use. Length-tracking views (`-sGROWABLE_ARRAYBUFFERS`) are not used: Chrome's
+  `FileSystemSyncAccessHandle.read/write` rejects views of a growable SharedArrayBuffer, so every WasmFS
+  OPFS write failed ("disk full"). The log says `Wasm memory: N MiB now, growable (max M MiB)`
+  at startup, and every swap-stats line has the heap break and the current size.
+- **Out of memory is reported.** When the memory can not grow (the maximum is reached, or the browser
+  refuses to commit more) or the initial memory can not be created, `src/ui/rex_web_pre.js` turns the
+  abort into a crash report that starts with `out of memory:` and says which of the two happened.
+- **The wasm memory is not the whole tab.** The renderer process also holds the compiled wasm code, one
+  V8 isolate per pthread Worker (`REXGLUE_WEB_PTHREAD_POOL_SIZE`, default 32, all spawned before
+  `main()`), and the GPU process holds the WebGPU resources.
 
 - **File mappings fail cleanly** (`src/core/memory_web.cpp`). Only the guest window used them, and it does
   not on the web.
