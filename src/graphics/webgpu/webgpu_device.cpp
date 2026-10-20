@@ -67,6 +67,8 @@ EM_JS(int, rexwgpu_install_dynamic_offset_copy, (), {
       };
     })(original);
     Object.defineProperty(cls.prototype, '__rexDynamicOffsetCopy', {value: true});
+    // rexwgpu_pass_batch (webgpu_command_stream.cpp) passes exact-size arrays: native call.
+    Object.defineProperty(cls.prototype, '__rexSetBindGroupRaw', {value: original});
     wrapped++;
   }
   return wrapped;
