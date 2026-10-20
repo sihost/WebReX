@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
@@ -119,6 +120,18 @@ uint32_t WebGPUSharedMemory::VerifyRange(uint32_t start, uint32_t length, const 
     bool marked = false;
     for (uint32_t offset = 0; offset < page_size; offset += fold::kDirtyPageSize) {
       marked |= fold::g_phys_dirty[(address + offset) >> fold::kDirtyPageShift] != 0;
+    }
+    if (!marked) {
+      // Guest stores mark AFTER the data (fold_web.h), so a store caught between its data
+      // and its mark looks unmarked for a moment: give it a short grace period before
+      // calling the page stale.
+      for (int spin = 0; spin < 64 && !marked; ++spin) {
+        std::this_thread::yield();
+        for (uint32_t offset = 0; offset < page_size; offset += fold::kDirtyPageSize) {
+          marked |= __atomic_load_n(&fold::g_phys_dirty[(address + offset) >> fold::kDirtyPageShift],
+                                    __ATOMIC_ACQUIRE) != 0;
+        }
+      }
     }
     if (marked) {
       continue;
