@@ -22,6 +22,7 @@
 #include <rex/graphics/webgpu/webgpu_log.h>
 #include <rex/ui/surface_web.h>
 #include <rex/ui/webgpu/webgpu_immediate_drawer.h>
+#include <rex/web_page.h>
 
 // WGSL converted from ../shaders/vulkan_spirv at build time (see the headers).
 #include "../shaders/webgpu_wgsl/guest_output_bilinear_dither_ps.h"
@@ -530,6 +531,8 @@ void WebGPUPresenter::OnAnimationFrame(double time) {
     }
   }
   animation_frame_cv_.notify_all();
+  // Wakes the guest vsync thread (vblank_source=animation_frame, graphics_system.cpp).
+  rex::web::NotifyAnimationFrame();
   last_animation_frame_time_ = time;
 
   // Picks up a canvas resize (the shared size block is updated by the browser

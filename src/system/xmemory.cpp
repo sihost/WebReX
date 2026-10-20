@@ -612,6 +612,11 @@ bool Memory::ConsumePhysicalDirty(uint32_t physical_address, uint32_t length) {
   }
   const uint32_t last_page = uint32_t(std::min<uint64_t>(
       (uint64_t(physical_address) + length - 1) >> fold::kDirtyPageShift, kLastPhysicalPage));
+  // The GPU checks every bound texture and buffer range on every draw, and nearly all of them
+  // are clean: answer that without the global critical region (contended by guest threads).
+  if (!fold::AnyDirtyPages(uint32_t(first_page), last_page)) {
+    return false;
+  }
   auto global_lock = global_critical_region_.Acquire();
   const uint32_t dirty_pages = fold::ConsumeDirtyPages(
       uint32_t(first_page), last_page,

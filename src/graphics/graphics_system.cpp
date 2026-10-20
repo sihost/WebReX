@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
@@ -41,6 +43,18 @@ REXCVAR_DEFINE_BOOL(web_pause_when_hidden, false, "Web",
                     "tab keeps running at full speed (needed for System Link hosts)");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+
+REXCVAR_DEFINE_STRING(vblank_source, "animation_frame", "GPU",
+                      "Web: what wakes the guest vsync thread. animation_frame = the browser's "
+                      "animation frames (requestAnimationFrame of the WebGPU presenter), with a "
+                      "timed wait until the deadline when there are none (hidden tab); timer = "
+                      "1 ms timed waits only, which take up to 15.6 ms in browser Workers on "
+                      "Windows and made vblanks irregular. Native: always timer")
+    .allowed({"animation_frame", "timer"});
+
+REXCVAR_DEFINE_INT32(vblank_stats_interval_ms, 0, "GPU",
+                     "Every N ms, log the guest vblank rate, the host time between vblanks "
+                     "(p50/p95/max) and how long the vsync thread's sleeps really took. 0 = off");
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
@@ -143,7 +157,39 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t next_frame_time = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
         bool paused_hidden = false;
-        while (vsync_worker_running_) {
+        // vblank_stats_interval_ms (host steady clock, ms).
+        using StatsClock = std::chrono::steady_clock;
+        auto stats_ms = [] {
+          return std::chrono::duration<double, std::milli>(
+                     StatsClock::now().time_since_epoch())
+              .count();
+        };
+        double stats_start_ms = 0.0, last_vblank_ms = 0.0;
+        std::vector<float> vblank_intervals_ms, sleep_ms;
+        auto pct = [](std::vector<float>& v, double q) -> float {
+          if (v.empty()) {
+            return 0.0f;
+          }
+          std::sort(v.begin(), v.end());
+          return v[std::min(v.size() - 1, size_t(q * double(v.size() - 1) + 0.5))];
+        };
+        // vblank_source=animation_frame (web): browser animation frames seen and when the
+          // count last changed (steady clock, ms).
+          const bool use_animation_frames =
+            REX_PLATFORM_WEB && REXCVAR_GET(vblank_source) == "animation_frame";
+          uint32_t animation_frames_seen = rex::web::GetAnimationFrameCount();
+          double animation_frame_change_ms = -1e9;
+          while (vsync_worker_running_) {
+          const uint32_t animation_frames = rex::web::GetAnimationFrameCount();
+          bool animation_frames_running = false;
+          if (use_animation_frames) {
+            double now_ms = stats_ms();
+            if (animation_frames != animation_frames_seen) {
+              animation_frames_seen = animation_frames;
+              animation_frame_change_ms = now_ms;
+            }
+            animation_frames_running = now_ms - animation_frame_change_ms < 100.0;
+          }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           bool pause = REXCVAR_GET(web_pause_when_hidden) && rex::web::IsPageHidden();
           if (pause != paused_hidden) {
@@ -158,8 +204,40 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
           }
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          if (current_time >= next_frame_time) {
+          // Woken by animation frames, fire on the one nearest to the deadline (up to half
+          // an interval early): with a 60 Hz display every animation frame is a vblank, with
+          // 120/144 Hz the nearest of them, with the average rate kept by the phase below.
+          const uint64_t early_ticks =
+              animation_frames_running && REXCVAR_GET(vsync) ? interval_ticks / 2 : 0;
+          if (current_time + early_ticks >= next_frame_time) {
             MarkVblank();
+            if (int32_t stats_interval = REXCVAR_GET(vblank_stats_interval_ms); stats_interval > 0) {
+              double now_ms = stats_ms();
+              if (stats_start_ms == 0.0) {
+                stats_start_ms = now_ms;
+              } else {
+                vblank_intervals_ms.push_back(float(now_ms - last_vblank_ms));
+              }
+              last_vblank_ms = now_ms;
+              if (now_ms - stats_start_ms >= double(stats_interval) && !vblank_intervals_ms.empty()) {
+                size_t n = vblank_intervals_ms.size();
+                double elapsed = now_ms - stats_start_ms;
+                float max_interval = *std::max_element(vblank_intervals_ms.begin(),
+                                                       vblank_intervals_ms.end());
+                float max_sleep =
+                    sleep_ms.empty() ? 0.0f : *std::max_element(sleep_ms.begin(), sleep_ms.end());
+                REXGPU_INFO(
+                    "vblank stats: {} vblanks in {:.0f} ms = {:.1f}/s | interval ms p50 {:.2f} "
+                    "p95 {:.2f} max {:.2f} | vsync thread waits took p50 {:.2f} p95 {:.2f} max {:.2f} "
+                    "({} waits)",
+                    n, elapsed, double(n) * 1000.0 / elapsed, pct(vblank_intervals_ms, 0.5),
+                    pct(vblank_intervals_ms, 0.95), max_interval, pct(sleep_ms, 0.5),
+                    pct(sleep_ms, 0.95), max_sleep, sleep_ms.size());
+                vblank_intervals_ms.clear();
+                sleep_ms.clear();
+                stats_start_ms = now_ms;
+              }
+            }
             // Keep the phase (next = previous deadline + interval, not now + interval):
               // when the 1 ms sleep below is coarser than that, the guest still gets its
               // refresh rate on average. A hidden browser tab's threads run with the 15.6 ms
@@ -171,11 +249,33 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
             if (current_time >= next_frame_time + 2 * interval_ticks) {
               next_frame_time = current_time + interval_ticks;
             }
-          } else if (next_frame_time - current_time > vsync_interval_ticks) {
+          } else if (next_frame_time - current_time > vsync_interval_ticks + early_ticks) {
             // The interval got shorter (vsync turned off) or the clock moved: resync.
             next_frame_time = current_time + interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          const bool stats = REXCVAR_GET(vblank_stats_interval_ms) > 0;
+          const double sleep_start_ms = stats ? stats_ms() : 0.0;
+          if (use_animation_frames && REXCVAR_GET(vsync)) {
+            // Until the next animation frame (the precise wake-up). The timeout is only the
+            // fallback for hidden tabs and pages before the first paint (no animation frames;
+            // then this is the old, coarse, timed wait): while animation frames run it is half
+            // an interval past the deadline, so the animation frame there wins.
+            current_time = chrono::Clock::QueryGuestTickCount();
+            const double ticks_per_ms = double(guest_tick_frequency) / 1000.0;
+            double timeout_ms =
+                next_frame_time > current_time
+                    ? double(next_frame_time - current_time) / ticks_per_ms
+                    : 0.0;
+            if (animation_frames_running) {
+              timeout_ms += double(interval_ticks / 2) / ticks_per_ms;
+            }
+            rex::web::WaitForAnimationFrame(animation_frames, std::clamp(timeout_ms, 1.0, 50.0));
+          } else {
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+          }
+          if (stats) {
+            sleep_ms.push_back(float(stats_ms() - sleep_start_ms));
+          }
         }
         return 0;
       }));

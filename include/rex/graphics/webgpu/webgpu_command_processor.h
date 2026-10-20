@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 #include <webgpu/webgpu.h>
 
@@ -243,6 +244,19 @@ class WebGPUCommandProcessor : public CommandProcessor {
   uint32_t drop_details_logged_ = 0;
   // webgpu_pipeline_wait_ms spent in the current frame (reset by IssueSwap).
   double pipeline_wait_frame_ms_ = 0.0;
+  // webgpu_frame_stats_interval_ms: frame pacing of the current interval.
+  struct FramePacing {
+    double interval_start_ms = 0.0;  // steady clock
+    double last_swap_ms = 0.0;
+    std::vector<float> intervals_ms;  // swap to swap
+    double gpu_wait_ms = 0.0;         // IssueSwap waiting for kMaxFramesInFlight
+    double replay_ms_start = 0.0;     // WebGPUCommandQueue::replay_ms_total()
+    uint64_t upload_bytes_start = 0;
+    uint64_t constant_bytes_start = 0;
+    uint64_t draws_start = 0;
+  };
+  FramePacing frame_pacing_;
+  void UpdateFramePacing(double gpu_wait_ms);
   // Waits for the pipeline of a draw or dispatch about to be recorded, within
   // the frame's webgpu_pipeline_wait_ms budget.
   void WaitForPipeline(PipelineId pipeline);

@@ -150,6 +150,40 @@ void MarkGuestRangeDirty(uint32_t guest_address, uint32_t length) noexcept {
   }
 }
 
+namespace {
+// 8 dirty bytes at an 8-aligned page index (the map is 64-byte aligned). Racy plain read like
+// the byte reads: a page can only become dirty concurrently, never clean.
+[[gnu::always_inline]] inline uint64_t DirtyWord(uint32_t i) {
+  uint64_t word;
+  __builtin_memcpy(&word, &g_phys_dirty[i], sizeof(word));
+  return word;
+}
+}  // namespace
+
+bool AnyDirtyPages(uint32_t first_page, uint32_t last_page) noexcept {
+  if (first_page >= kDirtyPageCount) {
+    return false;
+  }
+  last_page = std::min<uint32_t>(last_page, uint32_t(kDirtyPageCount - 1));
+  uint32_t i = first_page;
+  for (; i <= last_page && (i & 7); ++i) {
+    if (g_phys_dirty[i]) {
+      return true;
+    }
+  }
+  for (; last_page >= 7 && i <= last_page - 7; i += 8) {
+    if (DirtyWord(i)) {
+      return true;
+    }
+  }
+  for (; i <= last_page; ++i) {
+    if (g_phys_dirty[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint32_t ConsumeDirtyPages(uint32_t first_page, uint32_t last_page, DirtyRunFn fn,
                            void* context) noexcept {
   if (first_page >= kDirtyPageCount) {
@@ -159,6 +193,19 @@ uint32_t ConsumeDirtyPages(uint32_t first_page, uint32_t last_page, DirtyRunFn f
   uint32_t total = 0;
   uint32_t run_first = UINT32_MAX;
   for (uint32_t i = first_page; i <= last_page; ++i) {
+    // Skip 8 clean pages at once (textures and buffers span up to thousands of pages).
+    while (!(i & 7) && last_page >= 7 && i <= last_page - 7 && !DirtyWord(i)) {
+      if (run_first != UINT32_MAX) {
+        if (fn) {
+          fn(context, run_first, i - run_first);
+        }
+        run_first = UINT32_MAX;
+      }
+      i += 8;
+    }
+    if (i > last_page) {
+      break;
+    }
     // Cheap plain read first; only exchange pages that look dirty.
     bool dirty = false;
     if (g_phys_dirty[i]) {
