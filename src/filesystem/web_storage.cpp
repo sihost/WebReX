@@ -25,6 +25,7 @@ static_assert(REX_PLATFORM_WEB, "web_storage.cpp is web-only (Emscripten)");
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -98,18 +99,33 @@ EM_JS(void, rex_storage_js_refresh_estimate, (), {
       Promise.all([ s.estimate(), s.persisted ? s.persisted() : Promise.resolve(null) ])
           .then(([ e, p ]) => {
             const usage = e.usage || 0, quota = e.quota || 0;
-            const fsu = e.usageDetails && typeof e.usageDetails.fileSystem == 'number'
-                            ? e.usageDetails.fileSystem
-                            : -1;
+            const detail = (k) => e.usageDetails && typeof e.usageDetails[k] == 'number'
+                                      ? e.usageDetails[k]
+                                      : -1;
+            const fsu = detail('fileSystem'), caches = detail('caches'),
+                  idb = detail('indexedDB');
             const persisted = p === null ? -1 : (p ? 1 : 0);
-            report(usage, quota, fsu, persisted);
+            // Chrome's StaticStorageQuota: quota = usage + 10 GiB, whatever the real limit.
+            // Firefox reports a fixed 10 GiB group limit, equal to that while usage < 1 MiB.
+            const firefox = typeof navigator != 'undefined' &&
+                            String(navigator.userAgent).indexOf('Firefox') >= 0;
+            const padded = !firefox && Math.abs(quota - usage - 10737418240) < 1048576;
+            report(usage, quota, fsu, persisted, caches, idb, padded ? 1 : 0);
             const key = Math.round(usage / 1048576) + '/' + Math.round(quota / 1048576) + '/' +
                         persisted;
             if (key != st.estimateKey) {
               st.estimateKey = key;
-              console.log('[storage] usage ' + (usage / 1048576).toFixed(1) + ' MiB' +
-                          (fsu >= 0 ? ' (OPFS ' + (fsu / 1048576).toFixed(1) + ' MiB)' : '') +
-                          ' of ' + (quota / 1048576).toFixed(0) + ' MiB quota, persisted ' +
+              const mib = (v) => (v / 1048576).toFixed(1);
+              const parts = [];
+              if (fsu >= 0) parts.push('OPFS ' + mib(fsu));
+              if (caches >= 0) parts.push('Cache Storage ' + mib(caches));
+              if (idb >= 0) parts.push('IndexedDB ' + mib(idb));
+              console.log('[storage] usage ' + mib(usage) + ' MiB' +
+                          (parts.length ? ' (' + parts.join(', ') + ' MiB)' : "") + ' of ' +
+                          (quota / 1048576).toFixed(0) + ' MiB quota' +
+                          (padded ? ' (Chrome static quota: usage + 10 GiB, real limit unknown)'
+                                  : "") +
+                          ', persisted ' +
                           (persisted < 0 ? 'unknown' : persisted ? 'yes' : 'no'));
             }
           }, () => {});
@@ -228,6 +244,9 @@ struct EstimateState {
   std::atomic<double> usage{0.0};
   std::atomic<double> quota{0.0};
   std::atomic<double> file_system_usage{-1.0};
+  std::atomic<double> caches_usage{-1.0};
+  std::atomic<double> indexed_db_usage{-1.0};
+  std::atomic<bool> quota_padded{false};
   std::atomic<int> persisted{-1};
   std::atomic<uint64_t> sequence{0};
 };
@@ -257,6 +276,9 @@ StorageEstimate GetStorageEstimate() {
   estimate.usage = state.usage.load(std::memory_order_relaxed);
   estimate.quota = state.quota.load(std::memory_order_relaxed);
   estimate.file_system_usage = state.file_system_usage.load(std::memory_order_relaxed);
+  estimate.caches_usage = state.caches_usage.load(std::memory_order_relaxed);
+  estimate.indexed_db_usage = state.indexed_db_usage.load(std::memory_order_relaxed);
+  estimate.quota_padded = state.quota_padded.load(std::memory_order_relaxed);
   estimate.persisted = state.persisted.load(std::memory_order_relaxed);
   estimate.sequence = state.sequence.load(std::memory_order_relaxed);
   return estimate;
@@ -392,11 +414,18 @@ bool IsStorageWriter() {
 // Browser main thread (navigator.storage.estimate / persisted answered).
 extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_storage_estimate_result(double usage, double quota,
                                                                      double file_system_usage,
-                                                                     int persisted) {
+                                                                     int persisted,
+                                                                     double caches_usage,
+                                                                     double indexed_db_usage,
+                                                                     int quota_padded) {
   auto& state = rex::filesystem::web::Estimate();
   state.usage.store(usage, std::memory_order_relaxed);
   state.quota.store(quota, std::memory_order_relaxed);
   state.file_system_usage.store(file_system_usage, std::memory_order_relaxed);
+  state.caches_usage.store(caches_usage, std::memory_order_relaxed);
+  state.indexed_db_usage.store(indexed_db_usage, std::memory_order_relaxed);
+  // Chrome StaticStorageQuota (quota = usage + 10 GiB), detected by the page (not on Firefox).
+  state.quota_padded.store(quota_padded != 0, std::memory_order_relaxed);
   state.persisted.store(persisted, std::memory_order_relaxed);
   state.sequence.fetch_add(1, std::memory_order_relaxed);
   state.valid.store(true, std::memory_order_release);

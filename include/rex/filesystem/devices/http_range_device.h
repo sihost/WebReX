@@ -9,7 +9,9 @@
  * Worker issuing its own sync XHR), and a sequential reader gets the next blocks fetched
  * ahead on the pool; a block being downloaded is never requested twice (readers wait for it).
  * A service worker in front of the data URLs (the Halo page's web/sw.js) sees the same
- * Range + If-Match GETs, just several at a time. Blocks go through two caches:
+ * Range + If-Match GETs, just several at a time; when it answers them (X-<title>-SW: 1) it keeps
+ * the data in Cache Storage, and the OPFS cache below stores nothing new
+ * (--vfs_cache_skip_with_service_worker). Blocks go through two caches:
  *   1. an in-memory LRU of blocks shared by all files;
  *   2. optionally a persistent block cache in a directory on the OPFS mount
  *      (rex/filesystem/web_storage.h), keyed by sha256, which a loader may also pre-populate
@@ -128,6 +130,9 @@ class HttpRangeDevice : public Device {
     uint64_t reopened_files = 0;    // cache files reopened after their descriptor was closed
     uint64_t failed_writes = 0;     // block cache writes the storage refused (out of space)
     uint64_t space_limit_bytes = 0; // cache size that fit when a write last failed (0 = none)
+    uint64_t deduplicated_writes = 0;  // writes left to the service worker's Cache Storage
+    uint64_t protected_skips = 0;   // writes skipped: only recently used files were left to evict
+    bool service_worker_store = false;  // the data reads are answered by a service worker
   };
   Stats stats() const;
 
@@ -167,8 +172,12 @@ class HttpRangeDevice : public Device {
   // cache_mutex_ held). Scan builds the table from the directory at initialization.
   void ScanPersistentCacheLocked();
   void TouchPersistentLocked(const std::string& base, uint64_t file_bytes);
-  // Deletes least recently used cache files (never `keep_base`) until `bytes` are freed.
-  uint64_t EvictPersistentLocked(uint64_t bytes, const std::string& keep_base);
+  // Deletes least recently used cache files (never `keep_base`; with cold_only none used in
+  // the last vfs_cache_protect_s seconds) until `bytes` are freed.
+  uint64_t EvictPersistentLocked(uint64_t bytes, const std::string& keep_base,
+                                 bool cold_only = false);
+  // A service worker stores the data (see vfs_cache_skip_with_service_worker).
+  bool SkipWritesForServiceWorker() const;
   // Makes room for `bytes` more cache data under the size cap and the quota reserve;
   // false = don't write them.
   bool ReservePersistentLocked(uint64_t bytes, const std::string& keep_base);
@@ -196,6 +205,7 @@ class HttpRangeDevice : public Device {
   struct CacheFileUse {
     uint64_t bytes = 0;     // .data + .map
     uint64_t last_use = 0;  // use_clock_ value
+    int64_t last_use_s = 0;  // steady clock seconds of the last use (0 = earlier session)
   };
   std::unordered_map<std::string, CacheFileUse> cache_files_;  // by <dir>/<key>
   uint64_t cache_bytes_ = 0;
@@ -204,6 +214,10 @@ class HttpRangeDevice : public Device {
   // evicted (-) since it.
   uint64_t estimate_sequence_ = 0;
   int64_t bytes_since_estimate_ = 0;
+  uint64_t estimate_refresh_sequence_ = UINT64_MAX;  // estimate a refresh was asked after
+  std::atomic<bool> service_worker_store_{false};
+  uint64_t stat_deduplicated_writes_ = 0;
+  uint64_t stat_protected_skips_ = 0;
   uint32_t evictor_id_ = 0;  // web::RegisterStorageEvictor
   uint64_t stat_evicted_files_ = 0;
   uint64_t stat_evicted_bytes_ = 0;

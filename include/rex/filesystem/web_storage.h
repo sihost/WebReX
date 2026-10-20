@@ -43,6 +43,12 @@ struct StorageEstimate {
   double usage = 0.0;  // bytes, whole origin
   double quota = 0.0;
   double file_system_usage = -1.0;  // usageDetails.fileSystem (Chromium: OPFS), -1 if unknown
+  double caches_usage = -1.0;       // usageDetails.caches (Cache Storage: a service worker's
+                                    // data chunk store), -1 if unknown
+  double indexed_db_usage = -1.0;   // usageDetails.indexedDB, -1 if unknown
+  // Chrome's StaticStorageQuota: quota == usage + 10 GiB whatever the real limit is, so the
+  // quota says nothing (a write fails first); false when it looks real.
+  bool quota_padded = false;
   int persisted = -1;               // navigator.storage.persisted(): 1 / 0, -1 unknown
   uint64_t sequence = 0;            // incremented by every answer
 };
