@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <webgpu/webgpu.h>
@@ -111,6 +112,9 @@ struct WebGPUReplayStats {
   uint32_t copies = 0;
   uint32_t bind_groups_created = 0;
   uint32_t bind_groups_reused = 0;
+  // Pass state calls dropped because the same value was already set in the pass
+  // (--webgpu_filter_redundant_state).
+  uint32_t redundant_state_skipped = 0;
   uint64_t upload_bytes = 0;
   uint64_t constant_bytes = 0;
   // Device-thread wall time of Execute: arena writes + encoding, and the
@@ -157,13 +161,37 @@ class WebGPUReplayState {
   uint32_t replay_index_ = 0;
   bool log_skipped_pipelines_ = false;
 
-  // Bind groups created from descriptors during one Execute, deduplicated.
+  // Bind groups created from descriptors that cannot be cached (an entry with a
+  // nextInChain), released at the end of the Execute that created them.
   struct TransientBindGroup {
     uint64_t hash;
     size_t record_offset;  // Descriptor in the stream being replayed.
     WGPUBindGroup bind_group;
   };
   std::vector<TransientBindGroup> transient_bind_groups_;
+
+  // Bind groups created from descriptors, kept across replays
+  // (--webgpu_bind_group_cache_replays): most draws of a frame bind the same
+  // textures / samplers / buffer ranges as in the previous frame, and
+  // wgpuDeviceCreateBindGroup is one of the most expensive device-thread calls
+  // on the web (JS descriptor objects -> GC). Each cached entry holds a reference
+  // to its buffers, samplers and texture views, so their handles cannot be
+  // reused by new objects while the entry exists (a key match is always the same
+  // objects). The key is the recorded layout + entries (the stream constant
+  // placeholder stays in the key; the cache is flushed when the real constant
+  // buffer is reallocated).
+  struct CachedBindGroup {
+    std::vector<uint8_t> key;
+    WGPUBindGroup bind_group;
+    uint32_t last_used_replay;
+  };
+  std::unordered_multimap<uint64_t, CachedBindGroup> bind_group_cache_;
+  WGPUBuffer bind_group_cache_constant_buffer_ = nullptr;
+  uint32_t bind_group_cache_last_trim_ = 0;
+  void ReleaseCachedBindGroup(CachedBindGroup& cached);
+  void ClearBindGroupCache();
+  // Releases entries not used in the last max_age replays.
+  void TrimBindGroupCache(uint32_t replay_index, uint32_t max_age);
 };
 
 // ---------------------------------------------------------------------------
@@ -378,6 +406,8 @@ class WebGPUCommandQueue {
   // Statistics of the most recently replayed stream, and running totals.
   WebGPUReplayStats last_replay_stats() const;
   uint64_t replay_count() const { return replay_count_.load(std::memory_order_relaxed); }
+  // Device-thread wall time of every Execute so far (encode + submit), ms.
+  double replay_ms_total() const;
   // Draws and dispatches skipped by all replays so far (pipeline not ready).
   uint64_t draws_skipped_total() const {
     return draws_skipped_total_.load(std::memory_order_relaxed);
@@ -400,6 +430,7 @@ class WebGPUCommandQueue {
 
   mutable std::mutex stats_mutex_;
   WebGPUReplayStats last_stats_;
+  double replay_ms_total_ = 0.0;
   std::atomic<uint64_t> replay_count_{0};
   std::atomic<uint64_t> draws_skipped_total_{0};
   std::atomic<bool> log_skipped_pipelines_{false};

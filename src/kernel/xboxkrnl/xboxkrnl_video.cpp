@@ -387,6 +387,8 @@ ppc_u32_result_t VdInitializeScalerCommandBuffer_entry(
   for (size_t i = 0; i < dest_count; ++i) {
     dest[i] = 0x80000000;
   }
+  // Web dirty map (host_write_web.h): host writes of guest memory must mark it, after the data.
+  memory::NoteHostWrite(dest_ptr.host_address(), size_t(dest_count) * 4);
   return (uint32_t)dest_count;
 }
 
@@ -521,6 +523,10 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+  // Web dirty map (host_write_web.h): these 256 B land in the guest's primary ring, which
+  // shares pages with data the GPU fetches (MW2 menu vertex/index pages, verify mode found
+  // them changed without a mark). Mark after the data, like the guest store macros.
+  memory::NoteHostWrite(buffer_ptr.host_address(), 64 * 4);
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

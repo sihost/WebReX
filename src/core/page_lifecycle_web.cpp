@@ -11,8 +11,10 @@
 static_assert(REX_PLATFORM_WEB, "This file is web-only (Emscripten)");
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <mutex>
 
@@ -23,6 +25,9 @@ namespace {
 alignas(8) std::atomic<uint32_t> g_page_words[2] = {};
 static_assert(sizeof(std::atomic<uint32_t>) == 4);
 std::once_flag g_once;
+
+// NotifyAnimationFrame count (futex word).
+alignas(4) std::atomic<uint32_t> g_animation_frames{0};
 
 }  // namespace
 
@@ -44,6 +49,25 @@ uint32_t GetPageState() {
 
 uint32_t GetPageHiddenCount() {
   return g_page_words[1].load(std::memory_order_relaxed);
+}
+
+void NotifyAnimationFrame() {
+  g_animation_frames.fetch_add(1, std::memory_order_acq_rel);
+  emscripten_futex_wake(&g_animation_frames, INT_MAX);
+}
+
+uint32_t GetAnimationFrameCount() {
+  return g_animation_frames.load(std::memory_order_acquire);
+}
+
+bool WaitForAnimationFrame(uint32_t seen, double timeout_ms) {
+  if (g_animation_frames.load(std::memory_order_acquire) != seen) {
+    return true;
+  }
+  if (timeout_ms > 0.0) {
+    emscripten_futex_wait(&g_animation_frames, seen, timeout_ms);
+  }
+  return g_animation_frames.load(std::memory_order_acquire) != seen;
 }
 
 }  // namespace rex::web

@@ -64,6 +64,13 @@ REXCVAR_DEFINE_BOOL(webgpu_log_skipped_pipelines, false, "GPU",
                     "WebGPU: log every render pipeline id with its shaders and pass, and per id "
                     "the draws the replay skipped while it was not ready (first replay after the "
                     "skips; every 1000 replays the ids never replayed since)");
+REXCVAR_DEFINE_INT32(webgpu_pipeline_creations_in_flight, -1, "GPU",
+                     "WebGPU: render / compute pipeline creations (createShaderModule + "
+                     "create*PipelineAsync) outstanding at once; the others wait in FIFO order. "
+                     "Firefox compiles them one by one in its GPU process and runs every later "
+                     "submit / present only after all of them, so an unlimited burst stalls the "
+                     "game for minutes. -1 = auto (1 on Firefox, else no limit), 0 = no limit")
+    .range(-1, 1024);
 REXCVAR_DEFINE_STRING(webgpu_wgsl_bundle_url, "", "GPU",
                       "WebGPU (web): URL prefix of a precompiled WGSL bundle (e.g. /wgsl/). At "
                       "the first shader request the CP fetches <prefix><storage dir name>.wgslpack "
@@ -95,10 +102,44 @@ EM_JS(void, rex_wgsl_bundle_take, (double dst), {
   if (b) HEAPU8.set(b, dst);
   globalThis["__rexWgslBundle"] = undefined;
 });
+// Any thread (navigator exists in workers). No regex literal: "\/" + "/" would start a C++ comment.
+EM_JS(int, rex_webgpu_browser_is_firefox, (), {
+  return (typeof navigator != "undefined" && String(navigator.userAgent || "").indexOf("Firefox/") >= 0) ? 1 : 0;
+});
 // clang-format on
 #endif
 
 using HVST = Shader::HostVertexShaderType;
+
+// Device thread: runs `create` now, or queues it while `queue.limit` creations are outstanding.
+// `create` must end in exactly one FinishPipelineCreation (its callback, or at once on failure).
+void RunPipelineCreation(WebGPUPipelineCache::CreationQueue& queue, std::function<void()> create) {
+  if (queue.limit && queue.in_flight >= queue.limit) {
+    queue.pending.push_back(std::move(create));
+    uint32_t waiting = uint32_t(queue.pending.size());
+    queue.waiting.store(waiting, std::memory_order_relaxed);
+    if (waiting > queue.max_waiting.load(std::memory_order_relaxed)) {
+      queue.max_waiting.store(waiting, std::memory_order_relaxed);
+    }
+    return;
+  }
+  ++queue.in_flight;
+  create();
+}
+
+// Device thread: a creation settled; starts the next waiting ones.
+void FinishPipelineCreation(WebGPUPipelineCache::CreationQueue& queue) {
+  if (queue.in_flight) {
+    --queue.in_flight;
+  }
+  while (!queue.pending.empty() && (!queue.limit || queue.in_flight < queue.limit)) {
+    std::function<void()> create = std::move(queue.pending.front());
+    queue.pending.pop_front();
+    queue.waiting.store(uint32_t(queue.pending.size()), std::memory_order_relaxed);
+    ++queue.in_flight;
+    create();
+  }
+}
 using RenderPassFormatKey = WebGPURenderTargetCache::RenderPassFormatKey;
 
 #if REX_WEBGPU_HAS_TINT
@@ -304,7 +345,8 @@ bool WebGPUPipelineCache::Initialize() {
   features.tessellation_shader = false;
   translator_ = std::make_unique<SpirvShaderTranslator>(
       features, WebGPURenderTargetCache::IsMsaa2xSupported(),
-      WebGPURenderTargetCache::IsMsaa2xSupported(), false);
+      WebGPURenderTargetCache::IsMsaa2xSupported(), false,
+      command_processor_.draw_resolution_scale_x(), command_processor_.draw_resolution_scale_y());
 
   // Shared bind group layouts (see the header).
   uint32_t shared_memory_bindings =
@@ -363,6 +405,22 @@ bool WebGPUPipelineCache::Initialize() {
     REXGPU_INFO("WebGPU pipeline cache: SPIR-V -> WGSL with Tint {}, storage range {} MiB, "
                 "clip distances {}",
                 GetTintRevision(), max_storage_buffer_range_ >> 20, clip_distances_);
+  }
+  int32_t creations = REXCVAR_GET(webgpu_pipeline_creations_in_flight);
+  bool firefox = false;
+#if defined(__EMSCRIPTEN__)
+  firefox = rex_webgpu_browser_is_firefox() != 0;
+#endif
+  if (creations < 0) {
+    creations = firefox ? 1 : 0;
+  }
+  // Set before any creation is queued (RunAsync orders it after this on the device thread).
+  device.RunSync([queue = creation_queue_, creations]() { queue->limit = uint32_t(creations); });
+  if (creations) {
+    REXGPU_INFO(
+        "WebGPU pipeline cache: at most {} pipeline creation(s) in flight{} (the others wait, so "
+        "frames keep being submitted while the browser compiles)",
+        creations, firefox ? " (Firefox: its GPU process compiles pipelines one by one)" : "");
   }
   WebGPUCommandQueue& queue = command_processor_.command_queue();
   queue.set_log_skipped_pipelines(REXCVAR_GET(webgpu_log_skipped_pipelines));
@@ -543,12 +601,19 @@ void WebGPUPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     REXGPU_WARN("WebGPU shader storage: no storage directory, WGSL is not persisted");
     return;
   }
+  // The resolution scale changes the translated shaders (pixel position, scaled texture
+  // coordinates), so scaled storage gets its own directory ("-s2x2").
+  uint32_t scale_x = command_processor_.draw_resolution_scale_x();
+  uint32_t scale_y = command_processor_.draw_resolution_scale_y();
   storage_dir_ = root / "shaders" / fmt::format("{:08X}", title_id) / "webgpu" /
-                 fmt::format("{}-t{}-r{}", GetTintRevision(),
+                 fmt::format("{}-t{}-r{}{}", GetTintRevision(),
                              SpirvShaderTranslator::Modification::kVersion,
                              SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
                                  max_storage_buffer_range_) |
-                                 (clip_distances_ ? 4 : 0));
+                                 (clip_distances_ ? 4 : 0),
+                             (scale_x > 1 || scale_y > 1)
+                                 ? fmt::format("-s{}x{}", scale_x, scale_y)
+                                 : std::string());
   std::error_code ec;
   std::filesystem::create_directories(storage_dir_, ec);
   if (ec) {
@@ -1059,7 +1124,11 @@ bool WebGPUPipelineCache::ConfigurePipeline(const WebGPUDrawPipelineState& state
       if (std::isfinite(polygon_offset)) {
         desc.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(bias_format, polygon_offset);
       }
-      float slope = polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+      // With resolution scaling, the slope in host pixels is smaller (as Vulkan: the worst
+      // case of non-square scaling, max).
+      float slope = polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit *
+                    float(std::max(command_processor_.draw_resolution_scale_x(),
+                                   command_processor_.draw_resolution_scale_y()));
       desc.depth_bias_slope_scale = std::isfinite(slope) ? slope : 0.0f;
       if (desc.depth_bias_slope_scale == 0.0f) {
         desc.depth_bias_slope_scale = 0.0f;  // -0 -> +0 for the memcmp key
@@ -1151,9 +1220,11 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
   WebGPUDevice& device = command_processor_.device();
   std::shared_ptr<AsyncCounters> stats = async_counters_;
   std::string label = fmt::format("xe vs {:016X}:{:016X} memexport compute", key.hash, mod.value);
-  device.RunAsync([&device, &table, stats, id, wgsl, label, layout_array]() {
+  std::shared_ptr<CreationQueue> creations = creation_queue_;
+  auto create = [&device, &table, stats, creations, id, wgsl, label, layout_array]() {
     if (device.is_lost()) {
       stats->Settle(id);
+      FinishPipelineCreation(*creations);
       return;
     }
     WGPUDevice wgpu_device = device.device();
@@ -1175,6 +1246,7 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
     struct Context {
       WebGPUPipelineTable* table;
       std::shared_ptr<AsyncCounters> stats;
+      std::shared_ptr<CreationQueue> creations;
       PipelineId id;
       std::string label;
     };
@@ -1196,8 +1268,9 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
                      ToStringView(message));
       }
       context->stats->Settle(context->id);
+      FinishPipelineCreation(*context->creations);
     };
-    callback.userdata1 = new Context{&table, stats, id, label};
+    callback.userdata1 = new Context{&table, stats, creations, id, label};
     wgpuDeviceCreateComputePipelineAsync(wgpu_device, &desc, callback);
     if (pipeline_layout) {
       wgpuPipelineLayoutRelease(pipeline_layout);
@@ -1205,7 +1278,8 @@ PipelineId WebGPUPipelineCache::GetMemExportComputePipeline(
     if (module) {
       wgpuShaderModuleRelease(module);
     }
-  });
+  };
+  device.RunAsync([creations, create]() { RunPipelineCreation(*creations, create); });
   return id;
 }
 
@@ -1305,11 +1379,14 @@ PipelineId WebGPUPipelineCache::GetOrCreate(const WebGPUPipelineDescription& des
     const Statistics& statistics = this->statistics();
     REXGPU_INFO(
         "WebGPU pipeline cache: {} pipelines requested ({} created, {} failed); WGSL: {} "
-        "storage hits, {} translated, {} converting, {} failures, {} memory hits",
+        "storage hits, {} translated, {} converting, {} failures, {} memory hits; creations "
+        "waiting {} (max {})",
         statistics.pipelines_requested, async_counters_->pipelines_created.load(),
         async_counters_->pipelines_failed.load(), statistics.wgsl_storage_hits,
         statistics.wgsl_translated, async_counters_->wgsl_converting.load(),
-        statistics.wgsl_failures, statistics.wgsl_memory_hits);
+        statistics.wgsl_failures, statistics.wgsl_memory_hits,
+        creation_queue_->waiting.load(std::memory_order_relaxed),
+        creation_queue_->max_waiting.load(std::memory_order_relaxed));
   }
   if (!deferred) {
     CreateRenderPipelineAsync(id, d, std::move(vs_wgsl), std::move(ps_wgsl), std::move(label),
@@ -1356,9 +1433,12 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
   WebGPUDevice& device = command_processor_.device();
   WebGPUPipelineTable& table = command_processor_.command_queue().pipeline_table();
   std::shared_ptr<AsyncCounters> stats = async_counters_;
-  device.RunAsync([&device, &table, stats, id, d, vs_wgsl, ps_wgsl, label, layout_array]() {
+  std::shared_ptr<CreationQueue> creations = creation_queue_;
+  auto create = [&device, &table, stats, creations, id, d, vs_wgsl, ps_wgsl, label,
+                 layout_array]() {
     if (device.is_lost()) {
       stats->Settle(id);
+      FinishPipelineCreation(*creations);
       return;
     }
     WGPUDevice wgpu_device = device.device();
@@ -1490,6 +1570,7 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
     struct Context {
       WebGPUPipelineTable* table;
       std::shared_ptr<AsyncCounters> stats;
+      std::shared_ptr<CreationQueue> creations;
       PipelineId id;
       std::string label;
     };
@@ -1510,8 +1591,9 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
                      ToStringView(message));
       }
       context->stats->Settle(context->id);
+      FinishPipelineCreation(*context->creations);
     };
-    callback.userdata1 = new Context{&table, stats, id, label};
+    callback.userdata1 = new Context{&table, stats, creations, id, label};
     wgpuDeviceCreateRenderPipelineAsync(wgpu_device, &desc, callback);
     if (pipeline_layout) {
       wgpuPipelineLayoutRelease(pipeline_layout);
@@ -1520,7 +1602,8 @@ void WebGPUPipelineCache::CreateRenderPipelineAsync(
     if (ps_module) {
       wgpuShaderModuleRelease(ps_module);
     }
-  });
+  };
+  device.RunAsync([creations, create]() { RunPipelineCreation(*creations, create); });
 }
 
 }  // namespace rex::graphics::webgpu

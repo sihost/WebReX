@@ -65,10 +65,15 @@ class WebGPUTextureCache final : public TextureCache {
     uint64_t dirty_reloads = 0;
     uint64_t views_created = 0;
     uint64_t samplers_created = 0;
+    // Draw resolution scaling: scaled resolve windows allocated, loads of scaled textures.
+    uint64_t scaled_windows = 0;
+    uint64_t scaled_loads = 0;
   };
 
+  // draw_resolution_scale_x/y: TextureCache::GetConfigDrawResolutionScale (1 = no scaling).
   WebGPUTextureCache(WebGPUCommandProcessor& command_processor, const RegisterFile& register_file,
-                     WebGPUSharedMemory& shared_memory, memory::Memory& memory);
+                     WebGPUSharedMemory& shared_memory, memory::Memory& memory,
+                     uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1);
   ~WebGPUTextureCache() override;
 
   bool Initialize();
@@ -112,11 +117,37 @@ class WebGPUTextureCache final : public TextureCache {
   WGPUSampler UseSampler(WebGPUSamplerParameters parameters);
 
   // The front buffer (texture fetch constant 0) as a 2D single-mip view on the device
-  // thread, or null. width/height: texture size (unscaled). If the host swizzle is not
-  // applied by the view and swaps red and blue, *swap_source_needs_rb_swap_out is set.
+  // thread, or null. width/height: host texture size (times the draw resolution scale if
+  // *scaled_out). If the host swizzle is not applied by the view and swaps red and blue,
+  // *swap_source_needs_rb_swap_out is set.
   WGPUTextureView RequestSwapTexture(uint32_t& width_out, uint32_t& height_out,
                                      xenos::TextureFormat& format_out,
-                                     bool* swap_source_needs_rb_swap_out = nullptr);
+                                     bool* swap_source_needs_rb_swap_out = nullptr,
+                                     bool* scaled_out = nullptr);
+
+  // ---- Scaled resolve memory (draw resolution scaling). ----
+  // WebGPU has no sparse buffers, and the scaled copy of the 512 MiB shared memory would be
+  // 2-4.5 GiB, so it is kept in lazily created windows: window j holds the unscaled range
+  // [j * W, j * W + 2 * W) (W = scaled_window_unscaled_size()) times the scale, so any range
+  // up to W long lies within one window (the one of its start) for reading; a resolve writes
+  // every window overlapping its range (up to 3).
+  struct ScaledResolveWindow {
+    WGPUBuffer buffer = nullptr;
+    uint32_t start_unscaled = 0;
+    uint64_t size_scaled = 0;
+  };
+  bool scaled_resolve_available() const { return scaled_window_log2_ != 0; }
+  uint32_t scaled_window_unscaled_size() const {
+    return scaled_window_log2_ ? UINT32_C(1) << scaled_window_log2_ : 0;
+  }
+  // Creates (if needed) and returns the windows overlapping [start, start + length), or
+  // false if the range can't be resolution-scaled (longer than W, no scaling, or a window
+  // could not be created); the resolve then writes only the shared memory
+  // (MarkRangeAsResolved(..., false)).
+  bool GetScaledResolveWriteWindows(uint32_t start_unscaled, uint32_t length_unscaled,
+                                    std::vector<ScaledResolveWindow>& windows_out);
+  bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
+                                          uint32_t length_scaled_alignment_log2 = 0) override;
 
   const WebGPUTextureFormatTable& format_table() const { return format_table_; }
   const WebGPUTextureFeatures& features() const { return format_table_.features(); }
@@ -127,7 +158,7 @@ class WebGPUTextureCache final : public TextureCache {
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
-  bool IsScaledResolveSupportedForFormat(TextureKey key) const override { return false; }
+  bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
   uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 
   uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension dimension) const override;
@@ -205,8 +236,18 @@ class WebGPUTextureCache final : public TextureCache {
   // earlier invalidation) made it outdated.
   void RefreshTexture(Texture& texture);
 
+  // The read window of a range: [start, start + length) must be at most W long. Creates it
+  // if needed; null on failure.
+  const ScaledResolveWindow* GetScaledResolveReadWindow(uint32_t start_unscaled,
+                                                        uint32_t length_unscaled);
+  // Window j, created on first use (CP thread, RunSync on the device thread).
+  const ScaledResolveWindow* GetScaledResolveWindow(uint32_t index);
+
   WebGPUCommandProcessor& command_processor_;
   memory::Memory& memory_;
+  // log2 of W, 0 when not scaling (or no window fits the device's buffer limits).
+  uint32_t scaled_window_log2_ = 0;
+  std::vector<ScaledResolveWindow> scaled_windows_;
   WebGPUTextureFormatTable format_table_;
   WebGPUTextureLoader loader_;
   bool component_swizzle_ = false;

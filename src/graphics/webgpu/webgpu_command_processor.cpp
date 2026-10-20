@@ -9,6 +9,7 @@
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #ifdef __EMSCRIPTEN__
@@ -68,6 +69,11 @@ REXCVAR_DEFINE_BOOL(webgpu_dummy_attachment_for_no_output, false, "GPU",
                     "(normally skipped, they have no effect) into the dummy attachment that draws "
                     "without render targets but with effects (pixel shader memexport) get. "
                     "Diagnostics for that path");
+
+REXCVAR_DEFINE_INT32(webgpu_frame_stats_interval_ms, 0, "GPU",
+                     "WebGPU: every N ms of swaps, log frame pacing: swaps/s, the swap-to-swap "
+                     "interval p50/p95/p99/max, the CP thread's wait for the GPU (frame latency "
+                     "bound), device-thread replay time, uploads and draws per frame. 0 = off");
 
 REXCVAR_DEFINE_INT32(webgpu_pipeline_wait_ms, 0, "GPU",
                      "WebGPU: per-frame budget (ms) of the GPU command thread waiting for the "
@@ -206,15 +212,27 @@ bool WebGPUCommandProcessor::SetupContext() {
   }
   // ---- end WP3 ----
 
-  texture_cache_ =
-      std::make_unique<WebGPUTextureCache>(*this, *register_file_, *shared_memory_, *memory_);
+  // Draw resolution scaling (as VulkanCommandProcessor::SetupContext).
+  if (!TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x_,
+                                                  draw_resolution_scale_y_)) {
+    REXGPU_WARN("WebGPU: the draw resolution scale is clamped to {}x{}", draw_resolution_scale_x_,
+                draw_resolution_scale_y_);
+  }
+  if (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1) {
+    REXGPU_INFO("WebGPU: draw resolution scale {}x{}", draw_resolution_scale_x_,
+                draw_resolution_scale_y_);
+  }
+  texture_cache_ = std::make_unique<WebGPUTextureCache>(
+      *this, *register_file_, *shared_memory_, *memory_, draw_resolution_scale_x_,
+      draw_resolution_scale_y_);
   if (!texture_cache_->Initialize()) {
     REXGPU_ERROR("WebGPU: texture cache initialization failed");
     return false;
   }
 
-  render_target_cache_ =
-      std::make_unique<WebGPURenderTargetCache>(*this, *register_file_, *memory_, trace_writer_);
+  render_target_cache_ = std::make_unique<WebGPURenderTargetCache>(
+      *this, *register_file_, *memory_, trace_writer_, draw_resolution_scale_x_,
+      draw_resolution_scale_y_);
   if (!render_target_cache_->Initialize(shared_memory_->binding_count())) {
     REXGPU_ERROR("WebGPU: render target cache initialization failed");
     return false;
@@ -485,9 +503,9 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
     c.point_constant_diameter[0] = float(pa_su_point_size.width) * (2.0f / 16.0f);
     c.point_constant_diameter[1] = float(pa_su_point_size.height) * (2.0f / 16.0f);
     c.point_screen_diameter_to_ndc_radius[0] =
-        1.0f / float(std::max(viewport_info.xy_extent[0], uint32_t(1)));
+        float(draw_resolution_scale_x_) / float(std::max(viewport_info.xy_extent[0], uint32_t(1)));
     c.point_screen_diameter_to_ndc_radius[1] =
-        1.0f / float(std::max(viewport_info.xy_extent[1], uint32_t(1)));
+        float(draw_resolution_scale_y_) / float(std::max(viewport_info.xy_extent[1], uint32_t(1)));
   }
 
   // Texture signedness and, since the translator never relies on view
@@ -499,6 +517,8 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
   uint32_t texture_index;
   while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
     textures_remaining &= ~(UINT32_C(1) << texture_index);
+    c.textures_resolution_scaled |=
+        uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
     uint32_t& signs = c.texture_swizzled_signs[texture_index >> 2];
     uint32_t signs_shift = 8 * (texture_index & 3);
     signs = (signs & ~(UINT32_C(0xFF) << signs_shift)) |
@@ -1004,11 +1024,16 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // origin_bottom_left = true as on D3D12: WebGPU NDC +Y points up (towards
   // framebuffer row 0), unlike Vulkan's. With false every draw was flipped
   // vertically within its viewport and the face winding (culling) reversed.
-  draw_util::GetHostViewportInfo(regs, 1, 1, true, rt_width, rt_height, false,
-                                 normalized_depth_control, false, true,
-                                 pixel_shader && pixel_shader->writes_depth(), viewport_info);
+  draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x_, draw_resolution_scale_y_, true,
+                                 rt_width, rt_height, false, normalized_depth_control, false,
+                                 true, pixel_shader && pixel_shader->writes_depth(),
+                                 viewport_info);
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  scissor.offset[0] *= draw_resolution_scale_x_;
+  scissor.offset[1] *= draw_resolution_scale_y_;
+  scissor.extent[0] *= draw_resolution_scale_x_;
+  scissor.extent[1] *= draw_resolution_scale_y_;
   for (uint32_t i = 0; i < 2; ++i) {
     uint32_t size = i ? rt_height : rt_width;
     scissor.offset[i] = std::min(scissor.offset[i], size);
@@ -1285,6 +1310,56 @@ void WebGPUCommandProcessor::EncodeSwap(void* user, WebGPUReplayState& /*state*/
                                           blit.height, frame);
 }
 
+namespace {
+double SteadyMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+void WebGPUCommandProcessor::UpdateFramePacing(double gpu_wait_ms) {
+  FramePacing& p = frame_pacing_;
+  const double now = SteadyMs();
+  const double replay_ms = command_queue_->replay_ms_total();
+  if (p.interval_start_ms == 0.0) {
+    p.interval_start_ms = p.last_swap_ms = now;
+    p.replay_ms_start = replay_ms;
+    p.upload_bytes_start = shared_memory_->uploaded_bytes();
+    p.constant_bytes_start = statistics_.constant_bytes;
+    p.draws_start = statistics_.draws;
+    return;
+  }
+  p.intervals_ms.push_back(float(now - p.last_swap_ms));
+  p.last_swap_ms = now;
+  p.gpu_wait_ms += gpu_wait_ms;
+  const double elapsed_ms = now - p.interval_start_ms;
+  if (elapsed_ms < double(REXCVAR_GET(webgpu_frame_stats_interval_ms))) {
+    return;
+  }
+  const size_t n = p.intervals_ms.size();
+  std::vector<float> sorted = p.intervals_ms;
+  std::sort(sorted.begin(), sorted.end());
+  auto pct = [&](double q) { return sorted[std::min(n - 1, size_t(q * double(n - 1) + 0.5))]; };
+  const uint64_t upload_bytes = shared_memory_->uploaded_bytes();
+  REXGPU_INFO(
+      "WebGPU: frame pacing: {} swaps in {:.0f} ms = {:.1f}/s | interval ms p50 {:.2f} p95 {:.2f} "
+      "p99 {:.2f} max {:.2f} | per frame: CP wait for GPU {:.2f} ms, device replay {:.2f} ms, "
+      "draws {:.0f}, shared memory uploads {:.2f} MiB, constants {:.2f} MiB",
+      n, elapsed_ms, double(n) * 1000.0 / elapsed_ms, pct(0.5), pct(0.95), pct(0.99), sorted.back(),
+      p.gpu_wait_ms / double(n), (replay_ms - p.replay_ms_start) / double(n),
+      double(statistics_.draws - p.draws_start) / double(n),
+      double(upload_bytes - p.upload_bytes_start) / double(n) / 1048576.0,
+      double(statistics_.constant_bytes - p.constant_bytes_start) / double(n) / 1048576.0);
+  p.intervals_ms.clear();
+  p.interval_start_ms = now;
+  p.gpu_wait_ms = 0.0;
+  p.replay_ms_start = replay_ms;
+  p.upload_bytes_start = upload_bytes;
+  p.constant_bytes_start = statistics_.constant_bytes;
+  p.draws_start = statistics_.draws;
+}
+
 void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   uint64_t swap_index = ++statistics_.swaps;
@@ -1296,8 +1371,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t texture_width = 0, texture_height = 0;
   xenos::TextureFormat texture_format = xenos::TextureFormat(0);
   bool swap_needs_rb_swap = false;
+  bool swap_scaled = false;
   WGPUTextureView swap_view = texture_cache_->RequestSwapTexture(
-      texture_width, texture_height, texture_format, &swap_needs_rb_swap);
+      texture_width, texture_height, texture_format, &swap_needs_rb_swap, &swap_scaled);
 
   // Display gamma ramp (VulkanCommandProcessor::IssueSwap: D3D initializes the
   // 256-entry table for 8_8_8_8 output and the PWL ramp for 2_10_10_10).
@@ -1338,10 +1414,15 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           sample(2, 0.25f), sample(2, 0.5f), sample(2, 0.75f), sample(2, 1.0f));
     }
   }
+  // A resolution-scaled front buffer is presented at the host resolution.
+  uint32_t output_scale_x = swap_scaled ? draw_resolution_scale_x_ : 1;
+  uint32_t output_scale_y = swap_scaled ? draw_resolution_scale_y_ : 1;
   uint32_t output_width = std::clamp<uint32_t>(
-      frontbuffer_width ? frontbuffer_width : texture_width, 1, 8192);
+      frontbuffer_width ? frontbuffer_width * output_scale_x : texture_width, 1,
+      8192 * output_scale_x);
   uint32_t output_height = std::clamp<uint32_t>(
-      frontbuffer_height ? frontbuffer_height : texture_height, 1, 8192);
+      frontbuffer_height ? frontbuffer_height * output_scale_y : texture_height, 1,
+      8192 * output_scale_y);
 
   WGPUColor clear_color = {0.0, 0.0, 0.0, 1.0};
   if (has_last_color_clear_) {
@@ -1382,16 +1463,24 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   // Bound the GPU latency: wait for the swap kMaxFramesInFlight swaps back.
   uint64_t& slot = swap_submissions_[swap_index % kMaxFramesInFlight];
+  const bool frame_stats = REXCVAR_GET(webgpu_frame_stats_interval_ms) > 0;
+  const double gpu_wait_start_ms = frame_stats ? SteadyMs() : 0.0;
   if (slot && !submission_tracker_.AwaitCompleted(slot)) {
     REXGPU_WARN("WebGPU: submission {} not completed after 10 s (lost: {})", slot,
                 device_.is_lost());
   }
   slot = swap_submission;
+  if (frame_stats) {
+    UpdateFramePacing(SteadyMs() - gpu_wait_start_ms);
+  }
   primitive_processor_->EndFrame();  // WP3: after the latency wait
-  // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
-  // on by default): pages not written by the GPU become invalid, so vertex and
-  // index data are uploaded again on their next request even if a CPU write
-  // escaped the dirty map. Textures still depend on invalidation (watches).
+  // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state):
+  // pages not written by the GPU become invalid, so vertex and index data are
+  // uploaded again on their next request even if a CPU write escaped the dirty
+  // map. OFF by default on web (see command_processor.cpp): the dirty map covers
+  // every CPU write (1355d5f, 621b4c1; --webgpu_verify_shared_memory: 0 stale
+  // pages in 2x300 s MW2 + a Halo film), and it cost MW2 ~15-17 MiB/frame of
+  // uploads vs ~0.8 MiB. --clear_memory_page_state=true restores it.
   if (REXCVAR_GET(clear_memory_page_state)) {
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
@@ -1413,7 +1502,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         "constants {} KiB | "
         "submissions {} replayed {} completed {} | shared memory uploads {} ({} MiB) | last "
         "replay {} commands, {} draws ({} skipped, pipeline not ready), {} bind groups, encode "
-        "{:.3f} ms, submit {:.3f} ms | uncaptured errors {} | verify: {} pages checked, {} "
+        "{:.3f} ms, submit {:.3f} ms, {} redundant state calls skipped | uncaptured errors {} | "
+        "verify: {} pages checked, {} "
         "stale | vs memexport compute: {} dispatches, {} without a compute variant or off | "
         "tessellation: {} draws ({} patches, slot max {} points / {} indices), {} dropped by "
         "the tessellator | skipped (pipeline not ready) {} in all replays, pipeline waits {} "
@@ -1439,7 +1529,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         submission_tracker_.replayed(), submission_tracker_.completed(),
         shared_memory_->upload_count(), shared_memory_->uploaded_bytes() >> 20, replay.commands,
         replay.draws, replay.draws_skipped, replay.bind_groups_created, replay.encode_ms,
-        replay.submit_ms, device_.uncaptured_error_count(), shared_memory_->verified_pages(),
+        replay.submit_ms, replay.redundant_state_skipped, device_.uncaptured_error_count(),
+        shared_memory_->verified_pages(),
         shared_memory_->stale_pages(), statistics_.memexport_dispatches,
         statistics_.memexport_unsupported, statistics_.draws_tessellated,
         tessellator_ ? tessellator_->statistics().patches : 0,
@@ -1474,8 +1565,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     polygon_log_depth_bias = pipelines.draws_depth_bias;
   }
 #ifdef __EMSCRIPTEN__
-  // Running out of a fixed-size wasm memory aborts the tab: warn once when the heap break comes
-  // within 512 MiB of the maximum memory size.
+  // Running out of wasm memory aborts the tab (rex_web_pre.js reports it as out of memory): warn
+  // once when the heap break comes within 512 MiB of the maximum memory size (the growth limit,
+  // or the fixed size).
   static bool heap_headroom_warned = false;
   if (!heap_headroom_warned) {
     uint64_t heap_break = uint64_t(reinterpret_cast<uintptr_t>(sbrk(0)));
@@ -1484,8 +1576,8 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       heap_headroom_warned = true;
       REXGPU_WARN(
           "WebGPU: swap #{} memory: heap break {} MiB is within 512 MiB of the {} MiB maximum "
-          "wasm memory; an allocation past it aborts the tab (raise INITIAL_MEMORY / "
-          "MAXIMUM_MEMORY)",
+          "wasm memory; an allocation past it aborts the tab (raise rexglue_configure_target "
+          "WEB_MAXIMUM_MEMORY / REXGLUE_WEB_MAXIMUM_MEMORY)",
           swap_index, heap_break >> 20, heap_max >> 20);
     }
   }

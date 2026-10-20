@@ -15,6 +15,11 @@
  *   - Pipelines: createShaderModule + createRenderPipelineAsync on the device
  *     thread (RunAsync); the callback stores the pipeline in the table. Draws
  *     recorded before it is ready are skipped by the replay, the CP never waits.
+ *     --webgpu_pipeline_creations_in_flight caps the creations outstanding at
+ *     once (the rest wait in CreationQueue, FIFO). Firefox (auto: 1) compiles
+ *     pipelines one by one in its GPU process and runs every later queue
+ *     operation (submits, onSubmittedWorkDone, present) only after all of them,
+ *     so a burst of a few hundred stalled frames for minutes.
  *   - Layout (explicit, shared by every guest pipeline; the translator's
  *     descriptor sets, SpirvShaderTranslator::DescriptorSet):
  *       group 0  shared memory, read-only storage, bindings 0...N-1
@@ -49,6 +54,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -290,6 +296,15 @@ class WebGPUPipelineCache {
       settled_cv.notify_all();
     }
   };
+  // Pipeline creations waiting for --webgpu_pipeline_creations_in_flight (device thread;
+  // `waiting` readable anywhere). Shared like AsyncCounters.
+  struct CreationQueue {
+    uint32_t limit = 0;  // 0 = no limit
+    uint32_t in_flight = 0;
+    std::deque<std::function<void()>> pending;
+    std::atomic<uint32_t> waiting{0};
+    std::atomic<uint32_t> max_waiting{0};
+  };
   uint64_t pipelines_created() const { return async_counters_->pipelines_created.load(); }
   uint64_t pipelines_failed() const { return async_counters_->pipelines_failed.load(); }
 
@@ -411,6 +426,7 @@ class WebGPUPipelineCache {
   std::unordered_map<uint64_t, std::unique_ptr<WebGPUShaderBindings>> shader_bindings_;
   mutable Statistics statistics_;
   std::shared_ptr<AsyncCounters> async_counters_ = std::make_shared<AsyncCounters>();
+  std::shared_ptr<CreationQueue> creation_queue_ = std::make_shared<CreationQueue>();
   // CP thread: ids known to be settled (no lock needed for them any more).
   std::vector<bool> settled_known_;
 };

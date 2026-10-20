@@ -116,13 +116,14 @@ namespace disruptorplus
             sequence_t result;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
+                // (ReXGlue: the predicate and the timeout were swapped, so this never compiled.)
                 m_cv.wait_for(
                     lock,
+                    timeout,
                     [&]() -> bool {
                         result = minimum_sequence_after(sequence, count, sequences);
                         return difference(result, sequence) >= 0;
-                    },
-                    timeout);
+                    });
             }
             return result;
         }
@@ -169,13 +170,20 @@ namespace disruptorplus
             sequence_t result;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait_until(
-                    lock,
-                    [&]() -> bool {
-                        result = minimum_sequence_after(sequence, count, sequences);
-                        return difference(result, sequence) >= 0;
-                    },
-                    timeoutTime);
+                auto published = [&]() -> bool {
+                    result = minimum_sequence_after(sequence, count, sequences);
+                    return difference(result, sequence) >= 0;
+                };
+                // (ReXGlue: arguments were swapped; time_point::max() means no timeout and
+                // would overflow the conversion to the condition variable's clock.)
+                if (timeoutTime == std::chrono::time_point<Clock, Duration>::max())
+                {
+                    m_cv.wait(lock, published);
+                }
+                else
+                {
+                    m_cv.wait_until(lock, timeoutTime, published);
+                }
             }
             return result;
         }

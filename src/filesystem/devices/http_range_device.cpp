@@ -79,6 +79,17 @@ REXCVAR_DEFINE_INT32(vfs_cache_reserve_mb, 256, "Filesystem",
                      "the block cache stops growing and evicts its least recently used files when "
                      "navigator.storage.estimate() reports less than this left")
     .range(0, 1 << 20);
+REXCVAR_DEFINE_BOOL(vfs_cache_skip_with_service_worker, true, "Filesystem",
+                    "Web HttpRangeDevice: when the page's service worker answers the data reads "
+                    "(response header X-<title>-SW: 1; web/sw.js keeps every chunk it serves in "
+                    "Cache Storage), the OPFS block cache still serves what it holds but stores "
+                    "nothing new, so the game data is not kept twice in the origin's quota");
+REXCVAR_DEFINE_INT32(vfs_cache_protect_s, 120, "Filesystem",
+                     "Web HttpRangeDevice: block cache files used in the last N seconds are never "
+                     "evicted to make room for new blocks (those stay memory-only instead), so a "
+                     "full cache does not evict, download and rewrite the same data in a loop. "
+                     "Saves that need space (storage pressure) may still evict them. 0 = off")
+    .range(0, 86400);
 
 // -------------------------------------------------------------------------------------------
 // JS transport. All pointers and 64-bit integers are passed as doubles (exact below 2^53), which
@@ -114,6 +125,7 @@ EM_JS(double, rex_web_http_read_range,
     try {
       var size = fs.fstatSync(fd).size;
       if (offset >= size) return -416;
+      globalThis["__rexLastSw"] = 0;
       var n = Math.min(length, size - offset);
       var buf = Buffer.alloc(n);
       var got = fs.readSync(fd, buf, 0, n, offset);
@@ -129,6 +141,14 @@ EM_JS(double, rex_web_http_read_range,
   if (ifMatch) xhr.setRequestHeader("If-Match", ifMatch);
   try { xhr.send(null); } catch (e) { return -1; }
   if (xhr.status !== 206 && xhr.status !== 200) return -(xhr.status || 1);
+  // Answered by the page's service worker chunk store (web/sw.js marks its responses with
+  // X-<title>-SW: 1)? Read by rex_web_last_response_from_sw.
+  var fromSw = 0;
+  var swName = new RegExp("^x-[a-z0-9]+-sw:", "i");
+  for (var line of (xhr.getAllResponseHeaders() || "").split(String.fromCharCode(10))) {
+    if (swName.test(line) && line.substring(line.indexOf(":") + 1).trim() === "1") fromSw = 1;
+  }
+  globalThis["__rexLastSw"] = fromSw;
   var body = new Uint8Array(xhr.response);
   if (xhr.status === 200) {
     // The server ignored Range (violates the contract); still correct, just wasteful.
@@ -137,6 +157,11 @@ EM_JS(double, rex_web_http_read_range,
   var n2 = Math.min(body.length, length);
   HEAPU8.set(body.subarray(0, n2), dst);
   return n2;
+});
+
+// 1 if the last successful rex_web_http_read_range on this thread came from a service worker.
+EM_JS(int, rex_web_last_response_from_sw, (), {
+  return globalThis["__rexLastSw"] ? 1 : 0;
 });
 
 // 1 if the browser reports no network (navigator.onLine === false in this Worker), else 0.
@@ -694,6 +719,10 @@ HttpRangeDevice::PersistentFile* HttpRangeDevice::GetPersistentFile(uint32_t fil
       uint64_t(st.st_size) == info.size) {
     pf->complete = true;
     pf->data_fd = ::open((base + ".data").c_str(), O_RDONLY);
+  } else if (SkipWritesForServiceWorker() && ::stat((base + ".data").c_str(), &st) != 0) {
+    // Nothing cached for this file and nothing will be written: no empty files.
+    persistent_.emplace(file, nullptr);
+    return nullptr;
   } else {
     pf->data_fd = ::open((base + ".data").c_str(), O_RDWR | O_CREAT, 0644);
     pf->map_fd = ::open((base + ".map").c_str(), O_RDWR | O_CREAT, 0644);
@@ -729,6 +758,10 @@ bool HttpRangeDevice::ReadPersistentBlock(uint32_t file, uint32_t block,
 void HttpRangeDevice::WritePersistentBlocks(uint32_t file, uint32_t first_block,
                                             const uint8_t* data, size_t length) {
   // cache_mutex_ held.
+  if (SkipWritesForServiceWorker()) {
+    ++stat_deduplicated_writes_;
+    return;  // the service worker's Cache Storage already holds these blocks
+  }
   PersistentFile* pf = GetPersistentFile(file);
   if (!pf || pf->complete) return;
   off_t offset = off_t(uint64_t(first_block) * options_.block_size);
@@ -883,6 +916,17 @@ bool HttpRangeDevice::FetchBlocks(uint32_t file, uint32_t first, uint32_t last,
                                          if_match.empty() ? 0.0 : PtrArg(if_match.c_str()));
     if (got >= 0) {
       stat_bytes_.fetch_add(uint64_t(got), std::memory_order_relaxed);
+      if (!service_worker_store_.load(std::memory_order_relaxed) &&
+          rex_web_last_response_from_sw() && !service_worker_store_.exchange(true)) {
+        REXFS_INFO(
+            "HttpRangeDevice: {} is answered by the page's service worker, which keeps the data "
+            "in Cache Storage; the OPFS block cache {}",
+            options_.base_url,
+            REXCVAR_GET(vfs_cache_skip_with_service_worker)
+                ? "serves what it holds but stores nothing new (no second copy; "
+                  "--vfs_cache_skip_with_service_worker)"
+                : "keeps a second copy (--vfs_cache_skip_with_service_worker=false)");
+      }
       bool ok = size_t(got) == length;
       if (!ok) {
         REXFS_ERROR("HttpRangeDevice: short response for {} [{}+{}]: {} bytes", info.path, offset,
@@ -1219,6 +1263,9 @@ HttpRangeDevice::Stats HttpRangeDevice::stats() const {
   s.reopened_files = stat_reopened_files_;
   s.failed_writes = stat_failed_writes_;
   s.space_limit_bytes = space_limit_bytes_;
+  s.deduplicated_writes = stat_deduplicated_writes_;
+  s.protected_skips = stat_protected_skips_;
+  s.service_worker_store = service_worker_store_.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -1254,20 +1301,44 @@ void HttpRangeDevice::ScanPersistentCacheLocked() {
                  : int64_t(REXCVAR_GET(vfs_cache_reserve_mb)));
 }
 
+namespace {
+int64_t NowSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+// Evicting exactly what one write needs makes the next write evict again: free this much more.
+uint64_t EvictionHeadroom(uint64_t budget) {
+  return std::clamp<uint64_t>(budget / 8, uint64_t(4) << 20, uint64_t(64) << 20);
+}
+}  // namespace
+
+bool HttpRangeDevice::SkipWritesForServiceWorker() const {
+  return service_worker_store_.load(std::memory_order_relaxed) &&
+         REXCVAR_GET(vfs_cache_skip_with_service_worker);
+}
+
 void HttpRangeDevice::TouchPersistentLocked(const std::string& base, uint64_t file_bytes) {
   CacheFileUse& use = cache_files_[base];
   use.last_use = ++use_clock_;
+  use.last_use_s = NowSeconds();
   if (file_bytes > use.bytes) {
     cache_bytes_ += file_bytes - use.bytes;
     use.bytes = file_bytes;
   }
 }
 
-uint64_t HttpRangeDevice::EvictPersistentLocked(uint64_t bytes, const std::string& keep_base) {
+uint64_t HttpRangeDevice::EvictPersistentLocked(uint64_t bytes, const std::string& keep_base,
+                                               bool cold_only) {
+  const int64_t protect_s = REXCVAR_GET(vfs_cache_protect_s);
+  const int64_t now_s = NowSeconds();
   uint64_t freed = 0;
   while (freed < bytes) {
     auto victim = cache_files_.end();
     for (auto it = cache_files_.begin(); it != cache_files_.end(); ++it) {
+      if (cold_only && protect_s > 0 && now_s - it->second.last_use_s < protect_s) {
+        continue;  // in use this session: evicting it would just bring it back
+      }
       if (it->first != keep_base && it->second.bytes &&
           (victim == cache_files_.end() || it->second.last_use < victim->second.last_use)) {
         victim = it;
@@ -1307,11 +1378,31 @@ bool HttpRangeDevice::ReservePersistentLocked(uint64_t bytes, const std::string&
   if (space_limit_bytes_ && (cap <= 0 || space_limit_bytes_ < uint64_t(cap))) {
     cap = int64_t(space_limit_bytes_);
   }
+  // Never thrash: room for new blocks only comes from files not used for vfs_cache_protect_s
+  // (EvictPersistentLocked cold_only), evicted with headroom; if that is not enough, or one
+  // write would take half the budget (the .data files are not sparse: a block deep into a big
+  // file costs everything before it), the blocks stay memory-only.
+  auto skip = [&](const char* why, double budget) {
+    if ((++stat_protected_skips_ & 255) == 1) {
+      REXFS_INFO(
+          "HttpRangeDevice: block cache keeps {:.1f} MiB, budget {:.1f} MiB: {} {:.1f} MiB more; "
+          "those blocks stay in memory (skip {})",
+          double(cache_bytes_) / 1048576.0, budget / 1048576.0, why, double(bytes) / 1048576.0,
+          stat_protected_skips_);
+    }
+    return false;
+  };
   if (cap > 0) {
-    if (bytes > uint64_t(cap)) return false;
+    if (bytes > uint64_t(cap) / 2) {
+      return skip("one write would take half of it,", double(cap));
+    }
     if (cache_bytes_ + bytes > uint64_t(cap)) {
-      EvictPersistentLocked(cache_bytes_ + bytes - uint64_t(cap), keep_base);
-      if (cache_bytes_ + bytes > uint64_t(cap)) return false;
+      uint64_t need = cache_bytes_ + bytes - uint64_t(cap);
+      EvictPersistentLocked(need + EvictionHeadroom(uint64_t(cap)), keep_base, true);
+      if (cache_bytes_ + bytes > uint64_t(cap)) {
+        return skip("only files used in the last vfs_cache_protect_s are left to evict for",
+                    double(cap));
+      }
     }
   }
   web::StorageEstimate estimate = web::GetStorageEstimate();
@@ -1320,14 +1411,36 @@ bool HttpRangeDevice::ReservePersistentLocked(uint64_t bytes, const std::string&
       estimate_sequence_ = estimate.sequence;
       bytes_since_estimate_ = 0;
     }
-    double reserve = double(options_.persistent_cache_reserve_bytes >= 0
-                                ? options_.persistent_cache_reserve_bytes
-                                : int64_t(REXCVAR_GET(vfs_cache_reserve_mb)) << 20);
-    double left = estimate.quota - estimate.usage - double(bytes_since_estimate_) - double(bytes);
-    if (left < reserve) {
-      uint64_t want = uint64_t(reserve - left) + 1;
-      uint64_t freed = EvictPersistentLocked(want, keep_base);
-      if (freed < want) return false;
+    // Chrome's StaticStorageQuota reports usage + 10 GiB whatever the real limit is: then only
+    // a failing write tells (space_limit_bytes_).
+    if (!estimate.quota_padded) {
+      double reserve = double(options_.persistent_cache_reserve_bytes >= 0
+                                  ? options_.persistent_cache_reserve_bytes
+                                  : int64_t(REXCVAR_GET(vfs_cache_reserve_mb)) << 20);
+      // What the block cache may use: its own files plus what is left above the reserve once
+      // everything else in the origin (service worker Cache Storage, shaders, saves) is counted.
+      double left = estimate.quota - estimate.usage - double(bytes_since_estimate_);
+      double budget = std::max(0.0, left - reserve + double(cache_bytes_));
+      if (double(bytes) > budget / 2) {
+        return skip("(the origin's quota minus other storage and the reserve) too small for",
+                    budget);
+      }
+      left -= double(bytes);
+      if (left < reserve) {
+        uint64_t want = uint64_t(reserve - left) + 1;
+        uint64_t freed =
+            EvictPersistentLocked(want + EvictionHeadroom(uint64_t(budget)), keep_base, true);
+        if (freed < want) {
+          return skip("only files used in the last vfs_cache_protect_s are left to evict for",
+                      budget);
+        }
+      }
+    }
+    // Other storage grows between the 30 s estimates too: ask again after 64 MiB of writes.
+    if (bytes_since_estimate_ > (int64_t(64) << 20) &&
+        estimate_refresh_sequence_ != estimate.sequence) {
+      estimate_refresh_sequence_ = estimate.sequence;
+      web::RefreshStorageEstimate();
     }
   }
   bytes_since_estimate_ += int64_t(bytes);

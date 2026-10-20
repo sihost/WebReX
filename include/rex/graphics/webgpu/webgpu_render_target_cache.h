@@ -26,7 +26,9 @@
  * MSAA: 1x and 4x only; guest 2x uses 4x host samples (0/1 top, 2/3 bottom;
  * draws should use sample mask 0b1001). D24FS8 host depth is the guest value
  * * 0.5 (pass full_float24_in_0_to_1 = false to GetHostViewportInfo, as on
- * Vulkan). Draw resolution scaling is not supported (1x).
+ * Vulkan). Draw resolution scaling: host render targets and the EDRAM buffer tiles
+ * are scale times larger; resolves write the guest pixels to the shared memory and
+ * the host pixels to the texture cache's scaled resolve windows.
  *
  * Contract with the command processor (WP1): Update() binds the guest render
  * targets for the draw; the CP then calls
@@ -57,6 +59,7 @@
 #include <rex/graphics/webgpu/webgpu_command_stream.h>
 #include <rex/graphics/webgpu/webgpu_edram.h>
 #include <rex/graphics/webgpu/webgpu_readback.h>
+#include <rex/graphics/webgpu/webgpu_texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 
@@ -105,7 +108,8 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
 
   WebGPURenderTargetCache(WebGPUCommandProcessor& command_processor,
                           const RegisterFile& register_file, const memory::Memory& memory,
-                          TraceWriter& trace_writer);
+                          TraceWriter& trace_writer, uint32_t draw_resolution_scale_x = 1,
+                          uint32_t draw_resolution_scale_y = 1);
   ~WebGPURenderTargetCache() override;
 
   // shared_memory_binding_count: storage bindings the shared memory needs
@@ -193,6 +197,10 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
     // textures created (one per host sample count, recreated larger).
     uint64_t dummy_attachment_updates = 0;
     uint64_t dummy_attachments_created = 0;
+    // Draw resolution scaling: resolves also written to the scaled resolve windows, and
+    // resolves only written at 1x (range longer than a window).
+    uint64_t scaled_resolves = 0;
+    uint64_t unscaled_resolves = 0;
   };
   const Statistics& statistics() const { return statistics_; }
   const WebGPUEdram::Statistics* edram_statistics() const {
@@ -284,6 +292,7 @@ class WebGPURenderTargetCache final : public RenderTargetCache {
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<WebGPUEdramRectangle> load_rectangles_;
   std::vector<Transfer> clear_transfers_[2];
+  std::vector<WebGPUTextureCache::ScaledResolveWindow> scaled_windows_;
 
   // Resolve readback (--webgpu_readback_resolve), device-thread buffer.
   WGPUBuffer readback_buffer_ = nullptr;

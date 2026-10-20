@@ -138,6 +138,9 @@ void MarkGuestRangeDirty(uint32_t guest_address, uint32_t length) noexcept;
 // fn(context, run_first_page, run_page_count) for each maximal run that was dirty.
 // Returns the number of dirty pages found.
 using DirtyRunFn = void (*)(void* context, uint32_t first_page, uint32_t page_count);
+// True if any page of [first_page, last_page] is dirty (lock-free, 8 pages per load). A page
+// that becomes dirty concurrently may be missed, as if written just after the check.
+bool AnyDirtyPages(uint32_t first_page, uint32_t last_page) noexcept;
 uint32_t ConsumeDirtyPages(uint32_t first_page, uint32_t last_page, DirtyRunFn fn,
                            void* context) noexcept;
 
@@ -234,9 +237,39 @@ void ClearAllDirty() noexcept;
 }
 
 // Store-side raw address (stvx, stwcx./stdcx., dcbz/dcbz128): fold + mark the page dirty.
-// Callers access at most 128 naturally aligned bytes, so one page mark suffices. The mark
-// precedes the write here; the GPU only consumes after the guest's MMIO ring-pointer write
-// (handler, locked), which orders both.
+// Callers access at most 128 naturally aligned bytes, so one page mark suffices.
+//
+// Ordering: the mark must land AFTER the data (like Store8..64). The GPU thread consumes
+// marks at any time, not only after the guest's ring-pointer write: it exchanges a page's
+// mark to 0 and then copies the page (ConsumeDirtyPages + UploadRanges) while the guest may
+// still be filling another part of the same page (dynamic vertex/index rings). With the mark
+// first, "guest marks P -> GPU clears P and copies it -> guest data lands" leaves P changed
+// and unmarked (a stale GPU copy). Mark-after is safe: a consumer that clears first either
+// copies the new data or sees the later mark.
+//
+// PPC_RAW_ADDR_W therefore yields RawStoreW(...).ptr: the codegen always uses it inside the
+// store's own full-expression (`simde_mm_store_si128((T*)PPC_RAW_ADDR_W(ea), v);`,
+// `memset((void*)PPC_RAW_ADDR_W(ea), 0, 128);`, `eq = __sync_bool_compare_and_swap(
+// reinterpret_cast<T*>(PPC_RAW_ADDR_W(ea)), ...);`), so the temporary's destructor (the
+// mark) runs after the store. The data and mark stores may alias (g_phys_dirty is uint8_t
+// and `base` is not restrict), so the compiler keeps them in program order; the signal
+// fence makes that explicit at no runtime cost.
+struct RawStoreW {
+  uint8_t* ptr;
+  uint64_t offset;
+  [[gnu::always_inline]] RawStoreW(uint8_t* base, uint32_t a) noexcept
+      : ptr(base + Fold(a)), offset(Fold(a)) {}
+  [[gnu::always_inline]] ~RawStoreW() {
+    __atomic_signal_fence(__ATOMIC_RELEASE);
+    MarkDirtyHostOffset(offset);
+  }
+  RawStoreW(const RawStoreW&) = delete;
+  RawStoreW& operator=(const RawStoreW&) = delete;
+};
+
+// Function form for callers that store later through the returned pointer: marks BEFORE the
+// write, so it is only safe when no consumer can run between the mark and the store (unit
+// tests, single-threaded tools). Generated code uses PPC_RAW_ADDR_W (RawStoreW).
 [[gnu::always_inline]] inline uint8_t* RawAddrW(uint8_t* base, uint32_t a) {
   const uint64_t o = Fold(a);
   MarkDirtyHostOffset(o);

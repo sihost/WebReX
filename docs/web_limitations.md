@@ -59,7 +59,7 @@ renderer's audio thread alive. Measured on Halo 3: 30.0 ticks/s and 60 fps hidde
 ## Page lifecycle and Memory Saver
 
 Chrome's Memory Saver (and tab discarding under memory pressure) can discard an inactive heavy tab. A
-game tab with an 8 GB wasm memory is a prime target. The page is not told beforehand: the session is
+game tab with a 3-4 GB wasm memory is a prime target. The page is not told beforehand: the session is
 simply gone, and the next visit reloads it with `document.wasDiscarded == true`. Mitigations:
 - **An audible tab is not discarded.** The SDK's AudioContext counts once it runs (after the first user
   gesture) and plays sound. A muted tab or a suspended context does not protect the page.
@@ -118,10 +118,22 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
 | `texture-compression-bc-sliced-3d` | 3D BC textures decompressed | `--webgpu_texture_bc_sliced_3d=false` |
 | `texture-formats-tier1` | 8_8_8_8_GAMMA render targets stored as rgba8 with PWL gamma in the shaders: blending happens in gamma space | `--gamma_render_target_as_unorm16=false` |
 | `float32-filterable` | 32-bit float textures sampled nearest | `--webgpu_float32_filterable=false` |
-| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (so far it changes only the report line; the pipeline cache does not read it yet) |
+| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (the pipeline cache then translates vertex shaders without user clip distances; the WGSL storage directory differs) |
 | `depth-clip-control` | depth clipping cannot be turned off (`clip_disable`) | — |
 | `depth32float-stencil8` | D24FS8 depth stored in depth24plus | — |
 | `texture-component-swizzle` | swizzles applied in shaders (same result) | `--webgpu_texture_component_swizzle=false` |
+
+## GPU copy of guest memory (dirty map)
+
+- The web build does not re-upload every vertex/index page each frame: `clear_memory_page_state` defaults to
+  `false` on web (native keeps `true`). The GPU copy of guest physical memory is refreshed only from the dirty
+  map, which every guest store marks after its data. This cut MW2's uploads from ~15-17 MiB/frame to ~0.8.
+- Host code (kernel exports, hooks, file reads) that writes guest physical memory must call
+  `memory::NoteHostWrite` / `Memory::MarkPhysicalDirty` AFTER the write, or the GPU keeps a stale copy
+  (symptom: corrupt or flickering geometry/UI).
+- Diagnose with `--webgpu_verify_shared_memory=true` (slow: hashes every uploaded page, logs pages
+  "changed since its upload without a dirty mark" with the changed bytes). `--clear_memory_page_state=true`
+  restores the per-frame invalidation as a fallback.
 
 ## Input
 
@@ -137,9 +149,28 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   `show`, `canvas`, `opacity`, `size` and `layout`, documented in `src/ui/rex_web_pre.js`). It draws a
   virtual Standard Gamepad over the canvas, driven by Pointer Events, and adds it to
   `navigator.getGamepads()`, so the SDK reads it like a real pad. There is no direct touch-to-guest
-  input, and wasm64 plus about 8 GB of memory keeps most phones out anyway.
+  input, and wasm64 plus 4-7 GB of memory per tab keeps most phones out anyway.
 
 ## Files and memory
+
+- **Wasm memory is committed, never returned.** The browser commits the whole initial wasm memory when
+  the page starts (Chrome on Windows: an 8 GB initial memory is +7.9 GB of system commit charge, touched
+  or not), and a wasm memory never shrinks. Layout B needs a fixed 2.75 GiB guest window, and a whole
+  session's heap break is 3.1-3.8 GiB (MW2 match, Halo 3 game). So `rexglue_configure_target` links a
+  small initial memory that grows on demand: `REXGLUE_WEB_INITIAL_MEMORY` (default `3GB`) and
+  `REXGLUE_WEB_MAXIMUM_MEMORY` (default `8GB`; equal sizes = fixed memory, no growth), per title with
+  `-D` on the configure line, `set()` before `rexglue_setup_target()`, or the `WEB_INITIAL_MEMORY` /
+  `WEB_MAXIMUM_MEMORY` arguments. The maximum is address space only. After a grow the JS heap views are
+  refreshed on their next use. Length-tracking views (`-sGROWABLE_ARRAYBUFFERS`) are not used: Chrome's
+  `FileSystemSyncAccessHandle.read/write` rejects views of a growable SharedArrayBuffer, so every WasmFS
+  OPFS write failed ("disk full"). The log says `Wasm memory: N MiB now, growable (max M MiB)`
+  at startup, and every swap-stats line has the heap break and the current size.
+- **Out of memory is reported.** When the memory can not grow (the maximum is reached, or the browser
+  refuses to commit more) or the initial memory can not be created, `src/ui/rex_web_pre.js` turns the
+  abort into a crash report that starts with `out of memory:` and says which of the two happened.
+- **The wasm memory is not the whole tab.** The renderer process also holds the compiled wasm code, one
+  V8 isolate per pthread Worker (`REXGLUE_WEB_PTHREAD_POOL_SIZE`, default 32, all spawned before
+  `main()`), and the GPU process holds the WebGPU resources.
 
 - **File mappings fail cleanly** (`src/core/memory_web.cpp`). Only the guest window used them, and it does
   not on the web.
@@ -150,5 +181,54 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   DLC (STFS packages) on the server the same way, for example with xenia's or extract-xiso's extraction,
   and mount the result as an extra `HttpRangeDevice` root. A block-reader interface over HttpRangeDevice
   blocks (reusing its OPFS cache) would lift this.
-- **Draw resolution scaling** (`draw_resolution_scale_x/y`) is not supported on WebGPU. It runs at 1x
-  only.
+- **Draw resolution scaling** (`draw_resolution_scale_x/y`, URL `arg=--draw_resolution_scale_x=2&arg=--draw_resolution_scale_y=2`)
+  works on WebGPU (tested at 2x2 with the Halo 3 riverworld film: no WebGPU errors, paused film frames within 38-49 dB PSNR of the 1x frames).
+  Limits compared to the desktop backends: resolved data is kept at the scaled resolution in "scaled
+  resolve windows" of guest memory (64 MiB of GPU memory per 8 MiB guest range at 2x2, 144 MiB at 3x3,
+  halved to fit `maxStorageBufferBindingSize`, created on first use); a resolve that does not fit one
+  window falls back to 1x for that range (the texture is then read at guest resolution). Block-compressed
+  textures loaded from guest memory stay 1x (only resolved render targets are scaled), and trace playback
+  does not restore the EDRAM snapshot when scaled. GPU and wasm memory grow with the scale; 3x3 is untested.
+
+## Origin storage
+
+Everything a title keeps in the browser shares one origin quota: the page's service worker chunk store
+(Cache Storage, `web/sw.js` in the game repos: every 2 MiB chunk of `/data/` it serves), the OPFS block
+cache of `HttpRangeDevice` (`/opfs/rex-cache/<sha256>.data`), the WGSL shader storage
+(`/opfs/rex-cache/shaders`) and the saves (`xstorage:`, profiles). The console line
+`[storage] usage ... (OPFS ..., Cache Storage ..., IndexedDB ... MiB) of ... MiB quota` shows the split.
+
+- **Game data is stored once.** When the service worker answers the data reads (its responses carry
+  `X-<title>-SW: 1`), the OPFS block cache only serves what it already holds and stores nothing new
+  (`--vfs_cache_skip_with_service_worker`, default on). Before, every block was kept twice.
+- **Chrome does not report its real quota.** With the StaticStorageQuota feature (Chrome 155),
+  `navigator.storage.estimate()` reports usage + 10 GiB, whatever the real limit is. The SDK recognizes that
+  (`[storage] ... (Chrome static quota: usage + 10 GiB, real limit unknown)`). The real limit then only shows
+  as a failing write (`out of storage space (Chrome FILE_ERROR_NO_SPACE)`), and the block cache keeps below
+  the size that fit. A real quota, such as DevTools' custom quota or gate1 `--quota`, is respected: the cache
+  budget is the quota minus everything else in the origin minus `--vfs_cache_reserve_mb` (256 MiB for saves).
+- **A full cache does not thrash.** New blocks only evict cache files not used in the last
+  `--vfs_cache_protect_s` (120 s), with some headroom. A write that would take half the budget is skipped.
+  The `.data` files are not sparse, so a block deep in a big file costs everything before it. Skipped
+  blocks stay memory-only and are downloaded again when they are needed. Saves under storage pressure may
+  still evict anything.
+- **Persistent storage.** Titles call `RequestPersistentStorage()`. Chrome decides without a prompt.
+  It usually answers `denied` for a site that has no engagement or install yet, so the origin stays
+  best-effort. Firefox shows a prompt at the first click or key.
+
+## Browsers
+
+Chromium is the target. Firefox (158 on Windows) runs the games with 0 WebGPU errors, but slower.
+
+- **Pipeline creation is serialized in Firefox's GPU process.** `createRenderPipelineAsync` compiles
+  synchronously there. Every later queue operation (`submit`, `onSubmittedWorkDone`, present) waits for all
+  pipelines created before it. Measured with the games' WGSL (`C:\rex\b\wx-stor-ff\bench.html`): 20
+  vertex pipelines take 5.5 s in Firefox and 6.3 s in Chrome. A submit issued after a burst of 10 completes
+  after 890-1610 ms in Firefox, the time of the whole burst, and after 140 ms in Chrome. A map's few
+  hundred pipelines therefore froze Firefox for minutes ("submission N not completed after 10 s").
+  `--webgpu_pipeline_creations_in_flight` (auto = 1 on Firefox) now keeps one creation outstanding, so
+  frames are submitted between compiles. The first minutes of a map still run slowly in Firefox while its
+  pipelines compile one by one, and each costs 0.05-1.3 s depending on its WGSL size. Firefox has no
+  pipeline cache across sessions, so every session pays this again.
+- **`onSubmittedWorkDone` on an idle queue resolves after ~100 ms in Firefox** (its poll interval). It
+  takes about 17 ms when submits keep coming.

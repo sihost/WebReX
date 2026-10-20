@@ -9,24 +9,32 @@
  */
 #include <cstring>
 
+#include <rex/memory/host_write_web.h>
 #include <rex/ppc/function.h>
 
 namespace rex::kernel::crt {
+
+// Web: these host writes replace guest stores, so they mark the GPU dirty map themselves
+// (after the data, see rex/ppc/fold_web.h RawStoreW). Natively NoteHostWrite is a no-op.
+static void* Noted(void* dst, size_t n) {
+  memory::NoteHostWrite(dst, n);
+  return dst;
+}
 
 // ---------------------------------------------------------------------------
 // Standard memory operations
 // ---------------------------------------------------------------------------
 
 static void* native_memcpy(void* dst, const void* src, size_t n) {
-  return std::memcpy(dst, src, n);
+  return Noted(std::memcpy(dst, src, n), n);
 }
 
 static void* native_memmove(void* dst, const void* src, size_t n) {
-  return std::memmove(dst, src, n);
+  return Noted(std::memmove(dst, src, n), n);
 }
 
 static void* native_memset(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Noted(std::memset(dst, val, n), n);
 }
 
 static void* native_memchr(const void* ptr, int val, size_t n) {
@@ -38,19 +46,19 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
 // ---------------------------------------------------------------------------
 
 static void* native_XMemCpy(void* dst, const void* src, size_t n) {
-  return std::memcpy(dst, src, n);
+  return Noted(std::memcpy(dst, src, n), n);
 }
 
 static void* native_XMemSet(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Noted(std::memset(dst, val, n), n);
 }
 
 static void* native_XMemSet128(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Noted(std::memset(dst, val, n), n);
 }
 
 static void* native_memset_vmx(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Noted(std::memset(dst, val, n), n);
 }
 
 // ---------------------------------------------------------------------------
@@ -60,14 +68,14 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
 static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
   if (!dst || !src || count > dstsz)
     return 22;  // EINVAL
-  std::memcpy(dst, src, count);
+  Noted(std::memcpy(dst, src, count), count);
   return 0;
 }
 
 static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
   if (!dst || !src || count > dstsz)
     return 22;  // EINVAL
-  std::memmove(dst, src, count);
+  Noted(std::memmove(dst, src, count), count);
   return 0;
 }
 

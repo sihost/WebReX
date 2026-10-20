@@ -9,7 +9,11 @@
 #include <rex/graphics/webgpu/webgpu_shared_memory.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/graphics/webgpu/webgpu_command_processor.h>
@@ -26,6 +30,15 @@ REXCVAR_DEFINE_BOOL(webgpu_verify_shared_memory, false, "GPU",
                     "without a dirty mark are logged, counted and re-uploaded");
 
 namespace rex::graphics::webgpu {
+
+namespace {
+// Verify-mode probe clock (ms since first use).
+float VerifyNowMs() {
+  using Clock = std::chrono::steady_clock;
+  static const Clock::time_point start = Clock::now();
+  return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
+}
+}  // namespace
 
 WebGPUSharedMemory::WebGPUSharedMemory(WebGPUCommandProcessor& command_processor,
                                        memory::Memory& memory, TraceWriter& trace_writer)
@@ -71,6 +84,9 @@ bool WebGPUSharedMemory::Initialize() {
               kBufferSize >> 20, binding_count_, binding_size_ >> 20);
   if (REXCVAR_GET(webgpu_verify_shared_memory)) {
     page_hashes_.assign(kBufferSize >> page_size_log2(), 0);
+    chunk_hashes_.assign(kBufferSize >> kVerifyChunkLog2, 0);
+    page_upload_ms_.assign(kBufferSize >> page_size_log2(), -1.0f);
+    page_invalidate_ms_.assign(kBufferSize >> page_size_log2(), -1.0f);
     verify_watch_ = RegisterGlobalWatch(VerifyGlobalWatchCallback, this);
     REXGPU_WARN("WebGPU shared memory: verify mode (every upload hashed, fetches rechecked)");
   }
@@ -88,8 +104,10 @@ void WebGPUSharedMemory::VerifyGlobalWatchCallback(
   }
   uint32_t log2 = self->page_size_log2();
   uint32_t last = std::min<uint32_t>(address_last >> log2, uint32_t(self->page_hashes_.size()) - 1);
+  const float now = VerifyNowMs();
   for (uint32_t page = address_first >> log2; page <= last; ++page) {
     self->page_hashes_[page] = 0;
+    self->page_invalidate_ms_[page] = now;
   }
 }
 
@@ -113,24 +131,131 @@ uint32_t WebGPUSharedMemory::VerifyRange(uint32_t start, uint32_t length, const 
     if (actual == expected) {
       continue;
     }
+    uint32_t grace_changed = 0;
+    bool next_marked = false;
 #if REX_PLATFORM_WEB
     // A pending dirty mark is a legitimate CPU write the next request consumes.
-    bool marked = false;
-    for (uint32_t offset = 0; offset < page_size; offset += fold::kDirtyPageSize) {
-      marked |= fold::g_phys_dirty[(address + offset) >> fold::kDirtyPageShift] != 0;
+    auto page_marked = [page_size](uint32_t a) {
+      bool m = false;
+      for (uint32_t offset = 0; offset < page_size; offset += fold::kDirtyPageSize) {
+        m |= __atomic_load_n(&fold::g_phys_dirty[(a + offset) >> fold::kDirtyPageShift],
+                             __ATOMIC_ACQUIRE) != 0;
+      }
+      return m;
+    };
+    bool marked = page_marked(address);
+    // Guest stores mark AFTER the data (fold_web.h), so a store caught between its data
+    // and its mark looks unmarked for a moment: give it a short grace period before
+    // calling the page stale.
+    for (int spin = 0; spin < 64 && !marked; ++spin) {
+      std::this_thread::yield();
+      marked = page_marked(address);
+    }
+    if (!marked) {
+      // Probe: the OS may deschedule a guest thread between its data store and its mark for
+      // a whole time slice on a loaded machine (longer than the yields above). Wait up to
+      // 50 ms more: a mark that arrives = a delayed writer (benign, the next request uploads
+      // it), none = a lost / never made mark (a real stale GPU copy). Rare path (stale only).
+      const uint8_t* host = memory().TranslatePhysical(address);
+      std::vector<uint8_t> before(host, host + page_size);
+      const float wait_start = VerifyNowMs();
+      float late_ms = -1.0f;
+      while (VerifyNowMs() - wait_start < 50.0f) {
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+        if (page_marked(address)) {
+          late_ms = VerifyNowMs() - wait_start;
+          marked = true;
+          break;
+        }
+      }
+      for (uint32_t chunk = 0; chunk < (page_size >> kVerifyChunkLog2); ++chunk) {
+        size_t o = size_t(chunk) << kVerifyChunkLog2;
+        grace_changed += std::memcmp(before.data() + o, host + o, size_t(1) << kVerifyChunkLog2) != 0;
+      }
+      if (marked) {
+        ++late_marks_;
+        if (late_logged_ < 64) {
+          ++late_logged_;
+          REXGPU_WARN(
+              "WebGPU shared memory verify: page {:08X} ({} {}) changed without a dirty mark, "
+              "mark arrived {:.2f} ms after the yield grace (writer delayed between data and "
+              "mark, not lost); {} chunks changed during the wait, upload {:.1f} ms ago, late "
+              "marks {}",
+              address, what, id, late_ms, grace_changed,
+              page_upload_ms_[page] >= 0 ? VerifyNowMs() - page_upload_ms_[page] : -1.0f,
+              late_marks_);
+        }
+      }
     }
     if (marked) {
       continue;
     }
+    next_marked = address + page_size < kBufferSize && page_marked(address + page_size);
 #endif
     ++stale;
     ++stale_pages_;
-    if (stale_logged_ < 64) {
+    if (stale_logged_ < 256) {
       ++stale_logged_;
+      // Which 64-byte chunks changed: only the first bytes = a store straddling from the
+      // previous page (the store macros mark the page of the first byte only); the whole
+      // page = a bulk host writer (memcpy / file read / DMA).
+      const uint8_t* host = memory().TranslatePhysical(address);
+      uint32_t changed = 0, first_changed = UINT32_MAX, last_changed = 0;
+      const uint32_t chunks = page_size >> kVerifyChunkLog2;
+      for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        uint32_t h = uint32_t(XXH3_64bits(host + (size_t(chunk) << kVerifyChunkLog2),
+                                          size_t(1) << kVerifyChunkLog2));
+        if (h != chunk_hashes_[(address >> kVerifyChunkLog2) + chunk]) {
+          ++changed;
+          first_changed = std::min(first_changed, chunk);
+          last_changed = chunk;
+        }
+      }
+      // The guest allocation behind it (physical views 0xA0 / 0xC0 / 0xE0).
+      uint32_t alloc_base = 0, alloc_size = 0, alloc_protect = 0;
+      const uint32_t views[3] = {0xA0000000u | address, 0xC0000000u | address,
+                                 address >= 0x1000 ? 0xE0000000u + address - 0x1000 : 0};
+      for (uint32_t view : views) {
+        memory::BaseHeap* heap = view ? memory().LookupHeap(view) : nullptr;
+        memory::HeapAllocationInfo info{};
+        if (heap && heap->QueryRegionInfo(view, &info) &&
+            (info.state & memory::kMemoryAllocationCommit)) {
+          alloc_base = info.allocation_base;
+          alloc_size = info.allocation_size;
+          alloc_protect = info.allocation_protect;
+          break;
+        }
+      }
+      bool prev_marked = false;
+#if REX_PLATFORM_WEB
+      prev_marked = address >= page_size &&
+                    fold::g_phys_dirty[(address - 1) >> fold::kDirtyPageShift] != 0;
+#endif
+      // Probe: timing + the first changed bytes (big-endian guest data: floats / indices).
+      const float now = VerifyNowMs();
+      std::string bytes;
+      if (changed) {
+        const uint8_t* p = host + (size_t(first_changed) << kVerifyChunkLog2);
+        char hex[4];
+        for (uint32_t i = 0; i < 32; ++i) {
+          std::snprintf(hex, sizeof(hex), i % 4 == 3 ? "%02X " : "%02X", p[i]);
+          bytes += hex;
+        }
+      }
       REXGPU_WARN(
           "WebGPU shared memory verify: page {:08X} ({} {}) changed since its upload without a "
-          "dirty mark (stale GPU copy); re-uploading",
-          address, what, id);
+          "dirty mark (stale GPU copy); re-uploading. {}/{} 64 B chunks changed (bytes "
+          "0x{:X}-0x{:X}), prev page dirty {}, next page dirty {}, alloc {:08X}+0x{:X} prot "
+          "0x{:X}, verify draw {}; probe: upload {:.1f} ms ago, last invalidation {:.1f} ms "
+          "ago, no mark within 50 ms, {} chunks changed during the wait, late marks {}, first "
+          "changed bytes {}",
+          address, what, id, changed, chunks,
+          changed ? first_changed << kVerifyChunkLog2 : 0,
+          changed ? ((last_changed + 1) << kVerifyChunkLog2) - 1 : 0, prev_marked, next_marked,
+          alloc_base, alloc_size, alloc_protect, verified_pages_,
+          page_upload_ms_[page] >= 0 ? now - page_upload_ms_[page] : -1.0f,
+          page_invalidate_ms_[page] >= 0 ? now - page_invalidate_ms_[page] : -1.0f,
+          grace_changed, late_marks_, bytes);
     }
     page_hashes_[page] = 0;
 #if REX_PLATFORM_WEB
@@ -193,12 +318,23 @@ bool WebGPUSharedMemory::UploadRanges(
       MakeRangeValid(start, length, false);
       std::memcpy(upload, memory().TranslatePhysical(start), length);
       if (!page_hashes_.empty()) {
+        const float now = VerifyNowMs();
         for (uint32_t page = 0; page < pages; ++page) {
+          page_upload_ms_[page_start + page] = now;
           page_hashes_[page_start + page] =
               XXH3_64bits(static_cast<const uint8_t*>(upload) +
                               (size_t(page) << page_size_log2_value),
                           size_t(1) << page_size_log2_value) |
               1;
+        }
+        if (!chunk_hashes_.empty()) {
+          const uint32_t chunk_count = length >> kVerifyChunkLog2;
+          for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+            chunk_hashes_[(start >> kVerifyChunkLog2) + chunk] = uint32_t(
+                XXH3_64bits(static_cast<const uint8_t*>(upload) +
+                                (size_t(chunk) << kVerifyChunkLog2),
+                            size_t(1) << kVerifyChunkLog2));
+          }
         }
       }
       uploaded_bytes_ += length;

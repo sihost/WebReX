@@ -84,10 +84,22 @@ class WebGPUSharedMemory : public SharedMemory {
   // Per page: XXH3 of the uploaded bytes | 1, 0 = not uploaded since the last
   // invalidation / GPU write (verify mode only).
   std::vector<uint64_t> page_hashes_;
+  // Per 64-byte chunk: low 32 bits of XXH3 of the uploaded bytes (verify mode only), so a
+  // stale page log says which bytes changed (a straddling store vs a bulk host writer).
+  std::vector<uint32_t> chunk_hashes_;
+  static constexpr uint32_t kVerifyChunkLog2 = 6;
   GlobalWatchHandle verify_watch_ = nullptr;
   uint64_t stale_pages_ = 0;
   uint64_t verified_pages_ = 0;
   uint32_t stale_logged_ = 0;
+  // Probe (verify mode): per page, steady-clock ms of the last upload / invalidation, so a
+  // stale log tells how long after the upload the unmarked write happened.
+  std::vector<float> page_upload_ms_;
+  std::vector<float> page_invalidate_ms_;
+  // Changed unmarked pages whose mark arrived after the yield grace (a writer delayed between
+  // its data store and its mark), not counted as stale.
+  uint64_t late_marks_ = 0;
+  uint32_t late_logged_ = 0;
 };
 
 }  // namespace rex::graphics::webgpu

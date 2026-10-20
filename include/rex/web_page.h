@@ -35,6 +35,14 @@ void InstallPageLifecycle();
 uint32_t GetPageState();
 /// Number of visible -> hidden transitions so far.
 uint32_t GetPageHiddenCount();
+/// Browser animation frames (requestAnimationFrame callbacks of the WebGPU presenter on the
+/// device thread). They are the only precise periodic wake-up a page gets: timed waits
+/// (Atomics.wait with a timeout, setTimeout) in Workers follow the Windows timer resolution and
+/// often take 15.6 ms instead of 1 ms. NotifyAnimationFrame wakes WaitForAnimationFrame callers.
+void NotifyAnimationFrame();
+uint32_t GetAnimationFrameCount();
+/// Blocks until the count is no longer `seen` or `timeout_ms` passed; true if it changed.
+bool WaitForAnimationFrame(uint32_t seen, double timeout_ms);
 #else
 inline void InstallPageLifecycle() {}
 inline uint32_t GetPageState() {
@@ -42,6 +50,13 @@ inline uint32_t GetPageState() {
 }
 inline uint32_t GetPageHiddenCount() {
   return 0;
+}
+inline void NotifyAnimationFrame() {}
+inline uint32_t GetAnimationFrameCount() {
+  return 0;
+}
+inline bool WaitForAnimationFrame(uint32_t, double) {
+  return false;
 }
 #endif
 

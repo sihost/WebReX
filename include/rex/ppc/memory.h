@@ -75,7 +75,8 @@
 // replacement); natively it is identical to PPC_RAW_ADDR.
 #if REX_PLATFORM_WEB
 #define PPC_RAW_ADDR(x) (base + PPC_FOLD(x))
-#define PPC_RAW_ADDR_W(x) (::rex::fold::RawAddrW(base, (uint32_t)(x)))
+// Marks after the store (temporary destroyed at the end of the store's full-expression).
+#define PPC_RAW_ADDR_W(x) (::rex::fold::RawStoreW(base, (uint32_t)(x)).ptr)
 #else
 #define PPC_RAW_ADDR(x) (base + (uint32_t)(x) + PPC_PHYS_HOST_OFFSET(x))
 #define PPC_RAW_ADDR_W(x) PPC_RAW_ADDR(x)

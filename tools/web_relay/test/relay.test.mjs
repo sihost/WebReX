@@ -18,7 +18,8 @@ async function start(options = {}) {
 /** Browser-like client (Node 22 global WebSocket; answers pings itself) with a message queue. */
 function connect(port, room, headers) {
   return new Promise((resolve, reject) => {
-    const q = room === undefined ? '' : `?room=${encodeURIComponent(room)}`;
+    // room: a room name, or a raw query starting with '?' (e.g. '?room=r&pass=x').
+    const q = room === undefined ? '' : room.startsWith('?') ? room : `?room=${encodeURIComponent(room)}`;
     const ws = new WebSocket(`ws://127.0.0.1:${port}/net${q}`, headers ? { headers } : undefined);
     ws.binaryType = 'arraybuffer';
     const queue = [];
@@ -117,7 +118,7 @@ describe('web relay', () => {
     const a = await connect(srv.port, 'lan1');
     const wa = await a.next();
     assert.match(wa.resume, /^[0-9a-f]{32}$/);
-    assert.deepEqual(wa, { type: 'welcome', id: 1, room: 'lan1', peers: [], maxPayload: MAX_PAYLOAD, resume: wa.resume, resumeGraceMs: 30000, resumed: false });
+    assert.deepEqual(wa, { type: 'welcome', id: 1, room: 'lan1', peers: [], maxPayload: MAX_PAYLOAD, resume: wa.resume, resumeGraceMs: 30000, resumed: false, p2p: true });
     const b = await connect(srv.port, 'lan1');
     const wb = await b.next();
     assert.deepEqual([wb.type, wb.id, wb.peers, wb.resumed], ['welcome', 2, [1], false]);
@@ -191,7 +192,7 @@ describe('web relay', () => {
 
   test('/net/status, /net/progress, /healthz, 426 on plain GET /net, 404 elsewhere', async () => {
     const st = (q) => get(srv.port, `/net/status${q}`).then((r) => JSON.parse(r.body));
-    assert.deepEqual(await st('?room=st1'), { room: 'st1', peers: 0, maxPeers: 16, players: [], defaultRoom: 'default', rooms: [] });
+    assert.deepEqual(await st('?room=st1'), { room: 'st1', peers: 0, maxPeers: 16, players: [], defaultRoom: 'default', rooms: [], locked: false });
     const a = await connect(srv.port, 'st1');
     await a.next();
     const b = await connect(srv.port, 'st1');
@@ -201,7 +202,7 @@ describe('web relay', () => {
     await c.next();
     assert.equal((await st('?room=st1')).peers, 2);
     assert.equal((await st('')).room, 'default');
-    assert.deepEqual((await st('?room=x')).rooms, [{ room: 'st1', peers: 2 }, { room: 'st2', peers: 1 }]);
+    assert.deepEqual((await st('?room=x')).rooms, [{ room: 'st1', peers: 2, locked: false }, { room: 'st2', peers: 1, locked: false }]);
     assert.equal((await get(srv.port, '/net/progress?room=st1&client=abc&name=Me&have=1&total=4')).status, 204);
     assert.equal((await get(srv.port, '/net/progress?room=st1&client=bad%20id')).status, 400);
     assert.deepEqual((await st('?room=st1')).players.map((p) => [p.client, p.have, p.total, p.ready]), [['abc', 1, 4, false]]);

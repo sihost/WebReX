@@ -179,10 +179,19 @@ void copy_and_swap_64_unaligned(void* dest, const void* src, size_t count);
 void copy_and_swap_16_in_32_aligned(void* dest, const void* src, size_t count);
 void copy_and_swap_16_in_32_unaligned(void* dest, const void* src, size_t count);
 
-// Also marks the web dirty map when dest is guest physical memory (host_write_web.h).
+// Also marks the web dirty map when dest is guest physical memory (host_write_web.h), after
+// the data (a GPU consume between a mark and the data would leave the page stale).
+template <typename T>
+void copy_and_swap_unmarked(T* dest, const T* src, size_t count);
+
 template <typename T>
 void copy_and_swap(T* dest, const T* src, size_t count) {
+  copy_and_swap_unmarked(dest, src, count);
   NoteHostWrite(dest, count * sizeof(T));
+}
+
+template <typename T>
+void copy_and_swap_unmarked(T* dest, const T* src, size_t count) {
   bool is_aligned =
       reinterpret_cast<uintptr_t>(dest) % 32 == 0 && reinterpret_cast<uintptr_t>(src) % 32 == 0;
   if (sizeof(T) == 1) {

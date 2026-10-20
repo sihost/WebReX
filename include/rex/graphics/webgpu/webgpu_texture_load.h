@@ -199,6 +199,14 @@ struct WebGPUTextureLoadDesc {
   uint64_t source_size = 0;
   uint64_t base_offset = 0;
   uint64_t mips_offset = 0;
+  // The mips' buffer if not `source` (scaled resolve windows), else null.
+  WGPUBuffer mips_source = nullptr;
+  uint64_t mips_source_size = 0;
+  // Draw resolution scale of a scaled resolve texture (> 1: the sources are the scaled
+  // resolve memory, offsets and sizes in scaled bytes, the texture is scale times larger,
+  // and the texture_load_*_scaled shaders are used).
+  uint32_t scale_x = 1;
+  uint32_t scale_y = 1;
   bool load_base = true;
   bool load_mips = false;
   // Optional precomputed layout (TextureCache::Texture::guest_layout()); else computed.
@@ -239,11 +247,19 @@ class WebGPUTextureLoader {
   WebGPUTextureLoader& operator=(const WebGPUTextureLoader&) = delete;
   ~WebGPUTextureLoader();
 
-  // Recording thread (not the device thread). Creates every load pipeline.
-  bool Initialize(WebGPUDevice& device);
+  // Recording thread (not the device thread). Creates every load pipeline, and with
+  // `scaled` the resolution-scaled variants (xenia's texture_load_*_scaled_cs).
+  bool Initialize(WebGPUDevice& device, bool scaled = false);
   // Recording thread; streams referencing the loader's objects must have been replayed.
   void Shutdown();
   bool initialized() const { return device_ != nullptr; }
+  // Whether a load shader has a resolution-scaled variant (and the plain one exists).
+  bool HasScaledPipeline(WebGPUTextureLoadShader shader) const {
+    return size_t(shader) < pipelines_scaled_.size() && pipelines_scaled_[size_t(shader)];
+  }
+  bool HasPipeline(WebGPUTextureLoadShader shader) const {
+    return size_t(shader) < pipelines_.size() && pipelines_[size_t(shader)];
+  }
 
   // Records the load of the requested levels of `texture` (created from GetHostTextureInfo)
   // into `stream`, which must be outside passes. Returns false (recording nothing) if the
@@ -264,6 +280,8 @@ class WebGPUTextureLoader {
   WGPUBindGroupLayout bind_group_layout_ = nullptr;
   WGPUPipelineLayout pipeline_layout_ = nullptr;
   std::array<WGPUComputePipeline, size_t(WebGPUTextureLoadShader::kCount)> pipelines_{};
+  // Created only when Initialize gets a resolution scale.
+  std::array<WGPUComputePipeline, size_t(WebGPUTextureLoadShader::kCount)> pipelines_scaled_{};
   uint64_t max_scratch_size_ = 0;
   uint64_t max_binding_size_ = 0;
   uint32_t storage_offset_alignment_ = 256;
