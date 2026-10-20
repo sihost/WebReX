@@ -92,6 +92,14 @@ class WebGPUSharedMemory : public SharedMemory {
   uint64_t stale_pages_ = 0;
   uint64_t verified_pages_ = 0;
   uint32_t stale_logged_ = 0;
+  // Probe (verify mode): per page, steady-clock ms of the last upload / invalidation, so a
+  // stale log tells how long after the upload the unmarked write happened.
+  std::vector<float> page_upload_ms_;
+  std::vector<float> page_invalidate_ms_;
+  // Changed unmarked pages whose mark arrived after the yield grace (a writer delayed between
+  // its data store and its mark), not counted as stale.
+  uint64_t late_marks_ = 0;
+  uint32_t late_logged_ = 0;
 };
 
 }  // namespace rex::graphics::webgpu
