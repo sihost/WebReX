@@ -1475,10 +1475,12 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   primitive_processor_->EndFrame();  // WP3: after the latency wait
   // As D3D12CommandProcessor at the end of a frame (clear_memory_page_state,
-  // off by default on web): pages not written by the GPU become invalid, so
-  // vertex and index data are uploaded again on their next request even if a
-  // CPU write escaped the dirty map. Costly (every vertex/index page of the
-  // frame re-uploaded); --webgpu_verify_shared_memory finds escaped writes.
+  // on by default): pages not written by the GPU become invalid, so vertex and
+  // index data are uploaded again on their next request even if a CPU write
+  // escaped the dirty map. Costly (MW2: every vertex/index page of the frame,
+  // ~17 MiB/frame, vs ~1 MiB with it off), but still needed: with it off,
+  // --webgpu_verify_shared_memory finds MW2 menu vertex/index pages near
+  // 0x1FC00000 changed without a dirty mark (some guest writer escapes the map).
   if (REXCVAR_GET(clear_memory_page_state)) {
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
