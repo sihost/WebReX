@@ -4,13 +4,17 @@
 //     [--default-room default] [--max-peers 16] [--max-rooms 64] [--keepalive-ms 20000]
 //     [--idle-timeout-ms 90000] [--resume-grace-ms 30000] [--latency 0[:jitter]] [--tls-pfx file --tls-pass pw |
 //     --tls-cert file --tls-key file] [--quiet]
+//     hardening: [--access-key K]... [--room-pass ROOM=PW]... [--require-room-pass] [--max-datagram 65536]
+//     [--rate-datagrams 2000] [--rate-bytes 8388608] [--rate-burst-ms 1000] [--rate-text 20] [--rate-kick 0]
+//     [--max-peers-per-ip 0] [--auth-fail-limit 10] [--trust-proxy] [--no-room-list]
+//     peer-to-peer: [--no-p2p] [--ice-server URL[|user|credential]]... [--stun [--stun-port N]]
 import fs from 'node:fs';
 import { createRelayServer } from './lib/relay.mjs';
 
-const opt = { port: 8090, bind: '0.0.0.0', allowOrigins: [], defaultRoom: 'default' };
+const opt = { port: 8090, bind: '0.0.0.0', allowOrigins: [], defaultRoom: 'default', accessKeys: [], roomPasswords: {}, iceServers: [] };
 const args = process.argv.slice(2);
 const usage = () => {
-  console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 6).map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
+  console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 10).map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
   process.exit(0);
 };
 for (let i = 0; i < args.length; i++) {
@@ -34,6 +38,30 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--tls-cert') opt.cert = v();
   else if (a === '--tls-key') opt.key = v();
   else if (a === '--quiet') opt.quiet = true;
+  else if (a === '--access-key') opt.accessKeys.push(v());
+  else if (a === '--room-pass') {
+    const s = v();
+    const eq = s.indexOf('=');
+    if (eq < 1) throw new Error('--room-pass needs ROOM=PASSWORD');
+    opt.roomPasswords[s.slice(0, eq)] = s.slice(eq + 1);
+  } else if (a === '--require-room-pass') opt.requireRoomPassword = true;
+  else if (a === '--max-datagram') opt.maxDatagram = Number(v());
+  else if (a === '--rate-datagrams') opt.rateDatagrams = Number(v());
+  else if (a === '--rate-bytes') opt.rateBytes = Number(v());
+  else if (a === '--rate-burst-ms') opt.rateBurstMs = Number(v());
+  else if (a === '--rate-text') opt.rateText = Number(v());
+  else if (a === '--rate-kick') opt.rateKick = Number(v());
+  else if (a === '--max-peers-per-ip') opt.maxPeersPerIp = Number(v());
+  else if (a === '--auth-fail-limit') opt.authFailLimit = Number(v());
+  else if (a === '--trust-proxy') opt.trustProxy = true;
+  else if (a === '--no-room-list') opt.listRooms = false;
+  else if (a === '--no-p2p') opt.p2p = false;
+  else if (a === '--stun') opt.stun = true;
+  else if (a === '--stun-port') [opt.stun, opt.stunPort] = [true, Number(v())];
+  else if (a === '--ice-server') {
+    const [urls, username, credential] = v().split('|');
+    opt.iceServers.push(username !== undefined ? { urls, username, credential } : { urls });
+  }
   else if (a === '--help' || a === '-h') usage();
   else throw new Error(`unknown argument ${a} (--help)`);
 }
@@ -47,7 +75,8 @@ const { server, shutdown } = createRelayServer({ ...opt, tls, log });
 server.listen(opt.port, opt.bind, () => {
   const scheme = tls ? 'wss' : 'ws';
   console.log(`relay listening on ${scheme}://${opt.bind}:${server.address().port}/net?room=<name> ` +
-    `(origins: ${opt.allowOrigins.join(' ')})`);
+    `(origins: ${opt.allowOrigins.join(' ')}${opt.accessKeys.length ? ', access key required' : ''}` +
+    `${opt.p2p === false ? ', p2p off' : ''})`);
 });
 const stop = () => {
   shutdown().then(() => process.exit(0));

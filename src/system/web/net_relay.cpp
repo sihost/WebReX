@@ -248,7 +248,8 @@ EM_JS(void, rex_net_js_start,
             heap : () => HEAPU8,
             ctlPtr : ctl_ptr,
             ringPtr : ring_ptr,
-            ringSize : ring_size
+            ringSize : ring_size,
+            options : Module['rexNetOptions'] || {}
           });
           Module['rexNet'] = net;
           net.connect(str(url_ptr, url_len), str(room_ptr, room_len));
