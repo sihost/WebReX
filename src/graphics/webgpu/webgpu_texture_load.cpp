@@ -24,6 +24,26 @@ namespace {
 // xenia's texture_load_*.cs.xesl via SPIR-V -> native Tint (gen_wgsl.py in the project).
 #include "webgpu_texture_load_shaders.inc"
 
+// The resolution-scaled variants (draw resolution scaling), generated WGSL of the same
+// xenia shaders with the Vulkan bindings (remapped in GetScaledShaderSource).
+#include "../shaders/webgpu_wgsl/texture_load_128bpb_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_16bpb_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_32bpb_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_64bpb_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_8bpb_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_depth_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_depth_unorm_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r10g11b11_rgba16_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r10g11b11_rgba16_snorm_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r11g11b10_rgba16_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r11g11b10_rgba16_snorm_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r16_snorm_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_r16_unorm_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_rg16_snorm_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_rg16_unorm_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_rgba16_snorm_float_scaled_cs.h"
+#include "../shaders/webgpu_wgsl/texture_load_rgba16_unorm_float_scaled_cs.h"
+
 // ---------------------------------------------------------------------------
 // Hand-written WGSL for the WebGPU-only loads, same bindings, constants, workgroup size
 // (4 x 32) and host layout rules as the converted shaders. One guest block per invocation.
@@ -248,6 +268,81 @@ constexpr WebGPUTextureLoadShaderInfo kShaderInfo[size_t(Shader::kCount)] = {
     {"depth_unorm", 4, 3},
     {"depth_float", 4, 3},
 };
+
+// xenia's texture_load_*_scaled_cs (generated WGSL, tools/tint/gen_fixed_wgsl.py) with the
+// bindings remapped to this loader's single group (0 = dest, 1 = source, 2 = constants), or
+// empty if the shader has no scaled variant (decompression, the WebGPU-only expansions).
+std::string GetScaledShaderSource(Shader shader) {
+  const char* source = nullptr;
+  switch (shader) {
+    case Shader::k8bpb:
+      source = texture_load_8bpb_scaled_cs_wgsl;
+      break;
+    case Shader::k16bpb:
+      source = texture_load_16bpb_scaled_cs_wgsl;
+      break;
+    case Shader::k32bpb:
+      source = texture_load_32bpb_scaled_cs_wgsl;
+      break;
+    case Shader::k64bpb:
+      source = texture_load_64bpb_scaled_cs_wgsl;
+      break;
+    case Shader::k128bpb:
+      source = texture_load_128bpb_scaled_cs_wgsl;
+      break;
+    case Shader::kR10G11B11ToRGBA16:
+      source = texture_load_r10g11b11_rgba16_scaled_cs_wgsl;
+      break;
+    case Shader::kR10G11B11ToRGBA16SNorm:
+      source = texture_load_r10g11b11_rgba16_snorm_scaled_cs_wgsl;
+      break;
+    case Shader::kR11G11B10ToRGBA16:
+      source = texture_load_r11g11b10_rgba16_scaled_cs_wgsl;
+      break;
+    case Shader::kR11G11B10ToRGBA16SNorm:
+      source = texture_load_r11g11b10_rgba16_snorm_scaled_cs_wgsl;
+      break;
+    case Shader::kR16UNormToFloat:
+      source = texture_load_r16_unorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kR16SNormToFloat:
+      source = texture_load_r16_snorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kRG16UNormToFloat:
+      source = texture_load_rg16_unorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kRG16SNormToFloat:
+      source = texture_load_rg16_snorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kRGBA16UNormToFloat:
+      source = texture_load_rgba16_unorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kRGBA16SNormToFloat:
+      source = texture_load_rgba16_snorm_float_scaled_cs_wgsl;
+      break;
+    case Shader::kDepthUnorm:
+      source = texture_load_depth_unorm_scaled_cs_wgsl;
+      break;
+    case Shader::kDepthFloat:
+      source = texture_load_depth_float_scaled_cs_wgsl;
+      break;
+    default:
+      return {};
+  }
+  std::string wgsl(source);
+  auto replace = [&wgsl](const char* from, const char* to) {
+    size_t from_length = std::strlen(from);
+    for (size_t pos = wgsl.find(from); pos != std::string::npos; pos = wgsl.find(from, pos)) {
+      wgsl.replace(pos, from_length, to);
+      pos += std::strlen(to);
+    }
+  };
+  // Generated: constants @group(2) @binding(0), source @group(1), dest @group(0).
+  replace("@group(0u) @binding(0u)", "@group(0) @binding(0)");
+  replace("@group(1u) @binding(0u)", "@group(0) @binding(1)");
+  replace("@group(2u) @binding(0u)", "@group(0) @binding(2)");
+  return wgsl;
+}
 
 std::string GetShaderSource(Shader shader) {
   switch (shader) {
@@ -729,7 +824,7 @@ WebGPUTextureLoader::~WebGPUTextureLoader() {
   Shutdown();
 }
 
-bool WebGPUTextureLoader::Initialize(WebGPUDevice& device) {
+bool WebGPUTextureLoader::Initialize(WebGPUDevice& device, bool scaled) {
   Shutdown();
   const WGPULimits& limits = device.limits();
   max_binding_size_ = limits.maxStorageBufferBindingSize;
@@ -739,10 +834,14 @@ bool WebGPUTextureLoader::Initialize(WebGPUDevice& device) {
   storage_offset_alignment_ = std::max<uint32_t>(limits.minStorageBufferOffsetAlignment, 4);
 
   std::vector<std::string> sources(static_cast<size_t>(Shader::kCount));
+  std::vector<std::string> scaled_sources(static_cast<size_t>(Shader::kCount));
   for (size_t i = 1; i < size_t(Shader::kCount); ++i) {
     sources[i] = GetShaderSource(Shader(i));
+    if (scaled) {
+      scaled_sources[i] = GetScaledShaderSource(Shader(i));
+    }
   }
-  uint32_t created = 0;
+  uint32_t created = 0, created_scaled = 0;
   device.RunSync([&]() {
     WGPUDevice d = device.device();
     WGPUBindGroupLayoutEntry entries[3] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
@@ -768,29 +867,37 @@ bool WebGPUTextureLoader::Initialize(WebGPUDevice& device) {
     pipeline_layout_desc.bindGroupLayoutCount = 1;
     pipeline_layout_desc.bindGroupLayouts = &bind_group_layout_;
     pipeline_layout_ = wgpuDeviceCreatePipelineLayout(d, &pipeline_layout_desc);
-    for (size_t i = 1; i < size_t(Shader::kCount); ++i) {
-      if (sources[i].empty()) {
-        continue;
-      }
-      std::string label = std::string("rex texture load ") + kShaderInfo[i].name;
+    auto create = [&](const std::string& source, const std::string& label) -> WGPUComputePipeline {
       WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
-      wgsl.code = MakeStringView(sources[i]);
+      wgsl.code = MakeStringView(source);
       WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
       module_desc.nextInChain = &wgsl.chain;
       module_desc.label = MakeStringView(label);
       WGPUShaderModule module = wgpuDeviceCreateShaderModule(d, &module_desc);
       if (!module) {
-        continue;
+        return nullptr;
       }
       WGPUComputePipelineDescriptor pipeline_desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
       pipeline_desc.label = MakeStringView(label);
       pipeline_desc.layout = pipeline_layout_;
       pipeline_desc.compute.module = module;
       pipeline_desc.compute.entryPoint = MakeStringView("main");
-      pipelines_[i] = wgpuDeviceCreateComputePipeline(d, &pipeline_desc);
+      WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(d, &pipeline_desc);
       wgpuShaderModuleRelease(module);
+      return pipeline;
+    };
+    for (size_t i = 1; i < size_t(Shader::kCount); ++i) {
+      if (sources[i].empty()) {
+        continue;
+      }
+      std::string label = std::string("rex texture load ") + kShaderInfo[i].name;
+      pipelines_[i] = create(sources[i], label);
       if (pipelines_[i]) {
         ++created;
+        if (!scaled_sources[i].empty()) {
+          pipelines_scaled_[i] = create(scaled_sources[i], label + " scaled");
+          created_scaled += pipelines_scaled_[i] != nullptr;
+        }
       }
     }
   });
@@ -801,8 +908,9 @@ bool WebGPUTextureLoader::Initialize(WebGPUDevice& device) {
     return false;
   }
   device_ = &device;
-  REXWGPU_INFO("WebGPU texture loader: {} load pipelines, scratch limit {} MiB", created,
-               max_scratch_size_ >> 20);
+  REXWGPU_INFO("WebGPU texture loader: {} load pipelines ({} resolution-scaled), scratch limit "
+               "{} MiB",
+               created, created_scaled, max_scratch_size_ >> 20);
   return true;
 }
 
@@ -812,10 +920,12 @@ void WebGPUTextureLoader::Shutdown() {
   }
   WebGPUDevice& device = *device_;
   device.RunSync([this]() {
-    for (WGPUComputePipeline& pipeline : pipelines_) {
-      if (pipeline) {
-        wgpuComputePipelineRelease(pipeline);
-        pipeline = nullptr;
+    for (auto* list : {&pipelines_, &pipelines_scaled_}) {
+      for (WGPUComputePipeline& pipeline : *list) {
+        if (pipeline) {
+          wgpuComputePipelineRelease(pipeline);
+          pipeline = nullptr;
+        }
       }
     }
     if (pipeline_layout_) {
@@ -886,11 +996,19 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
   const WebGPUTextureHostFormat& host_format =
       WebGPUTextureFormatTable::GetHostFormat(pair, desc.signed_separate);
   Shader load_shader = host_format.load_shader;
-  if (load_shader == Shader::kUnknown || !pipelines_[size_t(load_shader)]) {
+  // Resolution-scaled resolve textures (scale 1 otherwise): the scaled shaders, every size
+  // in host texels times the scale, guest offsets times scale_x * scale_y.
+  const uint32_t scale_x = std::max(desc.scale_x, UINT32_C(1));
+  const uint32_t scale_y = std::max(desc.scale_y, UINT32_C(1));
+  const bool scaled = scale_x > 1 || scale_y > 1;
+  const uint32_t scale_area = scale_x * scale_y;
+  const auto& load_pipelines = scaled ? pipelines_scaled_ : pipelines_;
+  if (load_shader == Shader::kUnknown || !load_pipelines[size_t(load_shader)] ||
+      (scaled && host_format.block_compressed)) {
     ++statistics_.failures;
     return false;
   }
-  WGPUComputePipeline load_pipeline = pipelines_[size_t(load_shader)];
+  WGPUComputePipeline load_pipeline = load_pipelines[size_t(load_shader)];
   WGPUComputePipeline convert_pipeline = nullptr;
   const WebGPUTextureLoadShaderInfo* convert_info = nullptr;
   if (host_format.convert_shader != Shader::kUnknown) {
@@ -979,6 +1097,11 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
       y_texels = std::max(height >> level, UINT32_C(1));
       z_texels = std::max(depth >> level, UINT32_C(1));
     }
+    if (scaled) {
+      // What the scaled load writes, and at least the host level size (copied).
+      x_texels = std::max(x_texels * scale_x, std::max((width * scale_x) >> level, UINT32_C(1)));
+      y_texels = std::max(y_texels * scale_y, std::max((height * scale_y) >> level, UINT32_C(1)));
+    }
     HostLayout& host_layout = host_layouts[loop_level];
     uint32_t x_pitch_blocks =
         AlignUp((x_texels + host_block_width - 1) / host_block_width, host_x_blocks_per_thread);
@@ -1025,8 +1148,11 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
   // Guest source ranges.
   const uint64_t source_alignment = 16;
   uint64_t base_range = 0, mips_range = 0;
+  WGPUBuffer mips_source = desc.mips_source ? desc.mips_source : desc.source;
+  uint64_t mips_source_size = desc.mips_source ? desc.mips_source_size : desc.source_size;
   if (level_first == 0) {
-    base_range = AlignUp<uint64_t>(guest_layout->base.level_data_extent_bytes, source_alignment);
+    base_range = AlignUp<uint64_t>(
+        uint64_t(guest_layout->base.level_data_extent_bytes) * scale_area, source_alignment);
     if (!base_range || desc.base_offset % storage_offset_alignment_ ||
         desc.base_offset + base_range > desc.source_size || base_range > max_binding_size_) {
       ++statistics_.failures;
@@ -1034,9 +1160,10 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
     }
   }
   if (level_last != 0) {
-    mips_range = AlignUp<uint64_t>(guest_layout->mips_total_extent_bytes, source_alignment);
-    if (!mips_range || desc.mips_offset % storage_offset_alignment_ ||
-        desc.mips_offset + mips_range > desc.source_size || mips_range > max_binding_size_) {
+    mips_range = AlignUp<uint64_t>(uint64_t(guest_layout->mips_total_extent_bytes) * scale_area,
+                                   source_alignment);
+    if (!mips_range || !mips_source || desc.mips_offset % storage_offset_alignment_ ||
+        desc.mips_offset + mips_range > mips_source_size || mips_range > max_binding_size_) {
       ++statistics_.failures;
       return false;
     }
@@ -1044,7 +1171,7 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
 
   const uint32_t is_tiled_3d_endian_scale =
       uint32_t(desc.tiled) | (uint32_t(is_3d) << 1) | (uint32_t(desc.endianness) << 2) |
-      (UINT32_C(1) << 4) | (UINT32_C(1) << 7);
+      (std::min(scale_x, UINT32_C(7)) << 4) | (std::min(scale_y, UINT32_C(7)) << 7);
   const uint32_t guest_x_blocks_per_group_log2 =
       kLoadGuestXThreadsPerGroupLog2 + load_info.guest_x_blocks_per_thread_log2;
 
@@ -1098,13 +1225,13 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
       uint32_t level = level_packed == 0 ? 0 : loop_level;
       const texture_util::TextureGuestLayout::Level& level_guest_layout =
           is_base ? guest_layout->base : guest_layout->mips[level];
-      entries[1].buffer = desc.source;
+      entries[1].buffer = is_base ? desc.source : mips_source;
       entries[1].offset = is_base ? desc.base_offset : desc.mips_offset;
       entries[1].size = is_base ? base_range : mips_range;
 
       LoadConstants constants = {};
       constants.is_tiled_3d_endian_scale = is_tiled_3d_endian_scale;
-      constants.guest_offset = is_base ? 0 : guest_layout->mip_offsets_bytes[level];
+      constants.guest_offset = is_base ? 0 : guest_layout->mip_offsets_bytes[level] * scale_area;
       uint32_t guest_pitch = level_guest_layout.row_pitch_bytes;
       if (desc.tiled) {
         // Shaders take the pitch in blocks for tiled textures.
@@ -1114,8 +1241,8 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
       constants.guest_z_stride_block_rows_aligned = level_guest_layout.z_slice_stride_block_rows;
       uint32_t level_width, level_height, level_depth;
       level_extent(loop_level, level_width, level_height, level_depth);
-      constants.size_blocks[0] = (level_width + block_width - 1) / block_width;
-      constants.size_blocks[1] = (level_height + block_height - 1) / block_height;
+      constants.size_blocks[0] = (level_width + block_width - 1) / block_width * scale_x;
+      constants.size_blocks[1] = (level_height + block_height - 1) / block_height * scale_y;
       constants.size_blocks[2] = level_depth;
       constants.height_texels = level_height;
       constants.host_offset = uint32_t(host_layout.offset);
@@ -1133,7 +1260,7 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
         stream.CmdSetBindGroup(0, bind_group_layout_, entries, 3, 1, &constants_offset);
         stream.CmdDispatch(group_count_x, group_count_y, constants.size_blocks[2]);
         ++statistics_.dispatches;
-        constants.guest_offset += level_guest_layout.array_slice_stride_bytes;
+        constants.guest_offset += level_guest_layout.array_slice_stride_bytes * scale_area;
         constants.host_offset += uint32_t(host_layout.slice_size);
       }
     }
@@ -1160,8 +1287,8 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
             (uint32_t(is_3d) << 1) | (UINT32_C(1) << 4) | (UINT32_C(1) << 7);
         uint32_t level_width, level_height, level_depth;
         level_extent(loop_level, level_width, level_height, level_depth);
-        constants.size_blocks[0] = (level_width + block_width - 1) / block_width;
-        constants.size_blocks[1] = (level_height + block_height - 1) / block_height;
+        constants.size_blocks[0] = (level_width + block_width - 1) / block_width * scale_x;
+        constants.size_blocks[1] = (level_height + block_height - 1) / block_height * scale_y;
         constants.size_blocks[2] = level_depth;
         constants.height_texels = level_height;
         constants.guest_offset = uint32_t(host_layout.offset);
@@ -1196,16 +1323,16 @@ bool WebGPUTextureLoader::RecordLoad(WebGPUCommandStream& stream,
       if (host_layout.batch != batch) {
         continue;
       }
-      uint32_t level_width = std::max(width >> level, UINT32_C(1));
-      uint32_t level_height = std::max(height >> level, UINT32_C(1));
+      uint32_t level_width = std::max((width * scale_x) >> level, UINT32_C(1));
+      uint32_t level_height = std::max((height * scale_y) >> level, UINT32_C(1));
       uint32_t level_depth = std::max(depth >> level, UINT32_C(1));
       uint64_t offset = host_layout.offset;
       if (level >= level_packed) {
         uint32_t offset_blocks_x, offset_blocks_y, offset_z;
         texture_util::GetPackedMipOffset(width, height, depth, desc.format, level,
                                          offset_blocks_x, offset_blocks_y, offset_z);
-        uint64_t offset_host_x = offset_blocks_x;
-        uint64_t offset_host_y = offset_blocks_y;
+        uint64_t offset_host_x = uint64_t(offset_blocks_x) * scale_x;
+        uint64_t offset_host_y = uint64_t(offset_blocks_y) * scale_y;
         if (!host_format.block_compressed) {
           offset_host_x *= block_width;
           offset_host_y *= block_height;

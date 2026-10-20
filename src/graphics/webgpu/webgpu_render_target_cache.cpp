@@ -64,8 +64,11 @@ WebGPURenderTargetCache::WebGPURenderTarget::~WebGPURenderTarget() {
 WebGPURenderTargetCache::WebGPURenderTargetCache(WebGPUCommandProcessor& command_processor,
                                                  const RegisterFile& register_file,
                                                  const memory::Memory& memory,
-                                                 TraceWriter& trace_writer)
-    : RenderTargetCache(register_file, memory, &trace_writer, 1, 1),
+                                                 TraceWriter& trace_writer,
+                                                 uint32_t draw_resolution_scale_x,
+                                                 uint32_t draw_resolution_scale_y)
+    : RenderTargetCache(register_file, memory, &trace_writer, draw_resolution_scale_x,
+                        draw_resolution_scale_y),
       command_processor_(command_processor),
       trace_writer_(trace_writer) {}
 
@@ -75,7 +78,8 @@ WebGPURenderTargetCache::~WebGPURenderTargetCache() {
 
 bool WebGPURenderTargetCache::Initialize(uint32_t /*shared_memory_binding_count*/) {
   WebGPUDevice& device = command_processor_.device();
-  edram_ = std::make_unique<WebGPUEdram>(device);
+  edram_ = std::make_unique<WebGPUEdram>(device, draw_resolution_scale_x(),
+                                         draw_resolution_scale_y());
   bool edram_ok = false;
   device.RunSync([&]() { edram_ok = edram_->Initialize(); });
   if (!edram_ok) {
@@ -87,9 +91,10 @@ bool WebGPURenderTargetCache::Initialize(uint32_t /*shared_memory_binding_count*
   shutting_down_ = false;
   InitializeCommon();
   REXGPU_INFO(
-      "WebGPU render target cache: host render targets, max {}x{}, MSAA 1x/4x (2x as 4x), "
-      "D24FS8 as {}",
-      GetMaxRenderTargetWidth(), GetMaxRenderTargetHeight(),
+      "WebGPU render target cache: host render targets, max {}x{}, draw resolution scale {}x{}, "
+      "MSAA 1x/4x (2x as 4x), D24FS8 as {}",
+      GetMaxRenderTargetWidth(), GetMaxRenderTargetHeight(), draw_resolution_scale_x(),
+      draw_resolution_scale_y(),
       edram_->has_depth32float_stencil8() ? "depth32float-stencil8" : "depth24plus-stencil8");
   return true;
 }
@@ -621,14 +626,41 @@ bool WebGPURenderTargetCache::Resolve(memory::Memory& memory, WebGPUSharedMemory
       WebGPUCommandStream& stream = command_processor_.command_stream();
       stream.CmdBeginComputePass();
       DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      // The guest (1x) data always goes to the shared memory, so CPU readback, vertex
+        // fetch and textures that can't be scaled see the resolve.
       edram_->RecordResolve(stream, constants, shared_memory.buffer(), bind_offset,
                             bind_end - bind_offset);
+      // Draw resolution scaling: also every scaled resolve window overlapping the range,
+      // at the host resolution (the scaled textures are loaded from there).
+      bool scaled_written = false;
+      if (IsDrawResolutionScaled() &&
+          texture_cache.GetScaledResolveWriteWindows(extent_start, extent_length,
+                                                     scaled_windows_)) {
+        int64_t scale_area = int64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+        scaled_written = true;
+        for (const WebGPUTextureCache::ScaledResolveWindow& window : scaled_windows_) {
+          int64_t dest_base =
+              (int64_t(resolve_info.copy_dest_base) - int64_t(window.start_unscaled)) *
+              scale_area;
+          if (dest_base < INT32_MIN || dest_base > INT32_MAX) {
+            scaled_written = false;
+            continue;
+          }
+          WebGPUResolveConstants scaled_constants = constants;
+          scaled_constants.dest_base = int32_t(dest_base);
+          edram_->RecordResolve(stream, scaled_constants, window.buffer, 0, window.size_scaled,
+                                true);
+        }
+        ++statistics_.scaled_resolves;
+      } else if (IsDrawResolutionScaled()) {
+        ++statistics_.unscaled_resolves;
+      }
       stream.CmdEndComputePass();
 
       // Consumes the web dirty map for the range first (CPU writes before the
       // resolve), then marks it valid and fires the watches.
       shared_memory.RangeWrittenByGpu(extent_start, extent_length);
-      texture_cache.MarkRangeAsResolved(extent_start, extent_length);
+      texture_cache.MarkRangeAsResolved(extent_start, extent_length, scaled_written);
       written_address_out = extent_start;
       written_length_out = extent_length;
       ++statistics_.resolves;
@@ -778,6 +810,11 @@ bool WebGPURenderTargetCache::ReadbackResolve(memory::Memory& memory,
 
 void WebGPURenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   if (!edram_ || !snapshot) {
+    return;
+  }
+  if (edram_->is_scaled()) {
+    // The snapshot has the 1x layout; the scaled EDRAM buffer's tiles are larger.
+    REXGPU_WARN("WebGPU: EDRAM snapshot not restored with draw resolution scaling");
     return;
   }
   // The snapshot is the guest EDRAM layout, which is what the EDRAM buffer

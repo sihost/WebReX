@@ -212,15 +212,27 @@ bool WebGPUCommandProcessor::SetupContext() {
   }
   // ---- end WP3 ----
 
-  texture_cache_ =
-      std::make_unique<WebGPUTextureCache>(*this, *register_file_, *shared_memory_, *memory_);
+  // Draw resolution scaling (as VulkanCommandProcessor::SetupContext).
+  if (!TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x_,
+                                                  draw_resolution_scale_y_)) {
+    REXGPU_WARN("WebGPU: the draw resolution scale is clamped to {}x{}", draw_resolution_scale_x_,
+                draw_resolution_scale_y_);
+  }
+  if (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1) {
+    REXGPU_INFO("WebGPU: draw resolution scale {}x{}", draw_resolution_scale_x_,
+                draw_resolution_scale_y_);
+  }
+  texture_cache_ = std::make_unique<WebGPUTextureCache>(
+      *this, *register_file_, *shared_memory_, *memory_, draw_resolution_scale_x_,
+      draw_resolution_scale_y_);
   if (!texture_cache_->Initialize()) {
     REXGPU_ERROR("WebGPU: texture cache initialization failed");
     return false;
   }
 
-  render_target_cache_ =
-      std::make_unique<WebGPURenderTargetCache>(*this, *register_file_, *memory_, trace_writer_);
+  render_target_cache_ = std::make_unique<WebGPURenderTargetCache>(
+      *this, *register_file_, *memory_, trace_writer_, draw_resolution_scale_x_,
+      draw_resolution_scale_y_);
   if (!render_target_cache_->Initialize(shared_memory_->binding_count())) {
     REXGPU_ERROR("WebGPU: render target cache initialization failed");
     return false;
@@ -491,9 +503,9 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
     c.point_constant_diameter[0] = float(pa_su_point_size.width) * (2.0f / 16.0f);
     c.point_constant_diameter[1] = float(pa_su_point_size.height) * (2.0f / 16.0f);
     c.point_screen_diameter_to_ndc_radius[0] =
-        1.0f / float(std::max(viewport_info.xy_extent[0], uint32_t(1)));
+        float(draw_resolution_scale_x_) / float(std::max(viewport_info.xy_extent[0], uint32_t(1)));
     c.point_screen_diameter_to_ndc_radius[1] =
-        1.0f / float(std::max(viewport_info.xy_extent[1], uint32_t(1)));
+        float(draw_resolution_scale_y_) / float(std::max(viewport_info.xy_extent[1], uint32_t(1)));
   }
 
   // Texture signedness and, since the translator never relies on view
@@ -505,6 +517,8 @@ bool WebGPUCommandProcessor::UpdateSystemConstantValues(
   uint32_t texture_index;
   while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
     textures_remaining &= ~(UINT32_C(1) << texture_index);
+    c.textures_resolution_scaled |=
+        uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
     uint32_t& signs = c.texture_swizzled_signs[texture_index >> 2];
     uint32_t signs_shift = 8 * (texture_index & 3);
     signs = (signs & ~(UINT32_C(0xFF) << signs_shift)) |
@@ -1010,11 +1024,16 @@ bool WebGPUCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // origin_bottom_left = true as on D3D12: WebGPU NDC +Y points up (towards
   // framebuffer row 0), unlike Vulkan's. With false every draw was flipped
   // vertically within its viewport and the face winding (culling) reversed.
-  draw_util::GetHostViewportInfo(regs, 1, 1, true, rt_width, rt_height, false,
-                                 normalized_depth_control, false, true,
-                                 pixel_shader && pixel_shader->writes_depth(), viewport_info);
+  draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x_, draw_resolution_scale_y_, true,
+                                 rt_width, rt_height, false, normalized_depth_control, false,
+                                 true, pixel_shader && pixel_shader->writes_depth(),
+                                 viewport_info);
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  scissor.offset[0] *= draw_resolution_scale_x_;
+  scissor.offset[1] *= draw_resolution_scale_y_;
+  scissor.extent[0] *= draw_resolution_scale_x_;
+  scissor.extent[1] *= draw_resolution_scale_y_;
   for (uint32_t i = 0; i < 2; ++i) {
     uint32_t size = i ? rt_height : rt_width;
     scissor.offset[i] = std::min(scissor.offset[i], size);
@@ -1352,8 +1371,9 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t texture_width = 0, texture_height = 0;
   xenos::TextureFormat texture_format = xenos::TextureFormat(0);
   bool swap_needs_rb_swap = false;
+  bool swap_scaled = false;
   WGPUTextureView swap_view = texture_cache_->RequestSwapTexture(
-      texture_width, texture_height, texture_format, &swap_needs_rb_swap);
+      texture_width, texture_height, texture_format, &swap_needs_rb_swap, &swap_scaled);
 
   // Display gamma ramp (VulkanCommandProcessor::IssueSwap: D3D initializes the
   // 256-entry table for 8_8_8_8 output and the PWL ramp for 2_10_10_10).
@@ -1394,10 +1414,15 @@ void WebGPUCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           sample(2, 0.25f), sample(2, 0.5f), sample(2, 0.75f), sample(2, 1.0f));
     }
   }
+  // A resolution-scaled front buffer is presented at the host resolution.
+  uint32_t output_scale_x = swap_scaled ? draw_resolution_scale_x_ : 1;
+  uint32_t output_scale_y = swap_scaled ? draw_resolution_scale_y_ : 1;
   uint32_t output_width = std::clamp<uint32_t>(
-      frontbuffer_width ? frontbuffer_width : texture_width, 1, 8192);
+      frontbuffer_width ? frontbuffer_width * output_scale_x : texture_width, 1,
+      8192 * output_scale_x);
   uint32_t output_height = std::clamp<uint32_t>(
-      frontbuffer_height ? frontbuffer_height : texture_height, 1, 8192);
+      frontbuffer_height ? frontbuffer_height * output_scale_y : texture_height, 1,
+      8192 * output_scale_y);
 
   WGPUColor clear_color = {0.0, 0.0, 0.0, 1.0};
   if (has_last_color_clear_) {

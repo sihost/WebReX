@@ -118,7 +118,7 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
 | `texture-compression-bc-sliced-3d` | 3D BC textures decompressed | `--webgpu_texture_bc_sliced_3d=false` |
 | `texture-formats-tier1` | 8_8_8_8_GAMMA render targets stored as rgba8 with PWL gamma in the shaders: blending happens in gamma space | `--gamma_render_target_as_unorm16=false` |
 | `float32-filterable` | 32-bit float textures sampled nearest | `--webgpu_float32_filterable=false` |
-| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (so far it changes only the report line; the pipeline cache does not read it yet) |
+| `clip-distances` | user clip planes ignored | `--webgpu_clip_distances=false` (the pipeline cache then translates vertex shaders without user clip distances; the WGSL storage directory differs) |
 | `depth-clip-control` | depth clipping cannot be turned off (`clip_disable`) | — |
 | `depth32float-stencil8` | D24FS8 depth stored in depth24plus | — |
 | `texture-component-swizzle` | swizzles applied in shaders (same result) | `--webgpu_texture_component_swizzle=false` |
@@ -166,8 +166,14 @@ F3 debug overlay. The fallbacks and the cvars that force each one for testing:
   DLC (STFS packages) on the server the same way, for example with xenia's or extract-xiso's extraction,
   and mount the result as an extra `HttpRangeDevice` root. A block-reader interface over HttpRangeDevice
   blocks (reusing its OPFS cache) would lift this.
-- **Draw resolution scaling** (`draw_resolution_scale_x/y`) is not supported on WebGPU. It runs at 1x
-  only.
+- **Draw resolution scaling** (`draw_resolution_scale_x/y`, URL `arg=--draw_resolution_scale_x=2&arg=--draw_resolution_scale_y=2`)
+  works on WebGPU (tested at 2x2 with the Halo 3 riverworld film: no WebGPU errors, paused film frames within 38-49 dB PSNR of the 1x frames).
+  Limits compared to the desktop backends: resolved data is kept at the scaled resolution in "scaled
+  resolve windows" of guest memory (64 MiB of GPU memory per 8 MiB guest range at 2x2, 144 MiB at 3x3,
+  halved to fit `maxStorageBufferBindingSize`, created on first use); a resolve that does not fit one
+  window falls back to 1x for that range (the texture is then read at guest resolution). Block-compressed
+  textures loaded from guest memory stay 1x (only resolved render targets are scaled), and trace playback
+  does not restore the EDRAM snapshot when scaled. GPU and wasm memory grow with the scale; 3x3 is untested.
 
 ## Origin storage
 
